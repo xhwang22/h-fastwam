@@ -1,0 +1,44 @@
+# Model config: Wan2.2 pretrain with DINO visual encoder
+_target_: fastwam.runtime.create_wan22_pretrain
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 512
+load_text_encoder: false  # Use precomputed text embeds for efficiency
+redirect_common_files: true
+skip_dit_load_from_pretrain: false  # Load Wan2.2 pretrained weights
+
+visual_encoder:
+  encoder_type: dino
+  model_name: facebook/dinov3-vitl16-pretrain-lvd1689m
+  output_dim: 48
+  freeze_backbone: true
+  spatial_downsample: 16
+  temporal_downsample: 4
+  standardise_output: true
+
+dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: true
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: 7  # unused when action_conditioned=false
+
+scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000

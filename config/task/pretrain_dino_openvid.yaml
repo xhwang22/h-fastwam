@@ -1,0 +1,31 @@
+# Task config: Continue-pretrain Wan2.2 with DINO encoder on OpenVid-1M
+# @package _global_
+
+defaults:
+  - override /data: openvid
+  - override /model: pretrain_dino
+  - _self_
+
+# dataloading
+batch_size: 4
+num_workers: 8
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-5
+num_epochs: 1
+max_steps: 50000
+log_every: 10
+save_every: 5000
+eval_every: 1000
+
+# training
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null
+
+# wandb
+wandb:
+  enabled: true
+  project: wan22-pretrain
+  name: dino_openvid_1e-5

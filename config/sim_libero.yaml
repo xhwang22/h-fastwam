@@ -1,0 +1,68 @@
+# @package _global_
+
+defaults:
+  - train
+  - override /task: libero_uncond_2cam224_1e-4
+  - _self_
+
+ckpt: null
+gpu_id: 0
+
+model:
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+  # Visual encoder: set to match training config when checkpoint was trained with visual encoder.
+  # Examples:
+  #   visual_encoder:
+  #     encoder_type: dino
+  #     model_name: facebook/dinov3-vitl16-pretrain-lvd1689m
+  #     output_dim: 48
+  #     freeze_backbone: true
+  # Leave as null to use the default VAE encoder.
+  # visual_encoder: null
+
+EVALUATION:
+  task_suite_name: libero_spatial
+  task_id: 0
+  num_trials: 50
+  output_dir: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/world_model/fastwam/checkpoints/libero_test/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
+
+  # Runtime behavior
+  env_num: 1
+  num_steps_wait: 30
+  replan_steps: 10
+  binarize_gripper: true
+  use_action_ensembler: false
+  visualize_future_video: false
+
+  # Action inference
+  action_horizon: null
+  num_inference_steps: ${eval_num_inference_steps}
+  sigma_shift: null
+  text_cfg_scale: 1.0
+  negative_prompt: ""
+  rand_device: cpu
+  tiled: false
+
+  # Optional external inputs
+  dataset_stats_path: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/runs/libero_uncond_2cam224_1e-4/2026-04-01_21-10-12/dataset_stats.json
+  device: cuda
+
+MULTIRUN:
+  create_only: false
+  task_file: null
+  task_suite_names:
+    - libero_10
+    - libero_goal
+    - libero_spatial
+    - libero_object
+  num_gpus: 8
+  max_tasks_per_gpu: 2
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null
