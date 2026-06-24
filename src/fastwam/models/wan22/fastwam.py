@@ -9,6 +9,7 @@ from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
+from .visual_encoder import BaseVisualEncoder, build_visual_encoder
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
@@ -38,6 +39,8 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        action_loss_detach_video_expert: bool = False,
+        visual_encoder=None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -47,6 +50,12 @@ class FastWAM(torch.nn.Module):
         self.dit = self.mot
 
         self.vae = vae
+        # Visual encoder: BaseVisualEncoder subclass (DINO/VJEPA2) or VAE (backward compat).
+        self.use_visual_encoder = isinstance(visual_encoder, BaseVisualEncoder)
+        if self.use_visual_encoder:
+            self.visual_encoder = visual_encoder
+        else:
+            self.visual_encoder = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
         if text_dim is None:
@@ -84,6 +93,7 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.action_loss_detach_video_expert = bool(action_loss_detach_video_expert)
 
         self.to(self.device)
 
@@ -102,6 +112,7 @@ class FastWAM(torch.nn.Module):
         action_dit_config: dict[str, Any] | None = None,
         action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
+        skip_video_dit_load_from_pretrain: bool = False,
         mot_checkpoint_mixed_attn: bool = True,
         video_train_shift: float = 5.0,
         video_infer_shift: float = 5.0,
@@ -111,11 +122,26 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        action_loss_detach_video_expert: bool = False,
+        visual_encoder_config: dict[str, Any] | None = None,
+        pretrain_checkpoint: str | None = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
         if "text_dim" not in video_dit_config:
             raise ValueError("`video_dit_config['text_dim']` is required for FastWAM.")
+
+        # --- Optional visual encoder (DINO / V-JEPA2) -------------------- #
+        dino_visual_encoder = None
+        if visual_encoder_config is not None:
+            ve_cfg = dict(visual_encoder_config)
+            encoder_type = ve_cfg.pop("encoder_type", "dino")
+            dino_visual_encoder = build_visual_encoder(
+                encoder_type=encoder_type,
+                torch_dtype=torch_dtype,
+                **ve_cfg,
+            ).to(device=device)
+            logger.info("Using %s visual encoder (VAE encoder bypassed).", encoder_type)
 
         components = load_wan22_ti2v_5b_components(
             device=device,
@@ -126,7 +152,9 @@ class FastWAM(torch.nn.Module):
             redirect_common_files=redirect_common_files,
             dit_config=video_dit_config,
             skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            skip_video_dit_load_from_pretrain=skip_video_dit_load_from_pretrain,
             load_text_encoder=load_text_encoder,
+            skip_vae_load=(dino_visual_encoder is not None),
         )
 
         video_expert = components.dit
@@ -168,7 +196,32 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            action_loss_detach_video_expert=action_loss_detach_video_expert,
+            visual_encoder=dino_visual_encoder,
         )
+
+        # Load continue-pretrained checkpoint (DiT weights + optional visual encoder)
+        if pretrain_checkpoint is not None:
+            logger.info("Loading continue-pretrain checkpoint: %s", pretrain_checkpoint)
+            ckpt = torch.load(pretrain_checkpoint, map_location=device)
+            if "dit" in ckpt:
+                # Pretrain saves DiT as "dit"; FastWAM's video_expert is the DiT
+                missing, unexpected = model.video_expert.load_state_dict(ckpt["dit"], strict=False)
+                logger.info(
+                    "Loaded pretrained DiT into video_expert (missing=%d, unexpected=%d).",
+                    len(missing), len(unexpected),
+                )
+            else:
+                logger.warning("Pretrain checkpoint has no 'dit' key; skipping video expert load.")
+            if model.use_visual_encoder and "visual_encoder" in ckpt:
+                missing, unexpected = model.visual_encoder.load_state_dict(ckpt["visual_encoder"], strict=False)
+                logger.info(
+                    "Loaded pretrained visual_encoder projection (missing=%d, unexpected=%d).",
+                    len(missing), len(unexpected),
+                )
+            elif "visual_encoder" in ckpt and not model.use_visual_encoder:
+                logger.warning("Pretrain checkpoint has 'visual_encoder' but current model uses VAE; ignoring.")
+
         model.model_paths = {
             "video_dit": components.dit_path,
             "vae": components.vae_path,
@@ -176,6 +229,9 @@ class FastWAM(torch.nn.Module):
             "tokenizer": components.tokenizer_path,
             "action_dit_backbone": (
                 "SKIPPED_PRETRAIN" if skip_dit_load_from_pretrain else action_dit_pretrained_path
+            ),
+            "visual_encoder": (
+                visual_encoder_config.get("model_name", "dino") if visual_encoder_config else None
             ),
         }
         return model
@@ -185,7 +241,10 @@ class FastWAM(torch.nn.Module):
         self.mot.to(*args, **kwargs)
         if self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
-        self.vae.to(*args, **kwargs)
+        if self.vae is not None:
+            self.vae.to(*args, **kwargs)
+        if self.use_visual_encoder:
+            self.visual_encoder.to(*args, **kwargs)
         return self
 
     @staticmethod
@@ -239,15 +298,19 @@ class FastWAM(torch.nn.Module):
             torch.cat([context_mask, proprio_mask], dim=1),
         )
 
-    @torch.no_grad()
     def _encode_video_latents(self, video_tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
-        z = self.vae.encode(
-            video_tensor,
-            device=self.device,
-            tiled=tiled,
-            tile_size=tile_size,
-            tile_stride=tile_stride,
-        )
+        if self.use_visual_encoder:
+            # DINO backbone is frozen (no_grad inside), MLP projection needs gradients.
+            z = self.visual_encoder.encode(video_tensor, device=self.device)
+        else:
+            with torch.no_grad():
+                z = self.vae.encode(
+                video_tensor,
+                device=self.device,
+                tiled=tiled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+            )
         return z
 
     @torch.no_grad()
@@ -258,13 +321,24 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        if isinstance(z, list):
-            z = z[0].unsqueeze(0)
-        return z
+        if self.use_visual_encoder:
+            # [1, 3, H, W] → [1, 3, 1, H, W] → encode → [1, D, 1, H_lat, W_lat]
+            video_tensor = input_image.to(device=self.device).unsqueeze(2)
+            z = self.visual_encoder.encode(video_tensor, device=self.device)
+            return z
+        else:
+            image = input_image.to(device=self.device)[0].unsqueeze(1)
+            z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            if isinstance(z, list):
+                z = z[0].unsqueeze(0)
+            return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+        if self.use_visual_encoder:
+            raise NotImplementedError(
+                "Video decoding is not available in DINO encoder mode. "
+                "DINO replaces the VAE encoder; there is no decoder."
+            )
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video_tensor = video_tensor.squeeze(0).detach().float().clamp(-1, 1)
         video_tensor = ((video_tensor + 1.0) * 127.5).to(torch.uint8).cpu()
@@ -417,9 +491,9 @@ class FastWAM(torch.nn.Module):
         if image_is_pad is None:
             return video_loss_token.mean(dim=1)
 
-        temporal_factor = int(self.vae.temporal_downsample_factor)
+        temporal_factor = int(self.visual_encoder.temporal_downsample_factor)
         if temporal_factor <= 0:
-            raise ValueError(f"`vae.temporal_downsample_factor` must be positive, got {temporal_factor}.")
+            raise ValueError(f"`visual_encoder.temporal_downsample_factor` must be positive, got {temporal_factor}.")
         if image_is_pad.shape[1] < 1:
             raise ValueError("`image_is_pad` must contain at least one frame.")
         if (image_is_pad.shape[1] - 1) % temporal_factor != 0:
@@ -525,6 +599,7 @@ class FastWAM(torch.nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
+            detach_video_for_action=self.action_loss_detach_video_expert,
         )
 
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
@@ -798,14 +873,14 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
-        latent_h = height // self.vae.upsampling_factor
-        latent_w = width // self.vae.upsampling_factor
+        latent_t = (num_video_frames - 1) // self.visual_encoder.temporal_downsample_factor + 1
+        latent_h = height // self.visual_encoder.upsampling_factor
+        latent_w = width // self.visual_encoder.upsampling_factor
 
         video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
-            (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
+            (1, self.visual_encoder.z_dim, latent_t, latent_h, latent_w),
             generator=video_generator,
             device=rand_device,
             dtype=torch.float32,
@@ -825,7 +900,9 @@ class FastWAM(torch.nn.Module):
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
-            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+            # Pre-encoded context takes precedence; silently drop prompt.
+            prompt = None
+            use_prompt = False
         if not use_prompt and not use_context:
             raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
 
@@ -964,7 +1041,9 @@ class FastWAM(torch.nn.Module):
         use_prompt = prompt is not None
         use_context = context is not None or context_mask is not None
         if use_prompt and use_context:
-            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
+            # Pre-encoded context takes precedence; silently drop prompt.
+            prompt = None
+            use_prompt = False
         if not use_prompt and not use_context:
             raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
 
@@ -1093,6 +1172,8 @@ class FastWAM(torch.nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        if self.use_visual_encoder:
+            payload["visual_encoder"] = self.visual_encoder.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1100,7 +1181,15 @@ class FastWAM(torch.nn.Module):
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location=self.device)
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            missing, unexpected = self.mot.load_state_dict(payload["mot"], strict=False)
+            logger.warning(
+                "MoT load_state_dict: %d missing, %d unexpected keys (strict=False)",
+                len(missing), len(unexpected),
+            )
+            if missing:
+                logger.warning("  MoT missing sample: %s", list(missing)[:8])
+            if unexpected:
+                logger.warning("  MoT unexpected sample: %s", list(unexpected)[:8])
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
             self.video_expert.load_state_dict(payload["dit"], strict=False)
@@ -1113,6 +1202,12 @@ class FastWAM(torch.nn.Module):
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
+
+        if self.use_visual_encoder and "visual_encoder" in payload:
+            self.visual_encoder.load_state_dict(payload["visual_encoder"], strict=False)
+            logger.info("Loaded `visual_encoder` (projection MLP) from checkpoint.")
+        elif "visual_encoder" in payload and not self.use_visual_encoder:
+            logger.warning("Checkpoint contains `visual_encoder` weights but current model uses VAE; ignoring.")
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])

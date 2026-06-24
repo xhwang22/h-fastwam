@@ -1,14 +1,33 @@
 
 # Misc
 outputs/
-checkpoints
-data/*
+checkpoints/
+data/
 apex/
 assets/
-runs
 runs/
 evaluate_results/
 .deepspeed*
+*.log
+*.log*
+train.log
+eval_*.log
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+pretrained/
+weights/
+models/
+results/
+test_results/
+benchmark_results/
+profiling_results/
+wandb/
+mlruns/
+logs/
+.cache/
+.claude_tmp/
 
 
 # ai coding

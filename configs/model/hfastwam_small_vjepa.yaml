@@ -1,0 +1,112 @@
+# Model config: H-FastWAM SMALL + V-JEPA 2-AC vision encoder (Experiment 2).
+#
+# Same shrunk video & action experts as hfastwam_small.yaml (aligned to the
+# language expert: 16 heads * 128 head_dim = 2048, 28 layers, RANDOM-INIT, no
+# MoT projection adapters). The ONLY change vs hfastwam_small is the world-model
+# representation space: the video expert consumes / predicts FROZEN V-JEPA 2-AC
+# ViT-g features (1408-dim).
+#
+# NOTE: this is the ENCODER swap (DINO -> V-JEPA2-AC). The video expert is still
+# the small Wan-style DiT (random-init), NOT the JEPAPredictor (that is a
+# separate experiment 3 requiring a code change).
+#
+# Coupling: video_dit_config.in_dim == out_dim == encoder feature dim (1408 for
+# V-JEPA2-AC ViT-g with skip_projection=true). Transformer hidden_dim stays 2048.
+
+_target_: fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam
+
+fastwam_checkpoint: null
+
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+proprio_dim: ${data.train.processor.proprio_output_dim}
+
+skip_video_dit_load_from_pretrain: true
+skip_dit_load_from_pretrain: true
+
+# V-JEPA 2-AC ViT-g visual encoder (frozen), raw 1408d features -> DiT patchify.
+visual_encoder_config:
+  encoder_type: vjepa2_ac
+  model_name: vjepa2_ac_vit_giant
+  checkpoint_source: local
+  checkpoint_path: /apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/vjepa2/vjepa2-ac-vitg.pt
+  skip_projection: true     # raw 1408d features -> DiT patchify directly
+  freeze_backbone: true
+  spatial_downsample: 16
+  temporal_downsample: 4
+  standardise_output: true    # normalise per-channel before DiT patchify (matches DINO)
+
+visual_encoder: null
+
+language_vocab_size: 32000
+language_max_task_len: 128
+language_max_subtask_len: 128
+
+knowledge_insulation: true
+
+strict_expert_compat: false
+layer_alignment_mode: "tail_overlap"
+shared_attention_expert: "video"
+
+freeze_language_expert: false
+freeze_video_expert: false    # train video expert; override to true only for ablations
+freeze_action_expert: false
+
+language_backend: "qwen3"
+language_model_id: "Qwen/Qwen3-VL-2B-Instruct"
+language_local_files_only: false
+
+# Video DiT — SMALL (2048/16/28), but in/out dim = V-JEPA2-AC feature dim (1408).
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 1408              # V-JEPA 2-AC ViT-g hidden dim (skip_projection=true)
+  hidden_dim: 2048          # aligned to language (16*128=2048) -> no MoT proj
+  ffn_dim: 8192
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 1408             # FM target in V-JEPA2-AC feature space
+  num_heads: 16
+  attn_head_dim: 128
+  num_layers: 28
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: true
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+# Action DiT — SMALL (2048/16/28), random-init.
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 2048
+  ffn_dim: 8192
+  num_heads: 16
+  attn_head_dim: 128
+  num_layers: 28
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: true
+
+action_dit_pretrained_path: null
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss_config:
+  lambda_language: 1.0
+  lambda_video: 1.0
+  lambda_action: 1.0

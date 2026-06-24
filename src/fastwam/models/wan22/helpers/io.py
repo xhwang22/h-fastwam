@@ -1,11 +1,64 @@
+import contextlib
 import glob
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
 import torch
 from safetensors import safe_open
+
+logger = logging.getLogger(__name__)
+
+
+def _local_rank() -> int:
+    """Node-local rank, used to elect a single per-node downloader.
+
+    Downloads land in a node-local cache (``./checkpoints`` / ``DIFFSYNTH_MODEL_BASE_PATH``),
+    so electing local-rank-0 (rather than global-rank-0) is correct for multi-node runs:
+    each node downloads its own copy exactly once.
+    """
+    for key in ("LOCAL_RANK", "RANK", "SLURM_PROCID"):
+        val = os.environ.get(key)
+        if val is not None:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+    return 0
+
+
+@contextlib.contextmanager
+def _download_lock(lock_path: str):
+    """Cross-process exclusive lock around a download target.
+
+    Prefers ``filelock`` (a transitive dep of huggingface_hub/modelscope); falls back to
+    ``fcntl`` on POSIX, and degrades to a no-op if neither is available.
+    """
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    try:
+        from filelock import FileLock
+
+        with FileLock(lock_path):
+            yield
+        return
+    except ImportError:
+        pass
+
+    try:
+        import fcntl
+
+        with open(lock_path, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        return
+    except ImportError:
+        # No locking primitive available; proceed without a lock.
+        yield
 
 
 @dataclass
@@ -98,11 +151,42 @@ class ModelConfig:
         else:
             raise ValueError("`download_source` should be `modelscope` or `huggingface`.")
 
+    def _download_synchronized(self):
+        """Download under a per-target file lock so concurrent ranks don't race.
+
+        Multiple distributed ranks calling ``snapshot_download`` into the same directory
+        race on the atomic ``os.rename``/``os.replace`` that finalizes each file, surfacing
+        as ``OSError(39, 'Directory not empty')``. We serialize via a file lock and elect
+        node-local-rank-0 to do the actual fetch; other ranks block on the lock, then
+        re-check the cache (the lock holder may have completed the download) before
+        proceeding so they never download redundantly.
+        """
+        root = os.path.join(self.local_model_path, self.model_id)
+        lock_path = os.path.join(self.local_model_path, ".locks", f"{self.model_id.replace('/', '__')}.lock")
+
+        if _local_rank() != 0:
+            # Non-electors: wait for the elected downloader, then re-check the cache.
+            with _download_lock(lock_path):
+                if not self.require_downloading():
+                    return
+                logger.warning(
+                    "Cache miss for %s after waiting on download lock; downloading on rank %s.",
+                    self.model_id, _local_rank(),
+                )
+                self.download()
+            return
+
+        with _download_lock(lock_path):
+            # Re-check inside the lock: another process may have finished while we waited.
+            if self.require_downloading():
+                logger.info("Downloading %s into %s (node-local rank 0).", self.model_id, root)
+                self.download()
+
     def download_if_necessary(self):
         self.check_input()
         self.reset_local_model_path()
         if self.require_downloading():
-            self.download()
+            self._download_synchronized()
         if self.path is None:
             if self.origin_file_pattern in [None, "", "./"]:
                 self.path = os.path.join(self.local_model_path, self.model_id)

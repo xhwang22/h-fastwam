@@ -15,16 +15,22 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from tqdm import tqdm
-
-# try:
-#     import rootutils
-
-#     rootutils.setup_root(__file__, indicator=".python-version", pythonpath=True)
-# except ModuleNotFoundError:
+torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+#try:
+#    import rootutils
+#
+#    rootutils.setup_root(__file__, indicator=".python-version", pythonpath=True)
+#except ModuleNotFoundError:
 project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
-
+#project_root = Path(__file__).resolve().parents[2]
+#if str(project_root) not in sys.path:
+#    sys.path.append(str(project_root))  # 改成 append，放到最后面！
+#    sys.path.remove("/mnt/private_xh2/embodied/world_model/FastWAM/experiments/libero")
+import sys
+print("=== 当前使用的 Python 解释器 ===", sys.executable)
+print("=== 当前的 sys.path ===", sys.path)
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
     get_libero_dummy_action,
@@ -114,7 +120,33 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
     raise FileNotFoundError(msg)
 
 
+def _validate_visual_encoder_ckpt_compat(model: torch.nn.Module, ckpt: str) -> None:
+    """Warn if checkpoint visual encoder config doesn't match the current model."""
+    payload = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        return
+    ckpt_has_ve = "visual_encoder" in payload
+    model_has_ve = getattr(model, "use_visual_encoder", False)
+    if ckpt_has_ve and not model_has_ve:
+        logging.warning(
+            "Checkpoint contains `visual_encoder` weights but the current model "
+            "config uses VAE. Visual encoder weights will be IGNORED. "
+            "If the checkpoint was trained with a visual encoder, please set "
+            "model.visual_encoder in your eval config (e.g., "
+            "model.visual_encoder.encoder_type=dino model.visual_encoder.model_name=...)."
+        )
+    elif model_has_ve and not ckpt_has_ve:
+        logging.warning(
+            "Current model config uses a visual encoder, but the checkpoint "
+            "does NOT contain `visual_encoder` weights. The projection MLP will "
+            "use random initialisation — results will be incorrect unless this "
+            "is intentional."
+        )
+    del payload
+
+
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
+    _validate_visual_encoder_ckpt_compat(model, ckpt)
     model.load_checkpoint(ckpt)
     logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
     return
@@ -279,7 +311,7 @@ def _get_num_video_frames(cfg: DictConfig) -> int:
     return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
 
 
-def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
+def _validate_visualize_future_video_cfg(cfg: DictConfig, model: torch.nn.Module = None) -> None:
     if not bool(cfg.EVALUATION.get("visualize_future_video", False)):
         return
 
@@ -288,6 +320,15 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
         raise ValueError(
             "EVALUATION.visualize_future_video=true requires "
             "model.video_dit_config.action_conditioned=false."
+        )
+
+    # Visual encoder mode has no decoder — cannot generate future video frames.
+    if model is not None and getattr(model, "use_visual_encoder", False):
+        raise ValueError(
+            "EVALUATION.visualize_future_video=true is incompatible with visual encoder mode. "
+            "Visual encoders (DINO/V-JEPA2) replace the VAE encoder and have no decoder, "
+            "so future video frames cannot be rendered. "
+            "Set EVALUATION.visualize_future_video=false."
         )
 
 
@@ -403,6 +444,16 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    # Align eval with training: training samples have NO subtask (subtask_len=0),
+    # but infer_action defaults to AR-generating a subtask via the language expert
+    # (which was frozen + untrained, lambda_language=0). When
+    # EVALUATION.disable_subtask_generation=true, pass an explicit EMPTY subtask
+    # ([1, 0]) so the action expert sees the same conditioning as in training.
+    if bool(cfg.EVALUATION.get("disable_subtask_generation", False)):
+        infer_kwargs["subtask_token_ids"] = torch.zeros(
+            (1, 0), dtype=torch.long, device=model.device
+        )
+
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -700,6 +751,18 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
+
+    # Re-validate after model is loaded (checks visual encoder compat).
+    _validate_visualize_future_video_cfg(cfg, model=model)
+
+    if getattr(model, "use_visual_encoder", False):
+        logging.info(
+            "Visual encoder mode enabled for evaluation (encoder type: %s). "
+            "VAE encoder is bypassed; only the visual encoder projection MLP is used.",
+            type(model.visual_encoder).__name__,
+        )
+    else:
+        logging.info("Using VAE encoder for evaluation (visual_encoder is not configured).")
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))

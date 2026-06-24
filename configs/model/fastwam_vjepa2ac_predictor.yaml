@@ -1,0 +1,96 @@
+# FastWAM V-JEPA 2-AC predictor model (the "W-1" design).
+#
+# Architecture:
+#   * Vision encoder  : frozen V-JEPA 2-AC ViT-g/16 (1408-dim) — VJEPA2ACEncoder.
+#   * Video expert    : JEPAPredictor — deterministic next-frame latent
+#                       predictor (1024-dim, 16 heads × 64, 24 layers). NO flow
+#                       matching; trained with an L1 loss in encoder space.
+#   * Action expert   : ActionDiT, UNCHANGED (1024 residual, 24 heads × 128 =
+#                       3072 attn, 30 layers) loaded from its pretrained
+#                       backbone, kept as a flow-matching denoiser.
+#   * MoT             : non-strict tail-overlap (action runs 6 prefix layers
+#                       solo, then 24 shared mixed-attention layers; q/k/v/o
+#                       proj adapters bridge the 1024↔3072 attention widths).
+#
+# Actions reach the predictor purely through shared MoT self-attention
+# (video frame i attends to action group i). The predictor does not embed
+# actions itself.
+#
+# To seed the predictor from the native V-JEPA 2-AC predictor weights, set
+# `ac_predictor_checkpoint` to the bundled (encoder, predictor) .pt; mapping is
+# best-effort (logged coverage) because the native predictor is a plain ViT.
+
+_target_: fastwam.runtime.create_fastwam_jepa
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: true
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/world_model/fastwam/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+
+skip_dit_load_from_pretrain: false
+skip_video_dit_load_from_pretrain: false
+
+# Native V-JEPA 2-AC predictor checkpoint to seed JEPAPredictor (best-effort
+# weight map). Leave null to train the predictor blocks from scratch.
+ac_predictor_checkpoint: null
+
+# Continue-pretrained MoT checkpoint (optional).
+pretrain_checkpoint: null
+
+# V-JEPA 2-AC visual encoder (raw 1408-dim features → predictor patchify).
+visual_encoder:
+  encoder_type: vjepa2_ac
+  model_name: vjepa2_ac_vit_giant
+  checkpoint_source: local
+  checkpoint_path: /apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/vjepa2/vjepa2-ac-vitg.pt
+  skip_projection: true             # raw V-JEPA2-AC features → predictor patchify
+  freeze_backbone: true
+  spatial_downsample: 16
+  temporal_downsample: 4
+  standardise_output: false
+
+# JEPA predictor (video expert). Reuses the `video_dit_config` block name so the
+# factory plumbing is shared, but the keys map to JEPAPredictor kwargs.
+video_dit_config:
+  patch_size: [1, 2, 2]
+  in_dim: 1408             # V-JEPA 2-AC ViT-g hidden dim (encoder output)
+  out_dim: 1408            # predict latents back in encoder space
+  hidden_dim: 1024         # native V-JEPA 2-AC predictor width
+  ffn_dim: 4096
+  text_dim: 4096
+  num_heads: 16
+  attn_head_dim: 64        # 16 × 64 = 1024 attention width (native JEPA)
+  num_layers: 24
+  eps: 1.0e-06
+  video_attention_mask_mode: "per_frame_causal"
+  action_group_causal_mask_mode: "group_diagonal"
+  use_text_context: false  # uncond LIBERO/RoboTwin; set true to use text/proprio
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+# Action expert — UNCHANGED from the current FastWAM recipe.
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+# Only the action expert is a flow-matching denoiser now.
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+loss:
+  lambda_video: 1.0
+  lambda_action: 1.0
+  video_loss_type: l1      # V-JEPA 2-AC default (or "mse")
+  action_loss_detach_video_expert: true

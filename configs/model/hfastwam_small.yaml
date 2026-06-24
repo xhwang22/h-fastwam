@@ -1,0 +1,124 @@
+# Model config: H-FastWAM (SMALL) — video & action experts aligned to the
+# language expert's attention geometry to (a) shrink the model and (b) remove
+# all MoT projection adapters.
+#
+# Rationale (see run_libero_hfastwam_8card_small.sh):
+#   The MoT shared-attention space is num_heads * attn_head_dim of the
+#   `shared_attention_expert`. Projection adapters become nn.Identity (zero
+#   params) ONLY when every expert shares the SAME num_heads * attn_head_dim.
+#   The Qwen3-VL language expert is fixed at 16 heads * 128 head_dim = 2048, so
+#   we align video and action to 16 * 128 = 2048 as well. With shared space ==
+#   each expert's attention width, q/k/v/o adapters all collapse to identity.
+#
+#   We also align token hidden_dim (2048) and num_layers (28) to the language
+#   expert, random-init video & action (no Wan / ActionDiT pretrained load),
+#   and keep the VAE-48d latent world-model setup (in_dim = out_dim = 48,
+#   no DINO encoder) exactly as the production 8-card run uses.
+#
+# Net effect: ~6.7B trainable -> ~3.8B trainable, peak GPU mem ~49G -> well
+# under 40G, with identical optimizer/LR/global-batch settings.
+
+_target_: fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam
+
+# FastWAM pretrained checkpoint (fallback for Video Expert)
+fastwam_checkpoint: null
+
+# Base model
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+proprio_dim: ${data.train.processor.proprio_output_dim}
+
+# Random-init the DiT experts (do NOT load Wan / ActionDiT pretrained weights).
+# skip_dit_load_from_pretrain affects BOTH video and action experts.
+skip_video_dit_load_from_pretrain: true
+skip_dit_load_from_pretrain: true
+
+# VAE-48d latent world model: no DINO encoder (matches the 8-card run).
+visual_encoder_config: null
+visual_encoder: null
+
+# Language Expert config (no vision encoder — grounding via MoT attention)
+language_vocab_size: 32000
+language_max_task_len: 128
+language_max_subtask_len: 128
+
+# Knowledge insulation: stop gradient from DiT losses to language backbone
+knowledge_insulation: true
+action_loss_detach_video_expert: false  # action-loss grad flows into video expert (matches original FastWAM; no detach)
+
+# Expert compatibility / alignment.
+# strict_expert_compat stays false (Qwen layer count differs from 28? no — we
+# align to 28); tail_overlap keeps the existing mixing semantics. With matched
+# attention widths the adapters are identity regardless.
+strict_expert_compat: false
+layer_alignment_mode: "tail_overlap"
+shared_attention_expert: "video"
+
+# Initial freeze policy (applied by trainer; overridden on CLI by the script).
+freeze_language_expert: false
+freeze_video_expert: true
+freeze_action_expert: false
+
+# Language backend (fixed geometry: 16 heads * 128 head_dim = 2048 hidden).
+language_backend: "qwen3"
+language_model_id: "Qwen/Qwen3-VL-2B-Instruct"
+language_local_files_only: false
+
+# Video DiT config — SHRUNK & aligned to language (16*128=2048 attention width).
+# in_dim/out_dim kept at 48 for the VAE-48d latent world model.
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48                # VAE latent channels (was 1024 for DINO)
+  hidden_dim: 2048          # was 3072 -> aligned to language
+  ffn_dim: 8192             # 4x hidden (was 14336); structure preserved
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48               # VAE latent channels (FM target)
+  num_heads: 16             # was 24 -> aligned to language (16*128=2048)
+  attn_head_dim: 128
+  num_layers: 28            # was 30 -> aligned to language
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: true
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+# Action DiT config — SHRUNK & aligned to language (16*128=2048 attention width).
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 2048          # was 1024 -> aligned to language token width
+  ffn_dim: 8192             # 4x hidden (was 4096); structure preserved
+  num_heads: 16             # was 24 -> aligned to language (16*128=2048)
+  attn_head_dim: 128
+  num_layers: 28            # was 30 -> aligned to language
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: true
+
+# Random-init action expert (no pretrained ActionDiT load).
+action_dit_pretrained_path: null
+
+# Schedulers
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+# Loss weights (adjust per curriculum phase)
+loss_config:
+  lambda_language: 1.0
+  lambda_video: 1.0
+  lambda_action: 1.0

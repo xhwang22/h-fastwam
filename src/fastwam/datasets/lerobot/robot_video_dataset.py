@@ -21,6 +21,33 @@ logger = get_logger(__name__)
 
 
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+DATASET_STATS_FILENAME = "dataset_stats.json"
+DEFAULT_STATS_SYNC_TIMEOUT_SECONDS = 3600.0
+
+
+def _dataset_stats_path() -> str:
+    return os.path.join(misc.get_work_dir(), DATASET_STATS_FILENAME)
+
+
+def _resolve_stats_sync_timeout(timeout_s: Optional[float]) -> float:
+    if timeout_s is not None:
+        return float(timeout_s)
+    return float(os.environ.get("FASTWAM_DATASET_STATS_SYNC_TIMEOUT", DEFAULT_STATS_SYNC_TIMEOUT_SECONDS))
+
+
+def _wait_for_dataset_stats(stats_path: str, timeout_s: float):
+    deadline = time.monotonic() + timeout_s
+    while not os.path.exists(stats_path):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out after {timeout_s:.1f}s waiting for dataset stats at {stats_path}. "
+                "Check the main rank for normalization-stat calculation errors, or increase "
+                "FASTWAM_DATASET_STATS_SYNC_TIMEOUT."
+            )
+        time.sleep(min(1.0, remaining))
+    return load_dataset_stats_from_json(stats_path)
+
 
 class RobotVideoDataset(torch.utils.data.Dataset):
     def __init__(
@@ -32,8 +59,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         camera_key=None,
         processor=None,
         text_embedding_cache_dir=None,
+        load_text_context: bool = True,
         context_len=128,
         pretrained_norm_stats=None,
+        stats_sync_timeout: Optional[float] = None,
         val_set_proportion=0.05,
         is_training_set=False,
         global_sample_stride=1,
@@ -67,6 +96,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         self.video_size = video_size
         self.text_embedding_cache_dir = text_embedding_cache_dir
+        self.load_text_context = bool(load_text_context)
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
@@ -88,23 +118,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
-                if PartialState().is_main_process:
+                stats_path = _dataset_stats_path()
+                distributed_state = PartialState()
+                if distributed_state.is_main_process:
                     logger.info("Calculating dataset stats for normalization...")
                     dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
-                    work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    save_dataset_stats_to_json(dataset_stats, stats_path)
                 else:
-                    dataset_stats = None
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    obj_list = [dataset_stats]
-                    torch.distributed.broadcast_object_list(obj_list, src=0)
-                    dataset_stats = obj_list[0]
+                    dataset_stats = _wait_for_dataset_stats(
+                        stats_path,
+                        _resolve_stats_sync_timeout(stats_sync_timeout),
+                    )
             else:
                 dataset_stats = load_dataset_stats_from_json(pretrained_norm_stats)
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
-                    work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    save_dataset_stats_to_json(dataset_stats, _dataset_stats_path())
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
@@ -215,22 +244,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             task = self.override_instruction
         instruction = DEFAULT_PROMPT.format(task=task)
 
-        context, context_mask = self._get_cached_text_context(instruction)
-        # NOTE: to keep consistent with wan2.2's behavior
-        context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
-        
         data = {
             "video": video,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
-            "context": context,
-            "context_mask": context_mask,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.load_text_context:
+            context, context_mask = self._get_cached_text_context(instruction)
+            # NOTE: to keep consistent with wan2.2's behavior
+            context[~context_mask] = 0.0
+            context_mask = torch.ones_like(context_mask)
+            data["context"] = context
+            data["context_mask"] = context_mask
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -277,3 +306,70 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
         return data
+
+
+class InterleavedRobotVideoDataset(RobotVideoDataset):
+    def __init__(
+        self,
+        *args,
+        num_segments: int = 2,
+        segment_stride: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.num_segments = int(num_segments)
+        if self.num_segments <= 0:
+            raise ValueError(f"`num_segments` must be positive, got {num_segments}")
+        self.segment_stride = int(segment_stride) if segment_stride is not None else int(self.num_frames - 1)
+        if self.segment_stride <= 0:
+            raise ValueError(f"`segment_stride` must be positive, got {self.segment_stride}")
+
+    @staticmethod
+    def _stack_segment_values(values):
+        first = values[0]
+        if torch.is_tensor(first):
+            return torch.stack(values, dim=0)
+        if isinstance(first, str):
+            return list(values)
+        if isinstance(first, dict):
+            return {
+                key: InterleavedRobotVideoDataset._stack_segment_values([value[key] for value in values])
+                for key in first
+            }
+        if isinstance(first, (int, float, bool, np.integer, np.floating, np.bool_)):
+            return torch.as_tensor(values)
+        return list(values)
+
+    def _get_segment_indices(self, idx: int) -> list[int]:
+        starts = self.lerobot_dataset.episode_data_index["from"]
+        ends = self.lerobot_dataset.episode_data_index["to"]
+        idx_tensor = torch.as_tensor(idx, device=starts.device)
+        matches = ((starts <= idx_tensor) & (idx_tensor < ends)).nonzero(as_tuple=False)
+        if matches.numel() == 0:
+            return [min(idx + i * self.segment_stride, len(self) - 1) for i in range(self.num_segments)]
+
+        episode_idx = int(matches[0].item())
+        ep_end = int(ends[episode_idx].item())
+        return [
+            min(idx + i * self.segment_stride, ep_end - 1)
+            for i in range(self.num_segments)
+        ]
+
+    def _get_segments(self, idx: int):
+        segment_indices = self._get_segment_indices(idx)
+        segment_samples = [self._get(segment_idx) for segment_idx in segment_indices]
+        segments = {
+            key: self._stack_segment_values([sample[key] for sample in segment_samples])
+            for key in segment_samples[0]
+        }
+        segments["segment_mask"] = torch.ones(len(segment_samples), dtype=torch.bool)
+        return {"segments": segments}
+
+    def __getitem__(self, idx):
+        try:
+            return self._get_segments(idx)
+        except Exception as e:
+            print(f"Error processing interleaved sample idx {idx}: {e}. Returning a random sample instead.")
+            print(traceback.format_exc())
+            random_idx = np.random.randint(len(self))
+            return self._get_segments(random_idx)

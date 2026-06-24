@@ -258,7 +258,21 @@ run_libero_eval() {
     echo "ROOT_DIR: $ROOT_DIR"
     echo "NUM_GPUS: $NUM_GPUS"
     echo "MAX_TASKS_PER_GPU: $MAX_TASKS_PER_GPU"
-    
+
+    # Pre-create the libero config (one-time, before workers start) so that
+    # parallel workers don't race on `rm -f config.yaml` followed by recreate.
+    # When the file is missing, libero's `__init__.py` prompts via `input()`
+    # and that prompt hangs forever inside a non-interactive subprocess.
+    mkdir -p /root/.libero
+    if [ ! -f /root/.libero/config.yaml ]; then
+        echo "Initializing /root/.libero/config.yaml (one-time setup)..."
+        echo N | /apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/envs/libero2/bin/python -c 'from libero.libero import benchmark; benchmark.get_benchmark_dict()' >/dev/null 2>&1 || true
+    fi
+    if [ ! -f /root/.libero/config.yaml ]; then
+        echo "ERROR: failed to create /root/.libero/config.yaml; aborting." >&2
+        return 1
+    fi
+
     # Initialize GPU load tracking
     init_gpu_load_tracking
 
@@ -335,7 +349,8 @@ run_libero_eval() {
         # When the task exits, write a status file so the scheduler can detect failures promptly.
         tmux select-pane -t $SESSION_NAME:$pane_info 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
-        tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+        tmux send-keys -t $SESSION_NAME:$pane_info "export MUJOCO_GL=osmesa && source /apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate libero2 && export DIFFSYNTH_MODEL_BASE_PATH=/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/  && export PYOPENGL_PLATFORM=osmesa && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+            mkdir -p /root/.libero && [ -f /root/.libero/config.yaml ] || echo N | python -c 'from libero.libero import benchmark; benchmark.get_benchmark_dict()' >/dev/null 2>&1; \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
             task=$CONFIG ckpt=$CKPT \
@@ -463,7 +478,17 @@ run_libero_eval() {
         # Parse task info without using local
         suite=$(echo $task_info | cut -d, -f1)
         task_id=$(echo $task_info | cut -d, -f2)
-        
+
+        # Skip tasks that already have a results.json (resumable behavior).
+        result_file_pattern="$OUTPUT_DIR/$suite/gpu*_task${task_id}_results.json"
+        if ls $result_file_pattern 1> /dev/null 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Skipping already-completed task: $suite task_id=$task_id"
+            # Drop from pending list
+            grep -v "^$suite,$task_id$" "$PENDING_TASKS_FILE" > "$PENDING_TASKS_FILE.tmp" || true
+            mv "$PENDING_TASKS_FILE.tmp" "$PENDING_TASKS_FILE"
+            continue
+        fi
+
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Processing task: suite=$suite, task_id=$task_id"
         
         # Find the least-loaded GPU
@@ -509,9 +534,7 @@ run_libero_eval() {
         total_failed=$(wc -l < "$FAILED_TASKS_FILE" 2>/dev/null || echo 0)
 
         if [ "$new_failures" -gt 0 ]; then
-            echo "Detected failed subtasks, stopping the scheduler. Failure details: $FAILED_TASKS_FILE"
-            cat "$FAILED_TASKS_FILE"
-            return 2
+            echo "Detected $new_failures newly failed subtasks (total failed: $total_failed). Continuing with remaining tasks. Failure details: $FAILED_TASKS_FILE"
         fi
 
         # Check whether all tasks have completed

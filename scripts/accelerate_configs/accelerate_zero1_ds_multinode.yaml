@@ -1,0 +1,16 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+# Use MULTI_GPU so torchrun handles multi-node rendezvous correctly.
+# DeepSpeed ZeRO-1 is applied via the deepspeed_plugin below.
+distributed_type: MULTI_GPU
+deepspeed_config:
+  deepspeed_config_file: scripts/ds_configs/ds_zero1_config.json
+  zero3_init_flag: false
+mixed_precision: bf16
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+use_cpu: false

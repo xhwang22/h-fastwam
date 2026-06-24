@@ -142,14 +142,14 @@ class FastWAMJoint(FastWAM):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        latent_t = (num_video_frames - 1) // self.vae.temporal_downsample_factor + 1
-        latent_h = height // self.vae.upsampling_factor
-        latent_w = width // self.vae.upsampling_factor
+        latent_t = (num_video_frames - 1) // self.visual_encoder.temporal_downsample_factor + 1
+        latent_h = height // self.visual_encoder.upsampling_factor
+        latent_w = width // self.visual_encoder.upsampling_factor
 
         video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
-            (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
+            (1, self.visual_encoder.z_dim, latent_t, latent_h, latent_w),
             generator=video_generator,
             device=rand_device,
             dtype=torch.float32,

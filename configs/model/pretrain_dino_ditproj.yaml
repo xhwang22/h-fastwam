@@ -1,0 +1,65 @@
+# Model config: Wan2.2 pretrain with DINO visual encoder (LDA-1B style)
+#
+# Aligned with LDA-1B (arxiv 2602.12215, github.com/jiangranlv/latent-dynamics-action):
+#   - DINOv3-ViT-S (hidden=384) instead of ViT-L (1024)  ← much smaller target dim
+#   - skip_projection=true (raw DINO → DiT patchify, no MLP bottleneck)
+#   - standardise_output=false (rely on DINO's internal final LayerNorm; LDA does
+#     NOT add any extra channel standardisation, avoiding batch-stats jitter)
+#   - SIGReg disabled (no trainable compressor → no collapse risk)
+#   - train_shift kept at 5.0 (Wan default) — can revisit later if loss is hard
+#     to reduce; LDA-1B itself uses unweighted MSE
+#
+# Trade-off: patchify/unpatchify weights cannot be loaded from VAE-pretrained
+# Wan2.2 checkpoint (shape mismatch 48→384); they are randomly initialised.
+# All other DiT weights (blocks, text_embedding, time_embedding, etc.) still
+# load from pretrained Wan2.2.
+
+_target_: fastwam.runtime.create_wan22_pretrain
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 512
+load_text_encoder: false  # Use precomputed text embeds for efficiency
+redirect_common_files: true
+skip_dit_load_from_pretrain: false  # Load Wan2.2 pretrained weights (mismatched layers auto-skipped)
+
+visual_encoder:
+  encoder_type: dino
+  model_name: facebook/dinov3-vits16-pretrain-lvd1689m  # ← ViT-S (hidden=384), LDA-1B choice
+  output_dim: 384           # ignored when skip_projection=true (auto set to hidden_dim)
+  skip_projection: true     # No MLP — raw DINO features → DiT patchify
+  freeze_backbone: true
+  spatial_downsample: 16
+  temporal_downsample: 4
+  standardise_output: false # ← LDA-1B does NOT standardise; rely on DINO's internal LayerNorm
+  normalise_stats_path: null
+
+# SIGReg disabled — no bottleneck means no collapse risk
+sigreg_lam_var: 0.0
+sigreg_lam_cov: 0.0
+
+dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 384               # ← DINO ViT-S hidden dim
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 384              # ← output in DINO ViT-S space
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: true
+  video_attention_mask_mode: "first_frame_causal"
+  action_conditioned: false
+  action_dim: 7  # unused when action_conditioned=false
+
+scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000

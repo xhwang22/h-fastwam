@@ -1,0 +1,21 @@
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: DEEPSPEED
+deepspeed_config:
+  deepspeed_config_file: scripts/ds_configs/ds_zero2_bf16_config.json
+  zero3_init_flag: false
+
+# When using a deepspeed_config_file, accelerate REQUIRES that mixed_precision
+# (and grad_accum / zero_stage / offload / clipping) are NOT set here — they
+# must live in the DS json only, otherwise accelerate raises a config-conflict
+# error. Precision is driven by cfg.mixed_precision=bf16 (passed by the trainer
+# to Accelerator), which resolves the DS json's "bf16.enabled": "auto" to true.
+mixed_precision: null
+
+machine_rank: 0
+main_training_function: main
+num_machines: 1
+num_processes: 8
+rdzv_backend: static
+same_network: true
+use_cpu: false

@@ -16,44 +16,147 @@ class MoT(nn.Module):
         self,
         mixtures: Dict[str, nn.Module],
         mot_checkpoint_mixed_attn: bool = True,
+        strict_expert_compat: bool = True,
+        layer_alignment_mode: str = "strict",
+        shared_attention_expert: str = "video",
     ):
         super().__init__()
         if not mixtures:
             raise ValueError("`mixtures` cannot be empty.")
-        if "video" not in mixtures or "action" not in mixtures:
-            raise ValueError("`mixtures` must include both 'video' and 'action' experts.")
+        if len(mixtures) < 2:
+            raise ValueError("`mixtures` must contain at least two experts.")
+
+        valid_alignment = {"strict", "tail_overlap"}
+        if layer_alignment_mode not in valid_alignment:
+            raise ValueError(
+                f"Invalid `layer_alignment_mode`: {layer_alignment_mode}. Must be one of {valid_alignment}."
+            )
 
         self.mixtures = nn.ModuleDict(mixtures)
         self.expert_order = list(self.mixtures.keys())
         self.mot_checkpoint_mixed_attn = mot_checkpoint_mixed_attn
+        self.strict_expert_compat = bool(strict_expert_compat)
+        self.layer_alignment_mode = layer_alignment_mode
         if mot_checkpoint_mixed_attn:
             logger.info("Using gradient checkpointing for mixture attention. This will save memory but use more computation.")
 
-        first_expert = self.mixtures[self.expert_order[0]]
-        self.num_layers = len(first_expert.blocks)
-        self.num_heads = first_expert.num_heads
-        self.attn_head_dim = first_expert.attn_head_dim
+        if shared_attention_expert not in self.mixtures:
+            raise ValueError(
+                f"`shared_attention_expert`={shared_attention_expert} not found in mixtures={self.expert_order}."
+            )
 
-        for name in self.expert_order[1:]:
-            expert = self.mixtures[name]
-            if len(expert.blocks) != self.num_layers:
-                raise ValueError(
-                    f"All experts must have same number of layers; got {self.num_layers} and {len(expert.blocks)}"
-                )
-            if expert.num_heads != self.num_heads:
-                raise ValueError(
-                    f"All experts must have same num_heads; got {self.num_heads} and {expert.num_heads}"
-                )
-            if expert.attn_head_dim != self.attn_head_dim:
-                raise ValueError(
-                    "All experts must have same attn_head_dim; "
-                    f"got {self.attn_head_dim} and {expert.attn_head_dim}"
-                )
-        
-        logger.info(f"Initialized MoT with experts: {self.expert_order}, num_layers={self.num_layers}")
+        self.expert_num_layers = {name: int(len(expert.blocks)) for name, expert in self.mixtures.items()}
+        self.expert_num_heads = {name: int(expert.num_heads) for name, expert in self.mixtures.items()}
+        self.expert_attn_head_dim = {name: int(expert.attn_head_dim) for name, expert in self.mixtures.items()}
+        self.expert_hidden_dim = {
+            name: self.expert_num_heads[name] * self.expert_attn_head_dim[name]
+            for name in self.expert_order
+        }
+
+        shared_name = shared_attention_expert
+        self.num_heads = self.expert_num_heads[shared_name]
+        self.attn_head_dim = self.expert_attn_head_dim[shared_name]
+        self.shared_hidden_dim = self.num_heads * self.attn_head_dim
+
+        if self.strict_expert_compat:
+            first_name = self.expert_order[0]
+            self.num_layers = self.expert_num_layers[first_name]
+            for name in self.expert_order[1:]:
+                if self.expert_num_layers[name] != self.num_layers:
+                    raise ValueError(
+                        "All experts must have same number of layers in strict mode; "
+                        f"got {self.num_layers} and {self.expert_num_layers[name]} ({name})."
+                    )
+                if self.expert_num_heads[name] != self.num_heads:
+                    raise ValueError(
+                        "All experts must have same num_heads in strict mode; "
+                        f"got {self.num_heads} and {self.expert_num_heads[name]} ({name})."
+                    )
+                if self.expert_attn_head_dim[name] != self.attn_head_dim:
+                    raise ValueError(
+                        "All experts must have same attn_head_dim in strict mode; "
+                        f"got {self.attn_head_dim} and {self.expert_attn_head_dim[name]} ({name})."
+                    )
+            self.overlap_num_layers = self.num_layers
+            self.layer_start_indices = {name: 0 for name in self.expert_order}
+        else:
+            self.overlap_num_layers = min(self.expert_num_layers.values())
+            if self.overlap_num_layers <= 0:
+                raise ValueError("All experts must have at least one transformer block.")
+            if self.layer_alignment_mode == "strict":
+                # In non-strict shape mode + strict alignment, still only overlap layers are mixed.
+                self.layer_start_indices = {name: 0 for name in self.expert_order}
+            else:
+                # tail-overlap: expert-specific prefix layers run solo, then overlap layers are mixed.
+                self.layer_start_indices = {
+                    name: self.expert_num_layers[name] - self.overlap_num_layers
+                    for name in self.expert_order
+                }
+            self.num_layers = self.overlap_num_layers
+
+        # Projection adapters for heterogeneous experts (strict mode uses implicit identity).
+        self.q_proj_to_shared = nn.ModuleDict()
+        self.k_proj_to_shared = nn.ModuleDict()
+        self.v_proj_to_shared = nn.ModuleDict()
+        self.o_proj_from_shared = nn.ModuleDict()
+        if not self.strict_expert_compat:
+            for name in self.expert_order:
+                in_dim = self.expert_hidden_dim[name]
+                start_idx = self.layer_start_indices[name]
+                adapter_kwargs = self._module_float_kwargs(self.mixtures[name])
+                for overlap_idx in range(self.overlap_num_layers):
+                    layer_idx = start_idx + overlap_idx
+                    key = f"{name}__{layer_idx}"
+                    if in_dim == self.shared_hidden_dim:
+                        self.q_proj_to_shared[key] = nn.Identity()
+                        self.k_proj_to_shared[key] = nn.Identity()
+                        self.v_proj_to_shared[key] = nn.Identity()
+                        self.o_proj_from_shared[key] = nn.Identity()
+                    else:
+                        self.q_proj_to_shared[key] = nn.Linear(
+                            in_dim,
+                            self.shared_hidden_dim,
+                            bias=False,
+                            **adapter_kwargs,
+                        )
+                        self.k_proj_to_shared[key] = nn.Linear(
+                            in_dim,
+                            self.shared_hidden_dim,
+                            bias=False,
+                            **adapter_kwargs,
+                        )
+                        self.v_proj_to_shared[key] = nn.Linear(
+                            in_dim,
+                            self.shared_hidden_dim,
+                            bias=False,
+                            **adapter_kwargs,
+                        )
+                        self.o_proj_from_shared[key] = nn.Linear(
+                            self.shared_hidden_dim,
+                            in_dim,
+                            bias=False,
+                            **adapter_kwargs,
+                        )
+
+        logger.info(
+            "Initialized MoT with experts=%s, strict=%s, align=%s, overlap_layers=%d, shared_heads=%d, shared_head_dim=%d",
+            self.expert_order,
+            self.strict_expert_compat,
+            self.layer_alignment_mode,
+            self.overlap_num_layers,
+            self.num_heads,
+            self.attn_head_dim,
+        )
         for name in self.expert_order:
             expert = self.mixtures[name]
-            logger.info(f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
+            logger.info(
+                "  Expert '%s': params=%.2fB layers=%d heads=%d head_dim=%d",
+                name,
+                sum(p.numel() for p in expert.parameters()) / 1e9,
+                self.expert_num_layers[name],
+                self.expert_num_heads[name],
+                self.expert_attn_head_dim[name],
+            )
 
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
@@ -74,6 +177,55 @@ class MoT(nn.Module):
             )
         return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
+    @staticmethod
+    def _module_float_kwargs(module: nn.Module) -> dict:
+        for tensor in module.parameters():
+            if tensor.is_floating_point():
+                return {"device": tensor.device, "dtype": tensor.dtype}
+        for tensor in module.buffers():
+            if tensor.is_floating_point():
+                return {"device": tensor.device, "dtype": tensor.dtype}
+        return {}
+
+    @staticmethod
+    def _proj_key(name: str, layer_idx: int) -> str:
+        return f"{name}__{layer_idx}"
+
+    def _project_qkv_to_shared(
+        self,
+        name: str,
+        layer_idx: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.strict_expert_compat:
+            return q, k, v
+        key = self._proj_key(name, layer_idx)
+        if key not in self.q_proj_to_shared:
+            return q, k, v
+        return (
+            self.q_proj_to_shared[key](q),
+            self.k_proj_to_shared[key](k),
+            self.v_proj_to_shared[key](v),
+        )
+
+    def _project_mixed_from_shared(
+        self,
+        name: str,
+        layer_idx: int,
+        mixed: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.strict_expert_compat:
+            return mixed
+        key = self._proj_key(name, layer_idx)
+        if key not in self.o_proj_from_shared:
+            return mixed
+        return self.o_proj_from_shared[key](mixed)
+
+    def _expert_layer_idx(self, name: str, overlap_idx: int) -> int:
+        return int(self.layer_start_indices[name]) + int(overlap_idx)
+
     def _mixed_attention(
         self,
         q_cat: torch.Tensor,
@@ -81,10 +233,26 @@ class MoT(nn.Module):
         v_cat: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+        return self._attention_with_num_heads(
+            q_cat=q_cat,
+            k_cat=k_cat,
+            v_cat=v_cat,
+            attention_mask=attention_mask,
+            num_heads=self.num_heads,
+        )
+
+    def _attention_with_num_heads(
+        self,
+        q_cat: torch.Tensor,
+        k_cat: torch.Tensor,
+        v_cat: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_heads: int,
+    ) -> torch.Tensor:
         attn_mask = attention_mask.to(device=q_cat.device)
 
         def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask)
+            return flash_attention(q=q, k=k, v=v, num_heads=int(num_heads), ctx_mask=attn_mask)
 
         if self.mot_checkpoint_mixed_attn and self.training:
             return torch.utils.checkpoint.checkpoint(
@@ -123,6 +291,8 @@ class MoT(nn.Module):
 
     def _build_expert_attention_io(
         self,
+        name: str,
+        layer_idx: int,
         expert,
         block,
         x: torch.Tensor,
@@ -142,6 +312,8 @@ class MoT(nn.Module):
         """Build per-expert attention tensors and post-block states.
 
         Args:
+            name: Expert name.
+            layer_idx: Concrete layer index inside this expert.
             expert: Expert module that owns this `block`; only used to read
                 `use_gradient_checkpointing`.
             block: Transformer block for current layer (`expert.blocks[layer_idx]`).
@@ -169,6 +341,13 @@ class MoT(nn.Module):
 
         q = rope_apply(q, freqs, block.num_heads)
         k = rope_apply(k, freqs, block.num_heads)
+        q, k, v = self._project_qkv_to_shared(
+            name=name,
+            layer_idx=layer_idx,
+            q=q,
+            k=k,
+            v=v,
+        )
 
         use_gradient_checkpointing = bool(getattr(expert, "use_gradient_checkpointing", False))
         return (
@@ -279,6 +458,10 @@ class MoT(nn.Module):
                 - `k`: video key tensor [B, Sv, H*Dh]
                 - `v`: video value tensor [B, Sv, H*Dh]
         """
+        if not self.strict_expert_compat or self.layer_alignment_mode != "strict":
+            raise NotImplementedError(
+                "`prefill_video_cache` currently supports strict-compatible MoT only."
+            )
         if "video" not in self.mixtures:
             raise ValueError("MoT requires `video` expert for `prefill_video_cache`.")
         if video_attention_mask.ndim != 2:
@@ -312,6 +495,8 @@ class MoT(nn.Module):
                 gate_mlp,
                 use_gradient_checkpointing,
             ) = self._build_expert_attention_io(
+                name="video",
+                layer_idx=layer_idx,
                 expert=expert,
                 block=block,
                 x=x,
@@ -366,6 +551,10 @@ class MoT(nn.Module):
         Returns:
             Updated action tokens after all layers, shape [B, Sa, D].
         """
+        if not self.strict_expert_compat or self.layer_alignment_mode != "strict":
+            raise NotImplementedError(
+                "`forward_action_with_video_cache` currently supports strict-compatible MoT only."
+            )
         if "action" not in self.mixtures:
             raise ValueError("MoT requires `action` expert for `forward_action_with_video_cache`.")
         if len(video_kv_cache) != self.num_layers:
@@ -403,6 +592,8 @@ class MoT(nn.Module):
                 gate_mlp,
                 use_gradient_checkpointing,
             ) = self._build_expert_attention_io(
+                name="action",
+                layer_idx=layer_idx,
                 expert=expert,
                 block=block,
                 x=x,
@@ -451,14 +642,33 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        detach_video_for_action: bool = False,
+        detach_kv_experts: Optional[set] = None,
+        active_expert_order: Optional[list[str] | tuple[str, ...]] = None,
     ):
-        missing = [k for k in self.expert_order if k not in embeds_all]
+        """Run shared multi-expert attention.
+
+        In strict mode, all experts are mixed at every layer.
+        In hetero tail-overlap mode, each expert runs its prefix layers solo,
+        then participates in mixed attention for the shared overlap suffix.
+        """
+        expert_order = list(active_expert_order) if active_expert_order is not None else self.expert_order
+        if not expert_order:
+            raise ValueError("`active_expert_order` cannot be empty.")
+        unknown_active = [name for name in expert_order if name not in self.mixtures]
+        if unknown_active:
+            raise ValueError(
+                f"`active_expert_order` contains unknown experts: {unknown_active}. "
+                f"Known experts: {self.expert_order}"
+            )
+
+        missing = [k for k in expert_order if k not in embeds_all]
         if missing:
             raise ValueError(f"Missing expert tokens for {missing}")
-        missing = [k for k in self.expert_order if k not in freqs_all]
+        missing = [k for k in expert_order if k not in freqs_all]
         if missing:
             raise ValueError(f"Missing expert freqs for {missing}")
-        missing = [k for k in self.expert_order if k not in t_mod_all]
+        missing = [k for k in expert_order if k not in t_mod_all]
         if missing:
             raise ValueError(f"Missing expert t_mod for {missing}")
 
@@ -467,17 +677,96 @@ class MoT(nn.Module):
         if attention_mask.shape[0] != attention_mask.shape[1]:
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
+        if detach_kv_experts is not None:
+            unknown = set(detach_kv_experts) - set(expert_order)
+            if unknown:
+                raise ValueError(
+                    f"`detach_kv_experts` contains unknown expert names: {sorted(unknown)}. "
+                    f"Known active experts: {expert_order}"
+                )
+
         tokens_all = {k: v for k, v in embeds_all.items()}
 
-        for layer_idx in range(self.num_layers):
+        # Sequence offsets inside [expert_0 | expert_1 | ...] for mask slicing.
+        seq_lens_init = [int(tokens_all[name].shape[1]) for name in expert_order]
+        total_seq_init = int(sum(seq_lens_init))
+        if attention_mask.shape[0] != total_seq_init:
+            raise ValueError(
+                "Attention mask seq length mismatch: "
+                f"mask={attention_mask.shape[0]} vs tokens={total_seq_init}"
+            )
+        seq_offsets = {}
+        start = 0
+        for name, seq_len in zip(expert_order, seq_lens_init):
+            end = start + int(seq_len)
+            seq_offsets[name] = (start, end)
+            start = end
+
+        # Heterogeneous tail-overlap mode: run expert-specific prefix layers without cross-expert mixing.
+        if not self.strict_expert_compat and self.layer_alignment_mode == "tail_overlap":
+            for name in expert_order:
+                prefix_layers = int(self.layer_start_indices[name])
+                if prefix_layers <= 0:
+                    continue
+                expert = self.mixtures[name]
+                x = tokens_all[name]
+                freqs = freqs_all[name]
+                t_mod = t_mod_all[name]
+                row_s, row_e = seq_offsets[name]
+                self_mask = attention_mask[row_s:row_e, row_s:row_e]
+
+                for layer_idx in range(prefix_layers):
+                    block = expert.blocks[layer_idx]
+                    (
+                        q,
+                        k,
+                        v,
+                        residual_x,
+                        gate_msa,
+                        shift_mlp,
+                        scale_mlp,
+                        gate_mlp,
+                        use_gradient_checkpointing,
+                    ) = self._build_expert_attention_io(
+                        name=name,
+                        layer_idx=layer_idx,
+                        expert=expert,
+                        block=block,
+                        x=x,
+                        freqs=freqs,
+                        t_mod=t_mod,
+                    )
+                    mixed = self._attention_with_num_heads(
+                        q_cat=q,
+                        k_cat=k,
+                        v_cat=v,
+                        attention_mask=self_mask,
+                        num_heads=block.num_heads,
+                    )
+                    x = self._apply_post_with_optional_checkpoint(
+                        block=block,
+                        residual_x=residual_x,
+                        gate_msa=gate_msa,
+                        shift_mlp=shift_mlp,
+                        scale_mlp=scale_mlp,
+                        gate_mlp=gate_mlp,
+                        use_gradient_checkpointing=use_gradient_checkpointing,
+                        mixed_slice=mixed,
+                        context_payload=context_all.get(name),
+                    )
+                tokens_all[name] = x
+
+        # Mixed-attention overlap layers.
+        for overlap_idx in range(self.overlap_num_layers):
             q_chunks = []
             k_chunks = []
             v_chunks = []
             cached = {}
             seq_lens = []
 
-            for name in self.expert_order:
+            for name in expert_order:
                 expert = self.mixtures[name]
+                layer_idx = self._expert_layer_idx(name, overlap_idx)
                 block = expert.blocks[layer_idx]
                 x = tokens_all[name]
                 freqs = freqs_all[name]
@@ -494,6 +783,8 @@ class MoT(nn.Module):
                     gate_mlp,
                     use_gradient_checkpointing,
                 ) = self._build_expert_attention_io(
+                    name=name,
+                    layer_idx=layer_idx,
                     expert=expert,
                     block=block,
                     x=x,
@@ -507,6 +798,7 @@ class MoT(nn.Module):
                 seq_lens.append(x.shape[1])
                 cached[name] = {
                     "block": block,
+                    "layer_idx": layer_idx,
                     "residual_x": residual_x,
                     "gate_msa": gate_msa,
                     "shift_mlp": shift_mlp,
@@ -515,26 +807,81 @@ class MoT(nn.Module):
                     "use_gradient_checkpointing": use_gradient_checkpointing,
                 }
 
-            # 3. concat all tokens for mixed attention
             q_cat = torch.cat(q_chunks, dim=1)
             k_cat = torch.cat(k_chunks, dim=1)
             v_cat = torch.cat(v_chunks, dim=1)
 
-            total_seq = q_cat.shape[1]
+            total_seq = int(q_cat.shape[1])
             if attention_mask.shape[0] != total_seq:
                 raise ValueError(
                     "Attention mask seq length mismatch: "
                     f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
                 )
 
-            mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
+            if detach_video_for_action and len(expert_order) == 2 and expert_order[0] == "video" and expert_order[1] == "action":
+                video_seq_len = seq_lens[0]
+                video_mask = attention_mask[:video_seq_len, :total_seq]
+                video_mixed = self._mixed_attention(
+                    q_cat=q_chunks[0], k_cat=k_cat, v_cat=v_cat, attention_mask=video_mask,
+                )
+
+                k_cat_detached = torch.cat([k_chunks[0].detach(), k_chunks[1]], dim=1)
+                v_cat_detached = torch.cat([v_chunks[0].detach(), v_chunks[1]], dim=1)
+                action_mask = attention_mask[video_seq_len:, :total_seq]
+                action_mixed = self._mixed_attention(
+                    q_cat=q_chunks[1], k_cat=k_cat_detached, v_cat=v_cat_detached, attention_mask=action_mask,
+                )
+                mixed = torch.cat([video_mixed, action_mixed], dim=1)
+            elif detach_kv_experts:
+                detach_set = set(detach_kv_experts)
+                per_expert_mixed = []
+                q_start = 0
+                for q_idx, name_q in enumerate(expert_order):
+                    q_seq_len = seq_lens[q_idx]
+                    q_end = q_start + q_seq_len
+                    q_slice = q_chunks[q_idx]
+
+                    k_pieces = []
+                    v_pieces = []
+                    for kv_idx, name_kv in enumerate(expert_order):
+                        if name_kv in detach_set and name_kv != name_q:
+                            k_pieces.append(k_chunks[kv_idx].detach())
+                            v_pieces.append(v_chunks[kv_idx].detach())
+                        else:
+                            k_pieces.append(k_chunks[kv_idx])
+                            v_pieces.append(v_chunks[kv_idx])
+                    k_for_q = torch.cat(k_pieces, dim=1)
+                    v_for_q = torch.cat(v_pieces, dim=1)
+
+                    q_mask = attention_mask[q_start:q_end, :total_seq]
+                    per_expert_mixed.append(
+                        self._mixed_attention(
+                            q_cat=q_slice,
+                            k_cat=k_for_q,
+                            v_cat=v_for_q,
+                            attention_mask=q_mask,
+                        )
+                    )
+                    q_start = q_end
+                mixed = torch.cat(per_expert_mixed, dim=1)
+            else:
+                mixed = self._mixed_attention(
+                    q_cat=q_cat,
+                    k_cat=k_cat,
+                    v_cat=v_cat,
+                    attention_mask=attention_mask,
+                )
 
             start = 0
-            for name, seq_len in zip(self.expert_order, seq_lens):
-                # 4. split mixed attention output and apply post-attention blocks for each expert
+            for name, seq_len in zip(expert_order, seq_lens):
                 end = start + seq_len
                 mixed_slice = mixed[:, start:end, :]
                 cached_expert = cached[name]
+                mixed_slice = self._project_mixed_from_shared(
+                    name=name,
+                    layer_idx=cached_expert["layer_idx"],
+                    mixed=mixed_slice,
+                )
                 block = cached_expert["block"]
                 context_payload = context_all.get(name)
 

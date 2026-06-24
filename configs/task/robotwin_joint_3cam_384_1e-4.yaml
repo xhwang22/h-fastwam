@@ -1,10 +1,5 @@
 # @package _global_
 
-defaults:
-  - override /data: robotwin
-  - override /model: fastwam_joint
-  - _self_
-
 # dataloading
 batch_size: 16
 num_workers: 8

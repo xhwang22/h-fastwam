@@ -10,8 +10,8 @@ gpu_id: 0
 
 model:
   load_text_encoder: true
-  skip_dit_load_from_pretrain: true
-  action_dit_pretrained_path: null
+  skip_dit_load_from_pretrain: false
+  action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 
 EVALUATION:
   robotwin_root: third_party/RoboTwin

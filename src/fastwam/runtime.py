@@ -4,6 +4,7 @@ import inspect
 from pathlib import Path
 
 import torch
+from accelerate import PartialState
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from PIL import Image
@@ -83,11 +84,14 @@ def create_fastwam(
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
+    skip_video_dit_load_from_pretrain: bool = False,
+    visual_encoder=None,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
+    pretrain_checkpoint: str | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -133,6 +137,10 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(visual_encoder, DictConfig):
+        visual_encoder = OmegaConf.to_container(visual_encoder, resolve=True)
+    visual_encoder_config = visual_encoder if isinstance(visual_encoder, dict) else None
+
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -146,6 +154,7 @@ def create_fastwam(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        skip_video_dit_load_from_pretrain=bool(skip_video_dit_load_from_pretrain),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
@@ -155,6 +164,98 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_loss_detach_video_expert=bool(loss.get("action_loss_detach_video_expert", False)),
+        visual_encoder_config=visual_encoder_config,
+        pretrain_checkpoint=pretrain_checkpoint,
+    )
+
+
+def create_fastwam_jepa(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    skip_video_dit_load_from_pretrain: bool = False,
+    visual_encoder=None,
+    action_scheduler=None,
+    loss=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    ac_predictor_checkpoint: str | None = None,
+    pretrain_checkpoint: str | None = None,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Factory for FastWAMJepa — JEPA next-frame predictor + flow-matching action expert."""
+    from .models.wan22.fastwam_jepa import FastWAMJepa
+
+    if isinstance(video_dit_config, DictConfig):
+        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
+    if not isinstance(video_dit_config, dict):
+        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+
+    if isinstance(action_dit_config, DictConfig):
+        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
+    if action_dit_config is None:
+        action_dit_config = {}
+    if not isinstance(action_dit_config, dict):
+        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    if isinstance(action_scheduler, DictConfig):
+        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
+    if action_scheduler is None:
+        raise ValueError("`action_scheduler` is required for FastWAMJepa.")
+    if not isinstance(action_scheduler, dict):
+        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
+    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
+    if missing_keys:
+        raise ValueError(
+            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
+            "Expected keys: train_shift, infer_shift, num_train_timesteps."
+        )
+
+    if isinstance(loss, DictConfig):
+        loss = OmegaConf.to_container(loss, resolve=True)
+    if loss is None:
+        loss = {}
+    if not isinstance(loss, dict):
+        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
+
+    if isinstance(visual_encoder, DictConfig):
+        visual_encoder = OmegaConf.to_container(visual_encoder, resolve=True)
+    visual_encoder_config = visual_encoder if isinstance(visual_encoder, dict) else None
+
+    return FastWAMJepa.from_wan22_pretrained(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        load_text_encoder=bool(load_text_encoder),
+        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
+        redirect_common_files=bool(redirect_common_files),
+        video_dit_config=video_dit_config,
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        skip_video_dit_load_from_pretrain=bool(skip_video_dit_load_from_pretrain),
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_loss_detach_video_expert=bool(loss.get("action_loss_detach_video_expert", False)),
+        video_loss_type=str(loss.get("video_loss_type", "l1")),
+        visual_encoder_config=visual_encoder_config,
+        ac_predictor_checkpoint=ac_predictor_checkpoint,
+        pretrain_checkpoint=pretrain_checkpoint,
     )
 
 
@@ -168,11 +269,14 @@ def create_fastwam_joint(
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
+    skip_video_dit_load_from_pretrain: bool = False,
+    visual_encoder=None,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
+    pretrain_checkpoint: str | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -218,6 +322,10 @@ def create_fastwam_joint(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(visual_encoder, DictConfig):
+        visual_encoder = OmegaConf.to_container(visual_encoder, resolve=True)
+    visual_encoder_config = visual_encoder if isinstance(visual_encoder, dict) else None
+
     return FastWAMJoint.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -231,6 +339,7 @@ def create_fastwam_joint(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        skip_video_dit_load_from_pretrain=bool(skip_video_dit_load_from_pretrain),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
@@ -240,6 +349,62 @@ def create_fastwam_joint(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_loss_detach_video_expert=bool(loss.get("action_loss_detach_video_expert", False)),
+        visual_encoder_config=visual_encoder_config,
+        pretrain_checkpoint=pretrain_checkpoint,
+    )
+
+
+def create_wan22_pretrain(
+    model_id: str,
+    tokenizer_model_id: str,
+    dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    redirect_common_files: bool = True,
+    skip_dit_load_from_pretrain: bool = False,
+    visual_encoder=None,
+    scheduler=None,
+    sigreg_lam_var: float = 1.0,
+    sigreg_lam_cov: float = 1.0,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """Factory for Wan22Pretrain — video-only continue-pretraining model."""
+    from .models.wan22.wan22_pretrain import Wan22Pretrain
+
+    if isinstance(dit_config, DictConfig):
+        dit_config = OmegaConf.to_container(dit_config, resolve=True)
+    if not isinstance(dit_config, dict):
+        raise ValueError(f"`dit_config` must resolve to a dict, got {type(dit_config)}")
+
+    if isinstance(scheduler, DictConfig):
+        scheduler = OmegaConf.to_container(scheduler, resolve=True)
+    if scheduler is None:
+        scheduler = {}
+    if not isinstance(scheduler, dict):
+        raise ValueError(f"`scheduler` must be dict-like, got {type(scheduler)}")
+
+    if isinstance(visual_encoder, DictConfig):
+        visual_encoder = OmegaConf.to_container(visual_encoder, resolve=True)
+    visual_encoder_config = visual_encoder if isinstance(visual_encoder, dict) else None
+
+    return Wan22Pretrain.from_wan22_pretrained(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        load_text_encoder=bool(load_text_encoder),
+        redirect_common_files=bool(redirect_common_files),
+        dit_config=dit_config,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        train_shift=float(scheduler.get("train_shift", 5.0)),
+        infer_shift=float(scheduler.get("infer_shift", 5.0)),
+        num_train_timesteps=int(scheduler.get("num_train_timesteps", 1000)),
+        visual_encoder_config=visual_encoder_config,
+        sigreg_lam_var=float(sigreg_lam_var),
+        sigreg_lam_cov=float(sigreg_lam_cov),
     )
 
 
@@ -253,11 +418,14 @@ def create_fastwam_idm(
     action_dit_config=None,
     action_dit_pretrained_path: str | None = None,
     skip_dit_load_from_pretrain: bool = False,
+    skip_video_dit_load_from_pretrain: bool = False,
+    visual_encoder=None,
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
     redirect_common_files: bool = True,
+    pretrain_checkpoint: str | None = None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -305,6 +473,10 @@ def create_fastwam_idm(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(visual_encoder, DictConfig):
+        visual_encoder = OmegaConf.to_container(visual_encoder, resolve=True)
+    visual_encoder_config = visual_encoder if isinstance(visual_encoder, dict) else None
+
     return FastWAMIDM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -318,6 +490,7 @@ def create_fastwam_idm(
         action_dit_config=action_dit_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        skip_video_dit_load_from_pretrain=bool(skip_video_dit_load_from_pretrain),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
@@ -327,6 +500,9 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        action_loss_detach_video_expert=bool(loss.get("action_loss_detach_video_expert", False)),
+        visual_encoder_config=visual_encoder_config,
+        pretrain_checkpoint=pretrain_checkpoint,
     )
 
 
@@ -335,12 +511,20 @@ def build_datasets(data_cfg: DictConfig):
     if data_cfg.get("val") is None:
         val_ds = train_ds
     else:
+        PartialState().wait_for_everyone()
         train_stats_path = data_cfg.train.get("pretrained_norm_stats")
         default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
         pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
-        logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
-        val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
+        # Check if the val dataset class accepts `pretrained_norm_stats`
+        val_target = data_cfg.val.get("_target_", "")
+        _needs_norm_stats = "lerobot" in val_target.lower() or "robot" in val_target.lower()
+        if _needs_norm_stats:
+            logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
+            val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
+        else:
+            logger.info("Building val dataset (no pretrained_norm_stats needed).")
+            val_ds = instantiate(data_cfg.val)
     return train_ds, val_ds
 
 
@@ -366,11 +550,12 @@ def run_training(cfg: DictConfig):
     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
         OmegaConf.save(config_payload, f)
 
+    train_ds, val_ds = build_datasets(cfg.data)
+
     model_device = _resolve_train_device()
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
-    train_ds, val_ds = build_datasets(cfg.data)
 
     trainer = Wan22Trainer(
         cfg=cfg,

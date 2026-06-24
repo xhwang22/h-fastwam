@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Single-GPU, NON-DeepSpeed smoke test for H-FastWAM backward speed.
+#
+# Purpose: bypass DeepSpeed entirely (no slow init, no ZeRO grad hooks) to
+# isolate whether the ~17-22s backward is caused by DeepSpeed's per-param
+# gradient reduction or by something in the model/autograd itself.
+#
+# Usage:
+#   bash scripts/run_libero_hfastwam_singlecard.sh
+#   FASTWAM_PROFILE_STEPS=5 bash scripts/run_libero_hfastwam_singlecard.sh
+#   NO_CKPT=1 bash scripts/run_libero_hfastwam_singlecard.sh   # also disable grad checkpointing
+set -euo pipefail
+
+CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+if [[ -f "${CONDA_ACTIVATE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONDA_ACTIVATE}" fastwam
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+# --- pick one GPU ---
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# --- make sure DeepSpeed is OFF (plain PyTorch via accelerate) ---
+unset ACCELERATE_USE_DEEPSPEED
+unset ACCELERATE_DEEPSPEED_CONFIG_FILE
+unset DS_CONFIG
+
+# --- offline / fast init ---
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export PYTHONDONTWRITEBYTECODE=1
+export TORCH_EXTENSIONS_DIR="/tmp/torch_ext_single_$$"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# --- lightweight per-step timing on by default ---
+export FASTWAM_PROFILE_STEPS="${FASTWAM_PROFILE_STEPS:-5}"
+
+# --- data / model paths (match the multinode script) ---
+export DIFFSYNTH_MODEL_BASE_PATH="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+ACTION_DIT_PRETRAINED_PATH="${ACTION_DIT_PRETRAINED_PATH:-${REPO_ROOT}/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt}"
+
+RUN_NAME="${RUN_NAME:-libero_hfastwam_singlecard_test}"
+LOG_DIR="${REPO_ROOT}/runs/libero_hfastwam/${RUN_NAME}"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/train.log.rank0"
+
+# Optional: also disable gradient checkpointing to test that hypothesis.
+CKPT_OVERRIDES=()
+if [[ "${NO_CKPT:-0}" == "1" ]]; then
+  CKPT_OVERRIDES=(
+    "model.video_dit_config.use_gradient_checkpointing=false"
+    "model.action_dit_config.use_gradient_checkpointing=false"
+  )
+fi
+
+CMD=(
+  python -u scripts/train.py
+    task=libero_uncond_2cam224_1e-4
+    data=libero_2cam_interleaved
+    model=hfastwam
+    output_dir="${LOG_DIR}"
+    wandb.enabled=false
+    batch_size=1
+    gradient_accumulation_steps=1
+    log_every=1
+    num_workers=0
+    dataloader_timeout=0
+    data.train.num_segments=1
+    data.val.num_segments=1
+    "data.train.dataset_dirs=[${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_10_no_noops_lerobot]"
+    "data.val.dataset_dirs=[${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_10_no_noops_lerobot]"
+    model.visual_encoder_config=null
+    model.visual_encoder=null
+    model.video_dit_config.in_dim=48
+    model.video_dit_config.out_dim=48
+    model.skip_dit_load_from_pretrain=false
+    model.skip_video_dit_load_from_pretrain=false
+    model.action_dit_pretrained_path="${ACTION_DIT_PRETRAINED_PATH}"
+    num_epochs=3
+    max_steps=null
+    model.knowledge_insulation=false
+    model.freeze_language_expert=true
+    model.freeze_video_expert=false
+    model.freeze_action_expert=false
+    model.loss_config.lambda_language=0.0
+    "${CKPT_OVERRIDES[@]}"
+)
+
+echo "[singlecard] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} NO_CKPT=${NO_CKPT:-0} PROFILE_STEPS=${FASTWAM_PROFILE_STEPS}"
+echo "[singlecard] log=${LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
