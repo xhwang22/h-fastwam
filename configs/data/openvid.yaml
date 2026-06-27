@@ -1,0 +1,25 @@
+# Data config: OpenVid-1M dataset
+train:
+  _target_: fastwam.datasets.openvid.OpenVidDataset
+  data_root: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/data/OpenVid_Data
+  num_frames: 17
+  height: 480
+  width: 832
+  csv_name: data/train/OpenVid-1M.csv
+  video_subdir: video
+  fps_subsample: 2
+  precomputed_text_embeds_dir: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/data/OpenVid_text_embeds
+  max_samples: null
+
+# For evaluation, reuse train set (subsample a few videos)
+val:
+  _target_: fastwam.datasets.openvid.OpenVidDataset
+  data_root: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/data/OpenVid_Data
+  num_frames: 17
+  height: 480
+  width: 832
+  csv_name: data/train/OpenVid-1M.csv
+  video_subdir: video
+  fps_subsample: 2
+  precomputed_text_embeds_dir: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/data/OpenVid_text_embeds
+  max_samples: 100

@@ -1,0 +1,329 @@
+================================================================================
+FASTWAM EVALUATION INFRASTRUCTURE - COMPREHENSIVE SUMMARY
+================================================================================
+
+DOCUMENT CREATED: 2026-06-08
+CONTEXT: Training script "run_libero_hfastwam_8card_small_vjepa_predictor.sh"
+         Evaluation via "experiments/libero/eval_libero_single.py"
+
+================================================================================
+SECTION 1: EVALUATION SCRIPTS DISCOVERED IN CODEBASE
+================================================================================
+
+PRIMARY EVALUATION SCRIPTS:
+  1. experiments/libero/eval_libero_single.py
+     - LIBERO simulator-based task evaluation
+     - Runs full episodes on real simulator environment
+     - Supports single-GPU or multi-GPU task parallelism
+     - Outputs: success rates, videos, future video metrics
+  
+  2. experiments/robotwin/eval_robotwin_single.py
+     - RoboTwin simulator-based task evaluation
+     - Same structure as LIBERO evaluation
+     - Supports robot manipulation tasks from RoboTwin
+
+INLINE TRAINING EVALUATION:
+  - Trainer.evaluate() in src/fastwam/trainer.py
+  - Called every eval_every steps during training
+  - Computes validation loss + optional video reconstruction metrics
+  - Saves comparison videos to ${LOG_DIR}/eval/
+
+================================================================================
+SECTION 2: TRAINING SCRIPT ANALYSIS
+================================================================================
+
+SCRIPT: scripts/run_libero_hfastwam_8card_small_vjepa_predictor.sh
+
+HARDWARE SETUP:
+  - GPUs: 8 (via torchrun DDP)
+  - Per-GPU batch: 1
+  - Gradient accumulation: 16
+  - Global batch size: 8 × 1 × 16 = 128
+  - Backend: torchrun (no DeepSpeed)
+  - Master: 127.0.0.1:29500
+
+MODEL CONFIGURATION:
+  - Model name: hfastwam_small_vjepa_predictor
+  - Config: configs/model/hfastwam_small_vjepa_predictor.yaml
+  - Video expert: JEPAPredictor (deterministic, L1 loss)
+  - Language expert: Qwen3-VL-2B (frozen)
+  - Action expert: ActionDiT (flow-matching denoiser)
+  - Visual encoder: V-JEPA 2-AC ViT-g (frozen)
+  - Trainable params: ~3.8B
+
+ARCHITECTURE DETAILS:
+  - Language dims: 16 heads × 128 = 2048-dim, 28 layers
+  - Video dims: 2048-dim input/output (from/to 1408-dim JEPA space)
+  - Action dims: 2048-dim (aligned to language)
+  - MoT mode: tail_overlap (minimal adapters, mostly identity)
+
+DATA CONFIGURATION:
+  - Task: libero_uncond_2cam224_1e-4
+  - Datasets: libero_spatial, libero_object, libero_goal, libero_10
+  - Num frames: 1 segment per batch
+  - Training epochs: 3
+  - Batch size: 1 per GPU
+  - Data format: 2-camera 224×224 observations
+
+CHECKPOINTS:
+  - Location: runs/libero_hfastwam/{RUN_NAME}/checkpoints/weights/step_XXXXXX.pt
+  - Also saves: trainer_state.json (global_step, epoch, batch_in_epoch)
+  - Evaluation videos: runs/libero_hfastwam/{RUN_NAME}/eval/step_XXXXXX_rank_YYY.mp4
+
+ENVIRONMENT:
+  - Offline mode: HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1
+  - NCCL socket: bond1 (Infiniband disabled)
+  - Profiling: 5 steps per measure (FASTWAM_PROFILE_STEPS=5)
+
+================================================================================
+SECTION 3: HOW TO RUN EVALUATION ON 8 GPUs
+================================================================================
+
+SIMPLEST APPROACH (Single GPU):
+  
+  # Step 1: Find checkpoint
+  ls runs/libero_hfastwam/*/checkpoints/weights/step_*.pt
+  
+  # Step 2: Run single task on GPU 0
+  python experiments/libero/eval_libero_single.py \
+    ckpt=runs/libero_hfastwam/libero_hfastwam_8card_small_vjepa_predictor/checkpoints/weights/step_030000.pt \
+    gpu_id=0 \
+    EVALUATION.task_suite_name=libero_spatial \
+    EVALUATION.task_id=0 \
+    EVALUATION.num_trials=5 \
+    EVALUATION.output_dir=./evaluate_results
+  
+  # Step 3: Check results
+  cat evaluate_results/libero_spatial/*/gpu0_task0_results.json | jq '.successes'
+
+PARALLEL APPROACH (All 8 GPUs):
+  
+  # Evaluate 10 spatial tasks across 8 GPUs (1-2 per GPU)
+  for task_id in {0..9}; do
+    gpu_id=$((task_id % 8))
+    python experiments/libero/eval_libero_single.py \
+      ckpt=runs/libero_hfastwam/libero_hfastwam_8card_small_vjepa_predictor/checkpoints/weights/step_030000.pt \
+      gpu_id=$gpu_id \
+      EVALUATION.task_suite_name=libero_spatial \
+      EVALUATION.task_id=$task_id \
+      EVALUATION.num_trials=5 \
+      EVALUATION.output_dir=./evaluate_results &
+  done
+  wait
+  
+  # Aggregate results
+  for f in evaluate_results/libero_spatial/*/gpu*_task*_results.json; do
+    success=$(jq '.successes' $f)
+    total=$(jq '.total_episodes' $f)
+    echo "Task $(jq '.task_id' $f): $success/$total"
+  done
+
+KEY PARAMETERS FOR EVALUATION:
+  - gpu_id: Which GPU to use (0-7)
+  - ckpt: Path to checkpoint (e.g., step_030000.pt)
+  - EVALUATION.task_suite_name: libero_spatial|libero_object|libero_goal|libero_10
+  - EVALUATION.task_id: Task index (0-9 for most suites)
+  - EVALUATION.num_trials: Episodes to run (default 5)
+  - EVALUATION.num_inference_steps: Diffusion steps (default 20, higher=better but slower)
+  - EVALUATION.replan_steps: Action chunk size (default 5)
+  - EVALUATION.visualize_future_video: Compute future video PSNR metrics (false by default)
+
+================================================================================
+SECTION 4: EVALUATION OUTPUTS
+================================================================================
+
+RESULT STRUCTURE:
+  evaluate_results/{task_suite}/{timestamp}/
+  ├── gpu{gpu_id}_task{task_id}_results.json
+  ├── videos/
+  │   ├── task{task_id}_trial0.mp4
+  │   ├── task{task_id}_trial1.mp4
+  │   └── ...
+  └── predicted_videos/  (only if visualize_future_video=true)
+      ├── task{task_id}_trial0_replan0.mp4
+      ├── task{task_id}_trial0_all.mp4
+      └── ...
+
+RESULTS JSON FIELDS:
+  - task_suite: "libero_spatial"
+  - task_id: 0
+  - task_description: "Move the red cube in front of the blue bin"
+  - successes: 5 (out of num_trials)
+  - total_episodes: 5
+  - success_episodes: [0, 1, 2, 3, 4]
+  - failure_episodes: []
+  - start_time: "2026-06-08 12:00:00"
+  - duration: 3600.0 (seconds)
+  - future_video_psnr_mean: 25.3 (if visualize_future_video=true)
+
+================================================================================
+SECTION 5: KEY DIFFERENCES: INLINE TRAINING EVAL vs STANDALONE EVAL
+================================================================================
+
+INLINE EVALUATION (during training, Trainer.evaluate()):
+  - Frequency: Every eval_every steps (default 200)
+  - Dataset: Random sample from validation_dataset (1 sample per rank)
+  - Metrics: val_loss, psnr_rg, ssim_rg, psnr_rd, ssim_rd, psnr_dg, ssim_dg
+  - Video metrics: Compares rollout vs GT, rollout vs VAE decode, VAE vs GT
+  - Output: Videos saved to ${LOG_DIR}/eval/step_XXXXXX_rank_YYY.mp4
+  - Usage: Monitor training progress, detect convergence
+  - GPU usage: Single forward/inference pass per selected rank
+
+STANDALONE EVALUATION (experiments/libero/eval_libero_single.py):
+  - Frequency: User-triggered, one-shot
+  - Environment: Full LIBERO simulator with real episodes
+  - Metrics: Task success rate, rollout videos, optional future video PSNR
+  - Output: Results JSON + videos in evaluate_results/
+  - Usage: Measure real task performance on simulator
+  - GPU usage: Full episodes with closed-loop inference (expensive)
+
+THE RELATIONSHIP:
+  - Inline eval during training ≈ quick progress check
+  - Standalone eval on simulator ≈ comprehensive benchmark
+
+================================================================================
+SECTION 6: CONFIGURATION HIERARCHY
+================================================================================
+
+Hydra searches for configs in this order:
+  1. configs/train.yaml (base)
+  2. configs/task/{task_name}.yaml (e.g., libero_uncond_2cam224_1e-4.yaml)
+  3. configs/model/{model_name}.yaml (e.g., hfastwam_small_vjepa_predictor.yaml)
+  4. configs/data/ (nested in task config)
+  5. CLI overrides (key=value)
+
+EXAMPLE CONFIG STACK:
+  - Base: configs/train.yaml
+  - Task: configs/task/libero_uncond_2cam224_1e-4.yaml
+    └── contains data config with processor settings
+  - Model: configs/model/hfastwam_small_vjepa_predictor.yaml
+    └── defines architecture, loss config, schedulers
+
+================================================================================
+SECTION 7: VISUAL ENCODER & CHECKPOINT VALIDATION
+================================================================================
+
+The evaluation script checks checkpoint compatibility:
+
+1. If checkpoint has visual_encoder weights but model uses VAE:
+   WARNING: Weights will be IGNORED
+   SOLUTION: Set model.visual_encoder in eval config if checkpoint used one
+
+2. If model expects visual_encoder but checkpoint doesn't have weights:
+   WARNING: Projection MLP uses random initialization
+   SOLUTION: Ensure model config matches checkpoint training config
+
+3. For this specific model (hfastwam_small_vjepa_predictor):
+   - Visual encoder: V-JEPA 2-AC ViT-g (frozen, from checkpoint_path)
+   - Skip projection: true (raw 1408-d features)
+   - Model always includes visual_encoder (not optional)
+
+================================================================================
+SECTION 8: COMMON ISSUES & SOLUTIONS
+================================================================================
+
+ISSUE: FileNotFoundError for checkpoint
+  CAUSE: Relative path or checkpoint doesn't exist
+  FIX: Use absolute path or verify: ls runs/libero_hfastwam/*/checkpoints/weights/
+
+ISSUE: dataset_stats.json not found
+  CAUSE: Missing normalization statistics file
+  FIX: Pass explicit path: EVALUATION.dataset_stats_path=/path/to/dataset_stats.json
+       OR ensure it's in checkpoint parent directory (checked automatically)
+
+ISSUE: Visual encoder mismatch warning
+  CAUSE: Training/eval configs differ in visual_encoder settings
+  FIX: Ensure model config matches checkpoint type
+       If trained with visual_encoder, enable it in eval config
+
+ISSUE: CUDA out of memory
+  CAUSE: Large inference steps or batch size
+  FIX: Reduce EVALUATION.num_inference_steps (e.g., 10 instead of 20)
+       Note: Single-episode eval doesn't use batching, so batch size not relevant
+
+ISSUE: Evaluation runs very slowly
+  CAUSE: High num_inference_steps or many trials
+  FIX: Start with EVALUATION.num_trials=1 and EVALUATION.num_inference_steps=10
+       Increase trials after confirming it works
+
+================================================================================
+SECTION 9: METRICS EXPLAINED
+================================================================================
+
+TASK SUCCESS RATE:
+  - successes / total_episodes
+  - Binary: episode either completes (success) or doesn't (failure)
+  - Goal: Maximize
+
+FUTURE VIDEO PSNR (if visualize_future_video=true):
+  - Peak Signal-to-Noise Ratio of predicted future frames vs ground truth
+  - Captured at replan steps, compared to simulator ground truth
+  - Range: 0-∞ (higher is better)
+  - Typical: 15-30 dB for good predictions
+
+VIDEO RECONSTRUCTION METRICS (from inline eval):
+  - psnr_rg: Rollout vs GT (full inference)
+  - ssim_rg: SSIM of rollout vs GT
+  - psnr_rd: Rollout vs VAE reconstruction
+  - psnr_dg: VAE vs GT (lower bound on reconstruction quality)
+  - Note: These are NOT measured in standalone eval (no VAE in vjepa_predictor mode)
+
+ACTION METRICS (from inline eval):
+  - action_l1: Mean absolute error of denormalized actions
+  - action_l2: Mean squared error of denormalized actions
+  - Computed against ground truth actions in validation set
+
+================================================================================
+SECTION 10: QUICK COMMAND REFERENCE
+================================================================================
+
+# Find latest checkpoint
+CKPT=$(ls -t runs/libero_hfastwam/*/checkpoints/weights/step_*.pt | head -1)
+
+# Evaluate single task on GPU 0
+python experiments/libero/eval_libero_single.py \
+  ckpt=$CKPT gpu_id=0 EVALUATION.task_id=0 EVALUATION.num_trials=5
+
+# Evaluate all 10 spatial tasks across 8 GPUs
+for i in {0..9}; do python experiments/libero/eval_libero_single.py \
+  ckpt=$CKPT gpu_id=$((i%8)) EVALUATION.task_id=$i & done; wait
+
+# View results summary
+jq -s '[.[].successes] | add' evaluate_results/libero_spatial/*/gpu*_results.json
+
+# Run with future video prediction metrics
+python experiments/libero/eval_libero_single.py \
+  ckpt=$CKPT gpu_id=0 EVALUATION.visualize_future_video=true
+
+================================================================================
+SECTION 11: FILES REFERENCED IN THIS SUMMARY
+================================================================================
+
+TRAINING:
+  - scripts/run_libero_hfastwam_8card_small_vjepa_predictor.sh (main training script)
+  - configs/task/libero_uncond_2cam224_1e-4.yaml (task config)
+  - configs/model/hfastwam_small_vjepa_predictor.yaml (model config)
+  - scripts/train.py (entry point)
+
+EVALUATION:
+  - experiments/libero/eval_libero_single.py (main evaluation script)
+  - experiments/libero/libero_utils.py (simulator helpers)
+  - src/fastwam/trainer.py (Trainer.evaluate() method)
+
+MODEL & RUNTIME:
+  - src/fastwam/runtime.py (create_fastwam_jepa function)
+  - src/fastwam/trainer.py (Wan22Trainer class)
+  - src/fastwam/models/hfastwam/ (model implementations)
+
+DATA:
+  - src/fastwam/datasets/lerobot/robot_video_dataset.py (data loading)
+  - src/fastwam/datasets/lerobot/processors/fastwam_processor.py (preprocessing)
+
+================================================================================
+END OF SUMMARY
+================================================================================
+
+For detailed information, see:
+  - EVALUATION_GUIDE.md (comprehensive guide with full examples)
+  - QUICK_EVAL_REFERENCE.md (quick reference card)
+  - eval_libero_single.py source code (detailed implementation)

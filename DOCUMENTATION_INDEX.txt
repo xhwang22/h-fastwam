@@ -1,0 +1,341 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                  FASTWAM ARCHITECTURE DOCUMENTATION INDEX                    ║
+║                                                                              ║
+║                    Complete Technical Documentation Package                  ║
+║                          Generated: May 9, 2026                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+📁 LOCATION: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📄 DOCUMENTATION FILES (5 files, 2,317 lines, 87.2 KB total)
+
+1. ✅ README_ARCHITECTURE.md (227 lines, 7.7 KB)
+   ├─ Start here! Overview of all documentation
+   ├─ Quick architecture summary and statistics
+   ├─ How to use each document
+   ├─ Key technical highlights
+   └─ Verification checklist
+
+2. ✅ FastWAM_DOCUMENTATION_SUMMARY.txt (248 lines, 8.5 KB)
+   ├─ Overview of all three detailed documents
+   ├─ Component architecture summary
+   ├─ Training data flow (high-level)
+   ├─ Exact dimensions at each stage
+   ├─ File reference structure
+   ├─ Key technical concepts
+   ├─ Use cases for each document
+   └─ Quick start checklist
+
+3. ✅ FastWAM_Architecture_Complete.md (985 lines, 32 KB)
+   ├─ COMPREHENSIVE SPECIFICATION - Most detailed
+   ├─ Video Expert (WanVideoDiT):
+   │  ├─ Architecture summary (24 blocks, 1280d, 20 heads)
+   │  ├─ Input processing (pre_dit) - lines 509-620
+   │  ├─ DiT block structure (230-268)
+   │  ├─ Self-attention (171-196)
+   │  ├─ Cross-attention (198-221)
+   │  ├─ Output processing (post_dit) - lines 622-626
+   │  └─ Attention masking - lines 473-507
+   ├─ Action Expert (ActionDiT):
+   │  ├─ Architecture summary (24 blocks, 1280d, 20 heads)
+   │  ├─ Module initialization (lines 45-101)
+   │  ├─ Input processing (lines 226-299)
+   │  ├─ Output processing (lines 301-302)
+   │  └─ Loading from pretrained (lines 112-224)
+   ├─ VAE Architecture:
+   │  ├─ Overview (z_dim=16, 4×8 compression)
+   │  ├─ Encoder structure (lines 516-616) - 23 layers
+   │  ├─ ResidualBlock (lines 268-301)
+   │  ├─ AttentionBlock (lines 342-410)
+   │  └─ Decoder (lines 735-837)
+   ├─ Mixture of Transformers:
+   │  ├─ Mixed attention architecture
+   │  ├─ Attention mask structure
+   │  └─ Forward pass signature
+   ├─ FastWAM Main Class:
+   │  ├─ Component assembly (lines 22-98)
+   │  ├─ Scheduler configuration (lines 72-90)
+   │  └─ Loss weighting (lines 94-96)
+   ├─ Training Loss Data Flow:
+   │  ├─ Step 1-2: Build inputs and encode
+   │  ├─ Step 3-4: Add noise to video and action
+   │  ├─ Step 5-6: Expert pre-processing
+   │  ├─ Step 7-9: MoT forward pass
+   │  ├─ Step 10-11: Expert post-processing
+   │  ├─ Step 12-14: Loss computation
+   │  └─ Step 15: Combined loss
+   ├─ Attention Mechanisms:
+   │  ├─ Self-attention (video frames)
+   │  ├─ Cross-attention (text conditioning)
+   │  ├─ Cross-attention (action-to-video)
+   │  └─ Group causal masking
+   └─ Configuration summary table
+
+4. ✅ FastWAM_Data_Flow_Diagram.txt (390 lines, 22 KB)
+   ├─ ASCII VISUALIZATIONS - Great for diagrams
+   ├─ Complete training loop flow diagram
+   │  ├─ Input stage
+   │  ├─ VAE encoding
+   │  ├─ Noise injection
+   │  ├─ Expert pre_dit processing
+   │  ├─ MoT attention mask building
+   │  ├─ MoT forward (24 blocks)
+   │  ├─ Expert post_dit processing
+   │  ├─ Loss computation
+   │  └─ Final loss output
+   ├─ Module interaction map
+   ├─ Key dimensions summary
+   ├─ Attention mask dimensions and patterns
+   │  ├─ Mask structure visualization
+   │  ├─ Causal mask pattern (per-frame)
+   │  └─ Group causal mask pattern (action→video)
+   └─ Exact tensor shapes through pipeline
+
+5. ✅ FastWAM_Code_Reference.md (467 lines, 17 KB)
+   ├─ CODE-LEVEL REFERENCE - For implementation
+   ├─ File locations and class definitions
+   ├─ wan_video_dit.py:
+   │  ├─ WanVideoDiT class (lines 310-667)
+   │  ├─ Key methods table
+   │  ├─ Module components table
+   │  ├─ DiTBlock class (lines 230-268)
+   │  ├─ SelfAttention class (lines 171-196)
+   │  ├─ CrossAttention class (lines 198-221)
+   │  ├─ RoPE function (lines 57-71)
+   │  └─ Sinusoidal embedding (lines 73-94)
+   ├─ action_dit.py:
+   │  ├─ ActionDiT class (lines 32-337)
+   │  ├─ Key methods table
+   │  ├─ Module components table
+   │  ├─ ActionHead class (lines 18-29)
+   │  └─ Backbone key filtering
+   ├─ wan_video_vae.py:
+   │  ├─ WanVideoVAE (lines 1057-1078)
+   │  ├─ VideoVAE_ encoder (lines 516-616)
+   │  ├─ Decoder3d (lines 735-837)
+   │  ├─ ResidualBlock (lines 268-301)
+   │  ├─ AttentionBlock (lines 342-410)
+   │  └─ Layer structure table
+   ├─ fastwam.py:
+   │  ├─ FastWAM class (lines 19-98+)
+   │  ├─ Key methods table
+   │  ├─ Component assembly
+   │  ├─ Scheduler assembly
+   │  ├─ Loss computation (lines 522-643)
+   │  └─ Training loss data flow table
+   ├─ Quick reference tables:
+   │  ├─ Dimension mapping
+   │  ├─ Layer counts summary
+   │  ├─ Hidden dimensions
+   │  └─ Cross-file data flow
+   └─ scheduler_continuous.py methods
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎯 RECOMMENDED READING ORDER
+
+For Different Use Cases:
+
+1️⃣ GETTING STARTED (5 minutes):
+   └─ README_ARCHITECTURE.md
+      → Quick summary, statistics, how to use docs
+
+2️⃣ UNDERSTANDING ARCHITECTURE (30 minutes):
+   └─ FastWAM_DOCUMENTATION_SUMMARY.txt
+      → Overview, key concepts, use cases
+
+3️⃣ DETAILED SPECIFICATIONS (1-2 hours):
+   └─ FastWAM_Architecture_Complete.md
+      → Complete technical details, all components
+
+4️⃣ TRACING DATA FLOW (30 minutes):
+   └─ FastWAM_Data_Flow_Diagram.txt
+      → Visual diagrams, tensor shapes, masks
+
+5️⃣ CODE IMPLEMENTATION (Ongoing reference):
+   └─ FastWAM_Code_Reference.md
+      → Line numbers, quick lookups, cross-references
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📊 ARCHITECTURE AT A GLANCE
+
+┌─────────────────────────────────────────────────────────────┐
+│                    FASTWAM ARCHITECTURE                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  INPUT PIPELINE:                                            │
+│    Video [B,3,T,H,W] → VAE → Latents [B,16,T/4,H/8,W/8]  │
+│    Text → CLIP encoder → Context [B,L,768]                │
+│    Action [B,T,7] → Encode → Tokens [B,T,1280]            │
+│                                                             │
+│  TRANSFORMER PIPELINE (24 blocks):                         │
+│    ┌─ Video Expert ─┬─ Shared MoT ─┬─ Action Expert ─┐   │
+│    │  24 DiT blocks │  24 blocks    │  24 DiT blocks  │   │
+│    │  3D RoPE       │  Mixed attn   │  1D RoPE        │   │
+│    │  1280d hidden  │  Causal mask  │  1280d hidden   │   │
+│    │  20 heads      │  Group causal │  20 heads       │   │
+│    │  AdaLN x6      │  Flow matched │  AdaLN x6       │   │
+│    └─────────────────────────────────────────────────────┘  │
+│                                                             │
+│  OUTPUT PIPELINE:                                           │
+│    Video predictions [B,16,T/4,H/8,W/8]                    │
+│    Action predictions [B,T,7]                              │
+│                                                             │
+│  LOSS COMPUTATION:                                         │
+│    loss_total = λ_v·MSE(video) + λ_a·MSE(action)          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🔑 KEY NUMBERS TO REMEMBER
+
+Experts:
+  ✓ 24 DiT blocks each
+  ✓ 1280 hidden dimension
+  ✓ 20 attention heads
+  ✓ 64 head dimension (1280/20)
+  ✓ 3456 FFN dimension (2.7×)
+
+VAE:
+  ✓ 23 CausalConv3d layers
+  ✓ 16-dimensional latents
+  ✓ 4× temporal compression
+  ✓ 8× spatial compression
+  ✓ 5 downsampling stages
+
+Attention:
+  ✓ 6 AdaLN parameters per block (shift, scale, gate for MSA/MLP)
+  ✓ 3 RoPE dimensions for video (temporal, height, width)
+  ✓ 1 RoPE dimension for action (sequence)
+  ✓ 4 attention patterns in MoT mask
+
+Scheduling:
+  ✓ 1000 noise timesteps
+  ✓ 2 schedulers per modality (train/infer)
+  ✓ Flow matching noise schedule
+  ✓ Per-timestep loss weighting
+
+═══════════════════════════════════════════════════════════════════════════════
+
+✨ SPECIAL FEATURES DOCUMENTED
+
+1. Mixture of Transformers (MoT)
+   └─ Unified video-action attention with causal constraints
+
+2. Group Causal Masking
+   └─ Actions see first frame only (temporal consistency)
+
+3. Flow Matching
+   └─ Continuous diffusion with configurable noise schedule
+
+4. Adaptive Layer Normalization (AdaLN)
+   └─ Timestep-dependent modulation (6 params/block)
+
+5. 3D Rotary Position Embeddings (RoPE)
+   └─ Separate frequencies for temporal, height, width
+
+6. Proprioceptive Encoder
+   └─ Optional Linear layer for robot state (if proprio_dim provided)
+
+7. First-Frame Conditioning
+   └─ Optional: keep first frame fixed during training
+
+8. Gradient Checkpointing
+   └─ Memory-efficient training for 24-layer models
+
+═══════════════════════════════════════════════════════════════════════════════
+
+💾 FILE STATISTICS
+
+Document              Lines  Size   Purpose
+─────────────────────────────────────────────────────────────────
+README_ARCHITECTURE    227  7.7 KB  Index & overview
+DOCUMENTATION_SUMMARY  248  8.5 KB  Component summary
+Architecture_Complete  985  32 KB   Full specifications
+Data_Flow_Diagram      390  22 KB   Visual diagrams
+Code_Reference         467  17 KB   Line references
+
+TOTAL:               2,317 87.2 KB
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🔍 DOCUMENT CROSS-REFERENCES
+
+Finding information about...
+
+Video Expert?
+  → FastWAM_Architecture_Complete.md (p. 2-3)
+  → FastWAM_Code_Reference.md (p. 1-2)
+  → FastWAM_Data_Flow_Diagram.txt (p. 1-2)
+
+Action Expert?
+  → FastWAM_Architecture_Complete.md (p. 4-5)
+  → FastWAM_Code_Reference.md (p. 3-4)
+  → FastWAM_Data_Flow_Diagram.txt (p. 2-3)
+
+VAE?
+  → FastWAM_Architecture_Complete.md (p. 6-7)
+  → FastWAM_Code_Reference.md (p. 5-6)
+  → FastWAM_Data_Flow_Diagram.txt (p. 1)
+
+Training Loss?
+  → FastWAM_Architecture_Complete.md (p. 8-11)
+  → FastWAM_Code_Reference.md (p. 8)
+  → FastWAM_Data_Flow_Diagram.txt (p. 1)
+
+Attention Mechanisms?
+  → FastWAM_Architecture_Complete.md (p. 12-13)
+  → FastWAM_Data_Flow_Diagram.txt (p. 4-5)
+
+Exact Line Numbers?
+  → FastWAM_Code_Reference.md (tables throughout)
+
+Tensor Shapes?
+  → FastWAM_Data_Flow_Diagram.txt (dimensions section)
+  → FastWAM_Code_Reference.md (dimension mapping)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+✅ VERIFICATION CHECKLIST
+
+Documentation Completeness:
+  [x] Video Expert fully documented
+  [x] Action Expert fully documented
+  [x] VAE fully documented
+  [x] MoT fully documented
+  [x] Training loss flow documented
+  [x] Attention mechanisms documented
+  [x] Noise scheduling documented
+  [x] Data flow documented
+  [x] Exact line numbers provided
+  [x] Code cross-references provided
+  [x] ASCII diagrams provided
+  [x] Dimension mappings provided
+  [x] Layer counts provided
+  [x] Configuration summary provided
+  [x] Quick reference tables provided
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📞 SUPPORT
+
+For questions about:
+  - Architecture: See FastWAM_Architecture_Complete.md
+  - Code: See FastWAM_Code_Reference.md
+  - Data flow: See FastWAM_Data_Flow_Diagram.txt
+  - Quick info: See FastWAM_DOCUMENTATION_SUMMARY.txt
+  - Overview: See README_ARCHITECTURE.md
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Last Updated: May 9, 2026
+All documentation generated directly from source code
+Exact line numbers verified against FastWAM codebase
+
+Happy documentation reading! 📚
+
+═══════════════════════════════════════════════════════════════════════════════

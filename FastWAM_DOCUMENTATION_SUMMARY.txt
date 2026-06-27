@@ -1,0 +1,248 @@
+# FastWAM Architecture Documentation - Complete Package
+
+## Overview
+
+Three comprehensive technical documents have been created for the FastWAM model architecture:
+
+1. **FastWAM_Architecture_Complete.md** (32 KB, 985 lines)
+   - Complete architectural specification with all details
+   - Video Expert (WanVideoDiT) - 24 DiT blocks, 1280 hidden dim, 20 heads
+   - Action Expert (ActionDiT) - 24 DiT blocks, 1280 hidden dim, 20 heads
+   - VAE Architecture - 23 CausalConv3d layers, z_dim=16
+   - Mixture of Transformers - Mixed attention between modalities
+   - FastWAM Main Class - Component assembly and training loss flow
+   - Training Loss Data Flow - Step-by-step breakdown with dimensions
+   - Attention Mechanisms - Detailed explanation of all attention types
+
+2. **FastWAM_Data_Flow_Diagram.txt** (22 KB, 390 lines)
+   - Complete training loop flow diagram (ASCII art)
+   - Module interaction map
+   - Key dimensions at each stage
+   - Attention mask patterns and group causal masking
+   - Dimension mapping through entire pipeline
+
+3. **FastWAM_Code_Reference.md** (17 KB, 467 lines)
+   - Line-by-line code reference with exact line numbers
+   - File locations and class definitions
+   - Method signatures and return types
+   - Quick lookup tables
+   - Layer count summaries
+   - Hidden dimension mappings
+   - Cross-file data flow references
+
+---
+
+## Key Architecture Summary
+
+### Video Expert (WanVideoDiT)
+- **24 DiT Blocks**: Self-Attention (3D RoPE) → Cross-Attention (Text) → FFN
+- **Dimensions**: hidden_dim=1280, num_heads=20, attn_head_dim=64, ffn_dim=3456
+- **Input**: VAE latents [B, 16, T/4, H/8, W/8]
+- **Processing**: Patchify → Time/Text/Action Embedding → Tokens
+- **Output**: Predicted video latents [B, 16, T/4, H/8, W/8]
+
+### Action Expert (ActionDiT)
+- **24 DiT Blocks**: Identical architecture to video expert for MoT compatibility
+- **Same Dimensions**: hidden_dim=1280, num_heads=20, attn_head_dim=64, ffn_dim=3456
+- **Input**: Noisy actions [B, T_action, 7]
+- **Processing**: Action Encode → Time/Text Embedding → Tokens
+- **Output**: Predicted actions [B, T_action, 7]
+
+### VAE (WanVideoVAE)
+- **Encoder**: 23 CausalConv3d layers (1 init + 4×4 stages + 3 middle + 1 head)
+- **Compression**: Temporal 4× + Spatial 8×, z_dim=16
+- **Input**: Video frames [B, 3, T, H, W]
+- **Output**: Latents [B, 16, T/4, H/8, W/8]
+- **Key Components**: ResidualBlocks, AttentionBlock, CausalConv3d
+
+### Mixture of Transformers (MoT)
+- **Mixed Attention**: Video and action tokens attend together
+- **Attention Mask Structure**:
+  - Video-to-Video: Per-frame causal
+  - Video-to-Action: All allowed (video sees all actions)
+  - Action-to-Video: Group causal (actions see first frame only)
+  - Action-to-Action: All allowed (bidirectional)
+- **24 Shared Blocks**: Enhanced with mixed-modal attention
+
+### Noise Scheduling
+- **Type**: Continuous Flow Matching (WanContinuousFlowMatchScheduler)
+- **Timesteps**: 1000 for both video and action
+- **Operations**: 
+  - `sample_training_t()`: Random t ∈ [0, 1]
+  - `add_noise()`: x_t = α(t)·x + σ(t)·ε
+  - `training_target()`: Compute target for MSE loss
+  - `training_weight()`: Timestep-based loss weighting
+
+### Loss Computation
+```
+loss_total = λ_video · loss_video + λ_action · loss_action
+
+where:
+  loss_video = MSE(pred_video, target_video) with image_is_pad masking
+  loss_action = MSE(pred_action, target_action) with action_is_pad masking
+  λ_video, λ_action: configurable weights (default 1.0)
+```
+
+---
+
+## Training Data Flow (High-Level)
+
+```
+Raw Sample (video, text, action, masks)
+    ↓
+VAE Encode: [B, 3, T, H, W] → [B, 16, T/4, H/8, W/8]
+    ↓
+Add Noise: sample t, add noise to latents and actions
+    ↓
+Video Expert pre_dit: Patchify, embed time/text/action
+    ↓
+Action Expert pre_dit: Embed actions, time, text
+    ↓
+Build MoT Attention Mask: Connect video/action with causal rules
+    ↓
+Mixture of Transformers: 24 blocks of mixed attention
+    ↓
+Video Expert post_dit: Project to latent predictions
+Action Expert post_dit: Project to action predictions
+    ↓
+Compute Loss: MSE with padding masks and timestep weighting
+    ↓
+Return: loss_total, loss_dict (for optimizer)
+```
+
+---
+
+## Exact Dimensions at Each Stage
+
+```
+Input:          [B=4, 3, T=8, H=256, W=256]
+VAE latents:    [B=4, 16, T/4=2, H/8=32, W/8=32]
+Patches:        [B=4, 2×32×32=2048, 1280]
+Text context:   [B=4, L_text=77, 1280]
+Action tokens:  [B=4, T_action=8, 1280]
+Combined:       [B=4, 2048+77+8=2133, 1280]
+
+After MoT:      [B=4, 2133, 1280]
+
+Video output:   [B=4, 2048, 1280] → unpatchify → [B=4, 16, 2, 32, 32]
+Action output:  [B=4, 8, 1280] → project → [B=4, 8, 7]
+
+Loss:           scalar value for backprop
+```
+
+---
+
+## File Reference Structure
+
+```
+fastwam/models/wan22/
+├── fastwam.py
+│   ├── FastWAM.__init__ (lines 22-98)
+│   ├── FastWAM.build_inputs (lines 351-457)
+│   ├── FastWAM.training_loss (lines 522-643)
+│   ├── FastWAM._build_mot_attention_mask (lines 460-481)
+│   └── FastWAM._compute_video_loss_per_sample (lines 498-520)
+│
+├── wan_video_dit.py
+│   ├── WanVideoDiT class (lines 310-667)
+│   ├── WanVideoDiT.pre_dit (lines 509-620)
+│   ├── WanVideoDiT.post_dit (lines 622-626)
+│   ├── DiTBlock class (lines 230-268)
+│   ├── SelfAttention class (lines 171-196)
+│   ├── CrossAttention class (lines 198-221)
+│   └── precompute_freqs_cis (lines 57-71)
+│
+├── action_dit.py
+│   ├── ActionDiT class (lines 32-337)
+│   ├── ActionDiT.from_pretrained (lines 112-224)
+│   ├── ActionDiT.pre_dit (lines 226-299)
+│   ├── ActionDiT.post_dit (lines 301-302)
+│   └── ActionHead class (lines 18-29)
+│
+├── wan_video_vae.py
+│   ├── WanVideoVAE class (lines 1057-1078)
+│   ├── VideoVAE_ encoder (lines 516-616)
+│   ├── Decoder3d class (lines 735-837)
+│   ├── ResidualBlock class (lines 268-301)
+│   └── AttentionBlock class (lines 342-410)
+│
+├── mot.py
+│   └── MoT class (mixed attention orchestrator)
+│
+└── schedulers/
+    └── scheduler_continuous.py
+        └── WanContinuousFlowMatchScheduler
+```
+
+---
+
+## Key Technical Concepts
+
+### Diffusion/Flow Matching
+- Gradual corruption of data with noise
+- Model learns to predict noise or velocity
+- Timestep-dependent noise scheduling
+- Training loss weighted by SNR or similar metric
+
+### Mixture of Transformers
+- Unified attention space for multiple modalities
+- Video and action tokens share DiT blocks
+- Attention mask controls cross-modal interaction
+- Group causal: actions see first frame only
+
+### Rotary Position Embeddings (RoPE)
+- Video: 3D RoPE (temporal, height, width)
+- Action: 1D RoPE (sequence position)
+- Applied only in self-attention (not cross-attention)
+- Precomputed for efficiency
+
+### Adaptive Layer Normalization (AdaLN)
+- 6 parameters per block: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+- Derived from timestep embedding
+- Controls strength of attention and FFN contributions
+
+### Group Causal Masking
+- Action tokens attend only to first video frame
+- Prevents action conditioning on future video states
+- Enforces temporal consistency
+- Grouped by tokens_per_frame
+
+---
+
+## Use Cases for These Documents
+
+1. **Model Architecture Diagram**
+   - Use FastWAM_Data_Flow_Diagram.txt for ASCII art visualizations
+   - Can convert to PowerPoint/Visio/Miro using dimensions
+
+2. **Code Understanding**
+   - FastWAM_Code_Reference.md for quick lookups
+   - Maps concepts to exact line numbers
+
+3. **Implementation**
+   - FastWAM_Architecture_Complete.md for detailed specifications
+   - Exact layer counts, dimensions, and formulas
+
+4. **Training/Debugging**
+   - Data flow diagram for tracing tensor shapes
+   - Loss computation breakdown for optimization
+
+5. **Documentation**
+   - All three files provide comprehensive coverage
+   - Can be included in technical reports or theses
+
+---
+
+## Quick Start Checklist
+
+✓ Video Expert: 24 DiT blocks, 1280d, 20 heads
+✓ Action Expert: 24 DiT blocks, 1280d, 20 heads (must match video)
+✓ VAE: 23 layers encoder/decoder, z_dim=16, 4× temporal, 8× spatial
+✓ MoT: Mixed attention with causal masking patterns
+✓ Noise Scheduling: Flow matching with timestep weighting
+✓ Loss: MSE with modality weighting (λ_video, λ_action)
+✓ Proprio Encoder: Linear projection if proprioceptive input provided
+✓ Training Loss: 15-step forward pass with noise injection
+
+All architectural details, dimensions, and line numbers included in comprehensive documentation.
+

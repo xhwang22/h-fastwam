@@ -1,0 +1,390 @@
+# FastWAM Training Data Flow Diagram
+
+## Complete Training Loop Flow
+
+```
+TRAINING DATA INPUT
+│
+├─ Video frames: [B, 3, T, H, W] (e.g., 256×256)
+├─ Text prompt: "move arm to red cube"
+├─ Action sequence: [B, T_action, 7] (robotic joint angles)
+├─ Proprioceptive state: [B, T, proprio_dim] (optional)
+└─ Masks: image_is_pad, action_is_pad
+
+         │
+         ▼
+  ┌─────────────────────────┐
+  │  VAE ENCODING           │
+  │  (wan_video_vae.py)     │
+  │                         │
+  │  [B, 3, T, H, W]        │
+  │         ▼               │
+  │  [21 CausalConv3d      │
+  │   layers with          │
+  │   ResBlocks]           │
+  │         ▼               │
+  │  [B, 16, T/4, H/8, W/8]│
+  └─────────────────────────┘
+         │
+         ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  NOISE INJECTION & SCHEDULING                           │
+  │  (train_video_scheduler, train_action_scheduler)        │
+  │                                                         │
+  │  Sample timesteps:  t_v ~ U[0,1], t_a ~ U[0,1]        │
+  │  Add noise:         latents = α(t)·x + σ(t)·ε          │
+  │                     noisy_action = α(t)·a + σ(t)·n_a   │
+  │  Compute targets:   target_v = f(x, ε, t)              │
+  │                     target_a = f(a, n_a, t)            │
+  └─────────────────────────────────────────────────────────┘
+         │                        │
+         │ Noisy video latents    │ Noisy actions
+         │ [B,16,T/4,H/8,W/8]    │ [B, T_action, 7]
+         │                        │
+         ▼                        │
+  ┌──────────────────────────┐   │
+  │ VIDEO EXPERT PRE_DIT     │   │
+  │ (wan_video_dit.py)       │   │
+  │                          │   │
+  │ 1. Patchify:             │   │
+  │    Conv3d patch embed    │   │
+  │    → [B, seq, 1280]      │   │
+  │                          │   │
+  │ 2. Time embeddings:      │   │
+  │    freq_dim=256 sinusoid │   │
+  │    → [B, 1280]           │   │
+  │                          │   │
+  │ 3. Text embeddings:      │   │
+  │    CLIP → 2-layer MLP    │   │
+  │    → [B, L_text, 1280]   │   │
+  │                          │   │
+  │ 4. Action embeddings:    │   │
+  │    → [B, T_action, 1280] │   │
+  │                          │   │
+  │ 5. Concatenate:          │   │
+  │    [video, text, action] │   │
+  │    → [B, N_video+L+T, 1280] │
+  │                          │   │
+  │ 6. RoPE (3D):            │   │
+  │    freq_cis precomputed  │   │
+  │                          │   │
+  │ Output: video_pre {      │   │
+  │   tokens: [B, N_v, 1280],   │
+  │   t_mod: [B, 6, 1280],   │   │
+  │   context: [B, L, 1280], │   │
+  │   freqs: [N_v, 1, 32],   │   │
+  │   ...                    │   │
+  │ }                        │   │
+  └──────────────────────────┘   │
+         │                        │
+         │                        ▼
+         │               ┌──────────────────────────┐
+         │               │ACTION EXPERT PRE_DIT     │
+         │               │(action_dit.py)          │
+         │               │                         │
+         │               │1. Encode actions:       │
+         │               │   Linear(7 → 1280)      │
+         │               │   → [B, T_a, 1280]      │
+         │               │                         │
+         │               │2. Time embeddings:      │
+         │               │   freq_dim=256 sinusoid │
+         │               │   → [B, 1280]           │
+         │               │                         │
+         │               │3. Text embeddings:      │
+         │               │   2-layer MLP           │
+         │               │   → [B, L_text, 1280]   │
+         │               │                         │
+         │               │4. RoPE (1D):            │
+         │               │   for action sequence   │
+         │               │                         │
+         │               │Output: action_pre {     │
+         │               │  tokens: [B, T_a, 1280] │
+         │               │  t_mod: [B, 6, 1280],   │
+         │               │  context: [B, L, 1280], │
+         │               │  freqs: [T_a, 1, 32],   │
+         │               │  ...                    │
+         │               │}                        │
+         │               └──────────────────────────┘
+         │                        │
+         │ Video tokens           │ Action tokens
+         │ [B, N_video, 1280]     │ [B, T_action, 1280]
+         │                        │
+         └────────────┬───────────┘
+                      │
+                      ▼
+         ┌────────────────────────────────────┐
+         │  BUILD MoT ATTENTION MASK          │
+         │                                    │
+         │  Structure:                        │
+         │  ┌─────────┬──────────┐            │
+         │  │ Vid-Vid │ Vid-Act  │            │
+         │  ├─────────┼──────────┤            │
+         │  │ Act-Vid │ Act-Act  │            │
+         │  └─────────┴──────────┘            │
+         │                                    │
+         │  - Video-to-Video: Causal (frame)  │
+         │  - Video-to-Action: ALL True       │
+         │  - Action-to-Video: Group causal   │
+         │    (actions→first frame only)      │
+         │  - Action-to-Action: ALL True      │
+         │                                    │
+         │  Output: [N_v+N_a, N_v+N_a]       │
+         └────────────────────────────────────┘
+                      │
+                      ▼
+         ┌──────────────────────────────────────────┐
+         │  MIXTURE OF TRANSFORMERS (MoT)           │
+         │  (mot.py)                                │
+         │                                          │
+         │  ┌─ DiT Block 1 ─────────────────────┐   │
+         │  │ 1. Self-Attn (RoPE):              │   │
+         │  │    video: self ↔ self (causal)    │   │
+         │  │    action: self ↔ self (free)     │   │
+         │  │                                    │   │
+         │  │ 2. Cross-Attn (Text):              │   │
+         │  │    video: ↔ text context           │   │
+         │  │    action: ↔ text context          │   │
+         │  │                                    │   │
+         │  │ 3. Mixed Attention:                │   │
+         │  │    video ↔ action (mask-based)    │   │
+         │  │    action ↔ video (group causal)  │   │
+         │  │                                    │   │
+         │  │ 4. FFN + AdaLN Modulation:         │   │
+         │  │    shift_msa, scale_msa, gate_msa │   │
+         │  │    shift_mlp, scale_mlp, gate_mlp │   │
+         │  │    (6 params/block from t_mod)     │   │
+         │  └─────────────────────────────────────┘   │
+         │  [Repeat 24 times]                       │
+         │                                          │
+         │  Output:                                │
+         │  - video_tokens: [B, N_v, 1280]         │
+         │  - action_tokens: [B, T_a, 1280]        │
+         └──────────────────────────────────────────┘
+                      │
+         ┌────────────┴────────────┐
+         │                         │
+         ▼                         ▼
+   ┌──────────────────────┐  ┌──────────────────────┐
+   │VIDEO EXPERT POST_DIT │  │ACTION EXPERT POST_DIT│
+   │                      │  │                      │
+   │1. Head modulation:   │  │1. Linear projection: │
+   │   final AdaLN step   │  │   Linear(1280 → 7)   │
+   │                      │  │                      │
+   │2. Proj to latent:    │  │Output:               │
+   │   Linear(1280 → 16)  │  │[B, T_action, 7]     │
+   │                      │  │(pred_action)        │
+   │3. Unpatchify:        │  └──────────────────────┘
+   │   reshape + inverse  │
+   │   Conv (pixel shuffle)│
+   │                      │
+   │Output:               │
+   │[B, 16, T(or T-1),   │
+   │  H/8, W/8]          │
+   │(pred_video)         │
+   └──────────────────────┘
+         │                    │
+         │ pred_video         │ pred_action
+         │ [B,16,T',H/8,W/8]  │ [B, T_a, 7]
+         │                    │
+         │ target_video       │ target_action
+         │ [B,16,T',H/8,W/8]  │ [B, T_a, 7]
+         │                    │
+         ▼                    ▼
+   ┌──────────────────────┐  ┌──────────────────────┐
+   │  VIDEO LOSS          │  │  ACTION LOSS         │
+   │                      │  │                      │
+   │MSE(pred, target)     │  │MSE(pred, target)     │
+   │with image_is_pad     │  │with action_is_pad    │
+   │mask                  │  │mask                  │
+   │                      │  │                      │
+   │weight by:            │  │weight by:            │
+   │scheduler.training_   │  │scheduler.training_   │
+   │weight(t_video)       │  │weight(t_action)      │
+   │                      │  │                      │
+   │→ loss_video [scalar] │  │→ loss_action [scalar]│
+   └──────────────────────┘  └──────────────────────┘
+         │                         │
+         │ lambda_video=1.0        │ lambda_action=1.0
+         └──────────┬──────────────┘
+                    │
+                    ▼
+         ┌──────────────────────────┐
+         │  TOTAL LOSS              │
+         │                          │
+         │  loss_total =            │
+         │    λ_v * loss_video +    │
+         │    λ_a * loss_action     │
+         │                          │
+         │  loss_dict = {           │
+         │    "loss_video": ...,    │
+         │    "loss_action": ...,   │
+         │  }                       │
+         │                          │
+         │  return loss_total,      │
+         │         loss_dict        │
+         └──────────────────────────┘
+```
+
+---
+
+## Module Interaction Map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     FastWAM (Main Orchestrator)                 │
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │  Video VAE   │  │ Text Encoder │  │ Tokenizer    │          │
+│  │              │  │ (CLIP/T5)    │  │ (BPE)        │          │
+│  │ z_dim=16     │  │ text_dim=768 │  │              │          │
+│  │ temp_down=4x │  │              │  │              │          │
+│  │ spatial_down │  │              │  │              │          │
+│  │ =8x          │  │              │  │              │          │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
+│         │                 │                  │                  │
+│         │  build_inputs() │                  │                  │
+│         │    (encodes)    │                  │                  │
+│         └────────┬────────┴──────────────────┘                  │
+│                  │                                              │
+│                  ▼                                              │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │ Input Data: latents, context, actions, masks          │    │
+│  └────────────┬───────────────────────────────────────────┘    │
+│               │                                                 │
+│               ▼                                                 │
+│  ┌─────────────────────────┐                                   │
+│  │ Add Noise               │                                   │
+│  │ (Schedulers)            │                                   │
+│  │                         │                                   │
+│  │ train_video_scheduler   │                                   │
+│  │ train_action_scheduler  │                                   │
+│  └────────┬────────────────┘                                   │
+│           │                                                    │
+│    ┌──────┴──────┐                                             │
+│    │             │                                             │
+│    ▼             ▼                                             │
+│ ┌──────────────┐ ┌──────────────┐                            │
+│ │Video Expert  │ │Action Expert │                            │
+│ │(WanVideoDiT) │ │(ActionDiT)   │                            │
+│ │              │ │              │                            │
+│ │ 24 blocks    │ │ 24 blocks    │                            │
+│ │ 1280 hidden  │ │ 1280 hidden  │                            │
+│ │ 20 heads     │ │ 20 heads     │                            │
+│ └──────┬───────┘ └──────┬───────┘                            │
+│        │                 │                                     │
+│        │ pre_dit()       │ pre_dit()                           │
+│        │                 │                                     │
+│        ├─ tokens         ├─ tokens                            │
+│        ├─ t_mod          ├─ t_mod                             │
+│        ├─ context        ├─ context                           │
+│        └─ freqs          └─ freqs                             │
+│                │                │                             │
+│                └────────┬────────┘                             │
+│                         │                                      │
+│                         ▼                                      │
+│         ┌───────────────────────────────┐                     │
+│         │ Mixture of Transformers       │                     │
+│         │ (MoT - Mixed Attention)       │                     │
+│         │                               │                     │
+│         │ _build_mot_attention_mask()   │                     │
+│         │                               │                     │
+│         │ [24 DiT blocks w/ mixed attn] │                     │
+│         │                               │                     │
+│         │ Output:                       │                     │
+│         │ - video tokens (enhanced)     │                     │
+│         │ - action tokens (enhanced)    │                     │
+│         └───────┬─────────────────────┘                       │
+│                 │                                              │
+│        ┌────────┴────────┐                                     │
+│        │                 │                                     │
+│        ▼                 ▼                                     │
+│     post_dit()        post_dit()                              │
+│        │                 │                                     │
+│        ▼                 ▼                                     │
+│    Predictions: loss_video, loss_action                       │
+│        │                 │                                     │
+│        └────────┬────────┘                                     │
+│                 │                                              │
+│                 ▼                                              │
+│        Weighted Combined Loss                                 │
+│        (returned to optimizer)                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Key Dimensions Summary
+
+```
+INPUT STAGE:
+  Video:      [B, 3, T, H, W]           e.g., [4, 3, 8, 256, 256]
+  Action:     [B, T_a, 7]               e.g., [4, 8, 7]
+  Text:       [B, L_text]               e.g., [4, 77]
+
+VAE ENCODING:
+  Latents:    [B, 16, T/4, H/8, W/8]    e.g., [4, 16, 2, 32, 32]
+
+EXPERT INPUTS:
+  Video tokens:   [B, N_v, 1280]        e.g., [4, 256, 1280]  (2×32×32)
+  Action tokens:  [B, T_a, 1280]        e.g., [4, 8, 1280]
+  Text context:   [B, L_text, 1280]     e.g., [4, 77, 1280]
+
+MoT INPUTS:
+  Combined tokens: [B, N_v+T_a+L, 1280] e.g., [4, 341, 1280]
+  Attention mask:  [N_v+T_a, N_v+T_a]   e.g., [264, 264]
+  Video RoPE:      [N_v, 1, 32]         e.g., [256, 1, 32]
+  Action RoPE:     [T_a, 1, 32]         e.g., [8, 1, 32]
+
+EXPERT OUTPUTS:
+  Video pred:     [B, 16, T-1, H/8, W/8] e.g., [4, 16, 1, 32, 32]  (if first-frame cond)
+  Action pred:    [B, T_a, 7]            e.g., [4, 8, 7]
+
+LOSS COMPUTATION:
+  loss_video:     scalar
+  loss_action:    scalar
+  loss_total:     scalar = λ_v·loss_v + λ_a·loss_a
+```
+
+---
+
+## Attention Mask Dimensions and Patterns
+
+```
+MoT Attention Mask: [N_video + N_action, N_video + N_action]
+
+For typical config:
+  N_video = 256 (2×32×32 patches)
+  N_action = 8
+  Total = 264
+
+Mask structure visualization (simplified 4×4):
+  
+  Video rows (Q from video tokens):
+  ┌────────────┬────────────┐
+  │ Causal     │ All True   │  Row 0-3: Video tokens
+  │ (per-frame)│ (→ action) │  Attend to: video (causal) + action (all)
+  └────────────┴────────────┘
+  
+  Action rows (Q from action tokens):
+  ┌────────────┬────────────┐
+  │ GroupCausal│ All True   │  Row 4-7: Action tokens
+  │ (1st frame │ (→ action) │  Attend to: video (first frame only) + action (all)
+  │ only)      │            │
+  └────────────┴────────────┘
+
+Causal mask (per-frame):
+  Each frame has tokens_per_frame tokens
+  Frame i tokens attend to frames 0..i only
+  
+  Example with 3 frames, 4 tokens/frame:
+  Frame 0 (tokens 0-3):   [1,1,1,1 | 0,0,0,0 | 0,0,0,0]
+  Frame 1 (tokens 4-7):   [1,1,1,1 | 1,1,1,1 | 0,0,0,0]
+  Frame 2 (tokens 8-11):  [1,1,1,1 | 1,1,1,1 | 1,1,1,1]
+
+Group causal mask (action→video):
+  All action tokens group-attend only to first frame
+  If tokens_per_frame=4, action can only attend to tokens 0-3
+  
+  All action tokens (0-7):  [1,1,1,1 | 0,0,0,0 | 0,0,0,0]
+```
+

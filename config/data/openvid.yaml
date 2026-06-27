@@ -1,0 +1,25 @@
+# Data config: OpenVid-1M dataset
+train:
+  _target_: fastwam.datasets.openvid.OpenVidDataset
+  data_root: /path/to/OpenVid-1M   # <-- CHANGE THIS to your OpenVid-1M directory
+  num_frames: 17
+  height: 480
+  width: 832
+  csv_name: OpenVid-1M.csv
+  video_subdir: video
+  fps_subsample: 2
+  precomputed_text_embeds_dir: /path/to/OpenVid-1M/text_embeds  # <-- CHANGE THIS or set null to use raw captions
+  max_samples: null
+
+# For evaluation, reuse train set (subsample a few videos)
+val:
+  _target_: fastwam.datasets.openvid.OpenVidDataset
+  data_root: ${data.train.data_root}
+  num_frames: ${data.train.num_frames}
+  height: ${data.train.height}
+  width: ${data.train.width}
+  csv_name: ${data.train.csv_name}
+  video_subdir: ${data.train.video_subdir}
+  fps_subsample: ${data.train.fps_subsample}
+  precomputed_text_embeds_dir: ${data.train.precomputed_text_embeds_dir}
+  max_samples: 100  # small subset for eval
