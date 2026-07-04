@@ -47,8 +47,8 @@ skip_dit_load_from_pretrain: true
 visual_encoder_config:
   encoder_type: vjepa2_ac
   model_name: vjepa2_ac_vit_giant
-  checkpoint_source: local
-  checkpoint_path: /apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/vjepa2/vjepa2-ac-vitg.pt
+  checkpoint_source: torch_hub
+  checkpoint_path: null  # set to local path of vjepa2-ac-vitg.pt
   skip_projection: true     # raw 1408-d features → JEPAPredictor patchify directly
   freeze_backbone: true
   spatial_downsample: 16
@@ -74,7 +74,7 @@ freeze_action_expert: false
 
 language_backend: "qwen3"
 language_model_id: "Qwen/Qwen3-VL-2B-Instruct"
-language_local_files_only: false
+language_local_files_only: true   # load from HF_HOME cache (checkpoints/hf_cache), no network
 
 # JEPAPredictor config — SMALL, aligned to language (16×128=2048, 28 layers).
 # Keys unsupported by JEPAPredictor (has_image_input, freq_dim, etc.) are

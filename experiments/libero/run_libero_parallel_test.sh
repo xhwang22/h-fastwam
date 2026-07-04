@@ -266,7 +266,7 @@ run_libero_eval() {
     mkdir -p /root/.libero
     if [ ! -f /root/.libero/config.yaml ]; then
         echo "Initializing /root/.libero/config.yaml (one-time setup)..."
-        echo N | /apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/envs/libero2/bin/python -c 'from libero.libero import benchmark; benchmark.get_benchmark_dict()' >/dev/null 2>&1 || true
+        echo N | /apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/envs/libero2/bin/python -c 'from libero.libero import benchmark; benchmark.get_benchmark_dict()' >/dev/null 2>&1 || true
     fi
     if [ ! -f /root/.libero/config.yaml ]; then
         echo "ERROR: failed to create /root/.libero/config.yaml; aborting." >&2
@@ -349,7 +349,7 @@ run_libero_eval() {
         # When the task exits, write a status file so the scheduler can detect failures promptly.
         tmux select-pane -t $SESSION_NAME:$pane_info 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
-        tmux send-keys -t $SESSION_NAME:$pane_info "export MUJOCO_GL=osmesa && source /apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate libero2 && export DIFFSYNTH_MODEL_BASE_PATH=/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/  && export PYOPENGL_PLATFORM=osmesa && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+        tmux send-keys -t $SESSION_NAME:$pane_info "export MUJOCO_GL=osmesa && source /apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate libero2 && export DIFFSYNTH_MODEL_BASE_PATH=checkpoints/  && export PYOPENGL_PLATFORM=osmesa && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
             mkdir -p /root/.libero && [ -f /root/.libero/config.yaml ] || echo N | python -c 'from libero.libero import benchmark; benchmark.get_benchmark_dict()' >/dev/null 2>&1; \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \

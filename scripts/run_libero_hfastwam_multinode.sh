@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -80,10 +80,10 @@ info "  MASTER_PORT    = ${MASTER_PORT}"
 info "  NPROC_PER_NODE = ${NPROC_PER_NODE}"
 info "  TOTAL_GPUS     = $(( NNODES * NPROC_PER_NODE ))"
 
-TJ5_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints"
+CKPT_BASE="${REPO_ROOT}/checkpoints"
 ACTION_DIT_FILENAME="ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
 LOCAL_ACTION_DIT_PRETRAINED_PATH="${REPO_ROOT}/checkpoints/${ACTION_DIT_FILENAME}"
-TJ5_ACTION_DIT_PRETRAINED_PATH="${TJ5_BASE}/${ACTION_DIT_FILENAME}"
+TJ5_ACTION_DIT_PRETRAINED_PATH="${CKPT_BASE}/${ACTION_DIT_FILENAME}"
 if [[ -z "${ACTION_DIT_PRETRAINED_PATH:-}" ]]; then
   if [[ -f "${LOCAL_ACTION_DIT_PRETRAINED_PATH}" ]]; then
     ACTION_DIT_PRETRAINED_PATH="${LOCAL_ACTION_DIT_PRETRAINED_PATH}"
@@ -97,11 +97,11 @@ if [[ "${NODE_RANK}" == "0" && ! -f "${ACTION_DIT_PRETRAINED_PATH}" ]]; then
   info "         Override it with ACTION_DIT_PRETRAINED_PATH=/path/to/checkpoint.pt if needed."
 fi
 
-export DIFFSYNTH_MODEL_BASE_PATH="${TJ5_BASE}/"
+export DIFFSYNTH_MODEL_BASE_PATH="${CKPT_BASE}/"
 export MODEL="${MODEL:-hfastwam}"
 export TASK="${TASK:-libero_uncond_2cam224_1e-4}"
 export DATA="${DATA:-libero_2cam_interleaved}"
-export LIBERO_SOURCE_ROOT="${LIBERO_SOURCE_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+export LIBERO_SOURCE_ROOT="${LIBERO_SOURCE_ROOT:-data}"
 export LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-${LIBERO_SOURCE_ROOT}}"
 export CACHE_LIBERO_LOCAL="${CACHE_LIBERO_LOCAL:-0}"
 export LOCAL_LIBERO_DATA_ROOT="${LOCAL_LIBERO_DATA_ROOT:-/tmp/fastwam_data/libero}"

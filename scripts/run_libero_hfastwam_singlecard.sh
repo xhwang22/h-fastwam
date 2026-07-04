@@ -11,7 +11,7 @@
 #   NO_CKPT=1 bash scripts/run_libero_hfastwam_singlecard.sh   # also disable grad checkpointing
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -41,8 +41,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export FASTWAM_PROFILE_STEPS="${FASTWAM_PROFILE_STEPS:-5}"
 
 # --- data / model paths (match the multinode script) ---
-export DIFFSYNTH_MODEL_BASE_PATH="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
-LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data}"
 ACTION_DIT_PRETRAINED_PATH="${ACTION_DIT_PRETRAINED_PATH:-${REPO_ROOT}/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt}"
 
 RUN_NAME="${RUN_NAME:-libero_hfastwam_singlecard_test}"
@@ -82,7 +82,7 @@ CMD=(
     model.skip_dit_load_from_pretrain=false
     model.skip_video_dit_load_from_pretrain=false
     model.action_dit_pretrained_path="${ACTION_DIT_PRETRAINED_PATH}"
-    num_epochs=3
+    num_epochs=10
     max_steps=null
     model.knowledge_insulation=false
     model.freeze_language_expert=true

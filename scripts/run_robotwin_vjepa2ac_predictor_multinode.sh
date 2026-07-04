@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -66,8 +66,8 @@ info "  MASTER_PORT    = ${MASTER_PORT}"
 info "  NPROC_PER_NODE = ${NPROC_PER_NODE}"
 info "  TOTAL_GPUS     = $(( NNODES * NPROC_PER_NODE ))"
 
-TJ5_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints"
-VJEPA2_CKPT="${TJ5_BASE}/vjepa2/vjepa2-ac-vitg.pt"
+CKPT_BASE="${REPO_ROOT}/checkpoints"
+VJEPA2_CKPT="${CKPT_BASE}/vjepa2/vjepa2-ac-vitg.pt"
 
 # Rank-0-only sanity checks
 if [[ "${NODE_RANK}" == "0" ]]; then
@@ -100,7 +100,7 @@ PY
   fi
 fi
 
-export DIFFSYNTH_MODEL_BASE_PATH="${TJ5_BASE}/"
+export DIFFSYNTH_MODEL_BASE_PATH="${CKPT_BASE}/"
 export MODEL="${MODEL:-fastwam_vjepa2ac_predictor}"
 export TASK="${TASK:-robotwin_uncond_3cam_384_1e-4}"
 export DATA="${DATA:-robotwin}"

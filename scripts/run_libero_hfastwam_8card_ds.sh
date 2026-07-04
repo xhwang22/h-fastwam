@@ -26,7 +26,7 @@
 #   NO_CKPT=1 bash scripts/run_libero_hfastwam_8card_ds.sh
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -37,10 +37,24 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # --- 8 GPUs topology ---
+# Single-node: leave NODE_IP_LIST unset.
+# Multi-node:  NODE_IP_LIST="ip0,ip1,..."  (first IP = rank-0/master)
+#              NODE_RANK=<this node's index>  (set per node: 0, 1, 2, ...)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+if [[ -n "${NODE_IP_LIST:-}" ]]; then
+  IFS=',' read -ra _NODES <<< "${NODE_IP_LIST}"
+  NNODES="${#_NODES[@]}"
+  MASTER_ADDR="${MASTER_ADDR:-${_NODES[0]%%:*}}"
+else
+  NNODES=1
+  MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+fi
+NODE_RANK="${NODE_RANK:-0}"
+# shellcheck source=_multinode_ssh_dispatch.sh
+source "${SCRIPT_DIR}/_multinode_ssh_dispatch.sh"
+_multinode_dispatch "${BASH_SOURCE[0]}"
 
 # --- DeepSpeed is ON via the accelerate config; clear any stale overrides. ---
 unset ACCELERATE_USE_DEEPSPEED
@@ -68,8 +82,8 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond1}"
 export FASTWAM_PROFILE_STEPS="${FASTWAM_PROFILE_STEPS:-5}"
 
 # --- data / model paths (match the singlecard script) ---
-export DIFFSYNTH_MODEL_BASE_PATH="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
-LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data}"
 
 # Global batch = nproc * batch_size * grad_accum = 8 * 1 * 16 = 128.
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
@@ -77,7 +91,7 @@ GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 RUN_NAME="${RUN_NAME:-libero_hfastwam_8card_ds}"
 LOG_DIR="${REPO_ROOT}/runs/libero_hfastwam/${RUN_NAME}"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/train.log.rank0"
+LOG_FILE="${LOG_DIR}/train.log.rank${NODE_RANK}"
 
 ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_bf16.yaml}"
 
@@ -93,11 +107,12 @@ fi
 CMD=(
   accelerate launch
     --config_file "${ACCEL_CONFIG}"
-    --num_machines 1
-    --machine_rank 0
+    --num_machines "${NNODES}"
+    --machine_rank "${NODE_RANK}"
     --main_process_ip "${MASTER_ADDR}"
     --main_process_port "${MASTER_PORT}"
-    --num_processes "${NPROC_PER_NODE}"
+    --num_processes "$(( NPROC_PER_NODE * NNODES ))"
+    --deepspeed_multinode_launcher standard
     scripts/train.py
       task=libero_uncond_2cam224_1e-4
       data=libero_2cam_interleaved
@@ -113,7 +128,7 @@ CMD=(
       data.val.num_segments=1
       "data.train.dataset_dirs=[${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_10_no_noops_lerobot]"
       "data.val.dataset_dirs=[${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_10_no_noops_lerobot]"
-      num_epochs=3
+      num_epochs=10
       max_steps=null
       model.knowledge_insulation=false
       model.freeze_language_expert=true

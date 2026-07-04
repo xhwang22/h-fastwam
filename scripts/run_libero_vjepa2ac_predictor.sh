@@ -24,8 +24,8 @@ RUN_NAME="${RUN_NAME:-w1_$(date +%Y-%m-%d_%H-%M-%S)}"
 FOREGROUND="${FOREGROUND:-0}"
 EXTRA="${EXTRA:-}"
 
-TJ5_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints"
-VJEPA2_CKPT="${TJ5_BASE}/vjepa2/vjepa2-ac-vitg.pt"
+CKPT_BASE="${REPO_ROOT}/checkpoints"
+VJEPA2_CKPT="${CKPT_BASE}/vjepa2/vjepa2-ac-vitg.pt"
 
 LOG_DIR="${REPO_ROOT}/runs/libero_vjepa2ac_predictor/${RUN_NAME}"
 LOG_FILE="${LOG_DIR}/train.log"
@@ -88,7 +88,7 @@ if [[ -n "${EXTRA}" ]]; then
 fi
 
 COMMON_ENV=(
-  "DIFFSYNTH_MODEL_BASE_PATH=${TJ5_BASE}/"
+  "DIFFSYNTH_MODEL_BASE_PATH=${CKPT_BASE}/"
   "NUM_GPUS=${NUM_GPUS}"
   "RUN_ID=${RUN_NAME}"
 )

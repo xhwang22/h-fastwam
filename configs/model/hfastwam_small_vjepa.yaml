@@ -29,8 +29,8 @@ skip_dit_load_from_pretrain: true
 visual_encoder_config:
   encoder_type: vjepa2_ac
   model_name: vjepa2_ac_vit_giant
-  checkpoint_source: local
-  checkpoint_path: /apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/vjepa2/vjepa2-ac-vitg.pt
+  checkpoint_source: torch_hub
+  checkpoint_path: null  # set to local path of vjepa2-ac-vitg.pt
   skip_projection: true     # raw 1408d features -> DiT patchify directly
   freeze_backbone: true
   spatial_downsample: 16

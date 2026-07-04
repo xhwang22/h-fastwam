@@ -35,12 +35,12 @@ RUN_NAME="${RUN_NAME:-wan_init_$(date +%Y-%m-%d_%H-%M-%S)}"
 FOREGROUND="${FOREGROUND:-0}"
 EXTRA="${EXTRA:-}"
 
-# Cluster paths — keep big artifacts under /apdcephfs_tj5 because the compute
+# Cluster paths — checkpoints live under checkpoints/ in the repo root
 # nodes live on the tj cluster (cross-cluster cephfs reads make 8-rank
 # torch.load stall in D-state for hours).
-TJ5_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints"
-ACTION_DIT_CKPT="${TJ5_BASE}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
-VJEPA2_CKPT="${TJ5_BASE}/vjepa2/vjepa2-ac-vitg.pt"
+CKPT_BASE="${REPO_ROOT}/checkpoints"
+ACTION_DIT_CKPT="${CKPT_BASE}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
+VJEPA2_CKPT="${CKPT_BASE}/vjepa2/vjepa2-ac-vitg.pt"
 
 LOG_DIR="${REPO_ROOT}/runs/libero_vjepa2ac_ditproj/${RUN_NAME}"
 LOG_FILE="${LOG_DIR}/train.log"
@@ -118,7 +118,7 @@ fi
 
 # Env vars consumed by train_zero1.sh / hydra / training stack.
 COMMON_ENV=(
-  "DIFFSYNTH_MODEL_BASE_PATH=${TJ5_BASE}/"
+  "DIFFSYNTH_MODEL_BASE_PATH=${CKPT_BASE}/"
   "NUM_GPUS=${NUM_GPUS}"
   "RUN_ID=${RUN_NAME}"
 )

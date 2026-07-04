@@ -4,6 +4,7 @@ import inspect
 import functools
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -1366,9 +1367,49 @@ class Wan22Trainer:
             self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+            self._prune_old_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
+
+    def _prune_old_checkpoints(self):
+        """Keep only the most recent ``FASTWAM_KEEP_LAST_CKPT`` checkpoints.
+
+        Removes older ``state/step_XXXXXX`` dirs and ``weights/step_XXXXXX.pt``
+        files (matched by step number) so the (shared, finite) cephfs volume
+        does not fill up under frequent saving. Default keep=3; set
+        ``FASTWAM_KEEP_LAST_CKPT=0`` to disable pruning.
+        """
+        try:
+            keep = int(os.environ.get("FASTWAM_KEEP_LAST_CKPT", "3"))
+        except ValueError:
+            keep = 3
+        if keep <= 0:
+            return
+
+        # Collect saved steps from the state dir (authoritative for resume).
+        steps = []
+        if os.path.isdir(self.state_dir):
+            for name in os.listdir(self.state_dir):
+                m = re.match(r"step_(\d+)$", name)
+                if m:
+                    steps.append(int(m.group(1)))
+        steps = sorted(set(steps))
+        if len(steps) <= keep:
+            return
+
+        for step in steps[:-keep]:
+            tag = f"step_{step:06d}"
+            stale_state = os.path.join(self.state_dir, tag)
+            stale_weights = os.path.join(self.weights_dir, f"{tag}.pt")
+            try:
+                if os.path.isdir(stale_state):
+                    shutil.rmtree(stale_state, ignore_errors=True)
+                if os.path.isfile(stale_weights):
+                    os.remove(stale_weights)
+                logger.info("Pruned old checkpoint %s (keep last %d).", tag, keep)
+            except OSError as exc:
+                logger.warning("Failed to prune checkpoint %s: %s", tag, exc)
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)

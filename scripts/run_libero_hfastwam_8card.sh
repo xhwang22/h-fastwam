@@ -17,7 +17,7 @@
 #   NO_CKPT=1 bash scripts/run_libero_hfastwam_8card.sh   # also disable grad checkpointing
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -28,10 +28,24 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # --- 8 GPUs / torchrun topology ---
+# Single-node: leave NODE_IP_LIST unset.
+# Multi-node:  NODE_IP_LIST="ip0,ip1,..."  (first IP = rank-0/master)
+#              NODE_RANK=<this node's index>  (set per node: 0, 1, 2, ...)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+if [[ -n "${NODE_IP_LIST:-}" ]]; then
+  IFS=',' read -ra _NODES <<< "${NODE_IP_LIST}"
+  NNODES="${#_NODES[@]}"
+  MASTER_ADDR="${MASTER_ADDR:-${_NODES[0]%%:*}}"
+else
+  NNODES=1
+  MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+fi
+NODE_RANK="${NODE_RANK:-0}"
+# shellcheck source=_multinode_ssh_dispatch.sh
+source "${SCRIPT_DIR}/_multinode_ssh_dispatch.sh"
+_multinode_dispatch "${BASH_SOURCE[0]}"
 
 # --- make sure DeepSpeed is OFF (accelerate -> DDP under torchrun) ---
 unset ACCELERATE_USE_DEEPSPEED
@@ -39,6 +53,11 @@ unset ACCELERATE_DEEPSPEED_CONFIG_FILE
 unset DS_CONFIG
 
 # --- offline / fast init ---
+# HF_HOME points at the in-repo (shared-FS) cache holding pre-downloaded model
+# weights (Qwen3-VL-2B etc.); datasets cache stays on node-local disk to avoid
+# cephfs filelock races across ranks.
+export HF_HOME="${HF_HOME:-${REPO_ROOT}/checkpoints/hf_cache}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HOME}/.cache/huggingface/datasets}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
@@ -56,8 +75,8 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond1}"
 export FASTWAM_PROFILE_STEPS="${FASTWAM_PROFILE_STEPS:-5}"
 
 # --- data / model paths (match the singlecard script) ---
-export DIFFSYNTH_MODEL_BASE_PATH="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
-LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data}"
 ACTION_DIT_PRETRAINED_PATH="${ACTION_DIT_PRETRAINED_PATH:-${REPO_ROOT}/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt}"
 
 # Global batch = nproc * batch_size * grad_accum = 8 * 1 * 16 = 128.
@@ -66,7 +85,31 @@ GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 RUN_NAME="${RUN_NAME:-libero_hfastwam_8card}"
 LOG_DIR="${REPO_ROOT}/runs/libero_hfastwam/${RUN_NAME}"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/train.log.rank0"
+LOG_FILE="${LOG_DIR}/train.log.rank${NODE_RANK}"
+
+# --- wandb (default ON) ---
+# API key is read from ~/.wandb_key (chmod 600, NOT in the repo / git / logs).
+# Disable logging entirely with WANDB=0. Override project/group/mode via env.
+WANDB_API_KEY="${WANDB_API_KEY:-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}"
+if [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.wandb_key" ]]; then
+  WANDB_API_KEY="$(tr -d '[:space:]' < "${HOME}/.wandb_key")"
+fi
+WANDB_OVERRIDES=("wandb.enabled=false")
+if [[ "${WANDB:-1}" == "1" ]]; then
+  if [[ -z "${WANDB_API_KEY:-}" ]]; then
+    echo "[8card] ERROR: wandb enabled but no API key (set ~/.wandb_key or export WANDB_API_KEY, or pass WANDB=0)." >&2
+    exit 1
+  fi
+  export WANDB_API_KEY
+  WANDB_OVERRIDES=(
+    "wandb.enabled=true"
+    "wandb.project=${WANDB_PROJECT:-fast-wam}"
+    "wandb.name=${RUN_NAME}"
+    "wandb.mode=${WANDB_MODE:-online}"
+  )
+  [[ -n "${WANDB_ENTITY:-}" ]] && WANDB_OVERRIDES+=("wandb.workspace=${WANDB_ENTITY}")
+  [[ -n "${WANDB_GROUP:-}" ]] && WANDB_OVERRIDES+=("wandb.group=${WANDB_GROUP}")
+fi
 
 # Optional: also disable gradient checkpointing.
 CKPT_OVERRIDES=()
@@ -79,8 +122,8 @@ fi
 
 CMD=(
   torchrun
-    --nnodes=1
-    --node_rank=0
+    --nnodes="${NNODES}"
+    --node_rank="${NODE_RANK}"
     --nproc_per_node="${NPROC_PER_NODE}"
     --master_addr="${MASTER_ADDR}"
     --master_port="${MASTER_PORT}"
@@ -89,7 +132,7 @@ CMD=(
       data=libero_2cam_interleaved
       model=hfastwam
       output_dir="${LOG_DIR}"
-      wandb.enabled=false
+      "${WANDB_OVERRIDES[@]}"
       batch_size=1
       gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}"
       log_every=1
@@ -106,7 +149,7 @@ CMD=(
       model.skip_dit_load_from_pretrain=false
       model.skip_video_dit_load_from_pretrain=false
       model.action_dit_pretrained_path="${ACTION_DIT_PRETRAINED_PATH}"
-      num_epochs=3
+      num_epochs=10
       max_steps=null
       model.knowledge_insulation=false
       model.freeze_language_expert=true
