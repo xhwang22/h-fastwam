@@ -319,11 +319,18 @@ def get_model(usr_args: Dict[str, Any]):
     sim_cfg_path = usr_args.get("sim_cfg_path")
     sim_cfg_name = usr_args.get("sim_cfg_name")
     sim_task = usr_args.get("sim_task")
-    cfg = _compose_sim_cfg(
-        sim_cfg_path=sim_cfg_path,
-        sim_cfg_name=sim_cfg_name,
-        sim_task=sim_task,
-    )
+    sim_resolved_cfg_path = usr_args.get("sim_resolved_cfg_path")
+    if _is_none_like(sim_resolved_cfg_path):
+        cfg = _compose_sim_cfg(
+            sim_cfg_path=sim_cfg_path,
+            sim_cfg_name=sim_cfg_name,
+            sim_task=sim_task,
+        )
+    else:
+        resolved_cfg_path = Path(str(sim_resolved_cfg_path)).expanduser().resolve()
+        if not resolved_cfg_path.is_file():
+            raise FileNotFoundError(f"Resolved simulation config not found: {resolved_cfg_path}")
+        cfg = OmegaConf.load(resolved_cfg_path)
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):

@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>H-FastWAM Framework</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #f3f5f7;
+      font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .canvas {
+      width: min(1740px, calc(100vw - 28px));
+      margin: 14px auto;
+      overflow: auto;
+      border: 1px solid #d8dde3;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 8px 24px rgba(31, 41, 55, 0.08);
+    }
+    svg {
+      display: block;
+      width: 100%;
+      min-width: 1180px;
+      height: auto;
+    }
+    @media print {
+      body { background: #fff; }
+      .canvas { width: 100%; margin: 0; border: 0; box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="canvas">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1760 1040" role="img" aria-labelledby="title desc">
+      <title id="title">H-FastWAM V-JEPA 2.1 Predictor architecture</title>
+      <desc id="desc">
+        A single architecture figure with aligned latent inputs and predictions,
+        three-stream mixture-of-transformers, and a structured-attention inset.
+      </desc>
+
+      <defs>
+        <marker id="arrow-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 L10 5 L0 10 Z" fill="#333941" />
+        </marker>
+        <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 L10 5 L0 10 Z" fill="#327db5" />
+        </marker>
+        <marker id="arrow-gold" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 L10 5 L0 10 Z" fill="#bf8500" />
+        </marker>
+        <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0 0 L10 5 L0 10 Z" fill="#5d8b43" />
+        </marker>
+        <clipPath id="frame-1"><rect x="636" y="918" width="108" height="66" rx="5" /></clipPath>
+        <clipPath id="frame-2"><rect x="758" y="918" width="108" height="66" rx="5" /></clipPath>
+        <clipPath id="frame-3"><rect x="880" y="918" width="108" height="66" rx="5" /></clipPath>
+      </defs>
+
+      <rect x="0" y="0" width="1760" height="1040" fill="#ffffff" />
+
+      <!-- Title -->
+      <text x="880" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#17191c">
+        H-FastWAM · V-JEPA 2.1 Predictor
+      </text>
+      <text x="880" y="72" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" fill="#68707a">
+        Frozen language/visual backbones · trainable world/action experts · 28-layer three-stream MoT
+      </text>
+
+      <!-- Main boundary -->
+      <rect x="130" y="96" width="1500" height="790" rx="27"
+            fill="none" stroke="#777d84" stroke-width="2.5" stroke-dasharray="10 8" />
+      <rect x="168" y="82" width="208" height="34" rx="17" fill="#ffffff" />
+      <text x="272" y="106" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#17191c">
+        H-FastWAM
+      </text>
+
+      <!-- Aligned world outputs -->
+      <text x="845" y="126" text-anchor="middle" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#327db5">
+        Predicted Future Latents
+      </text>
+      <rect x="768" y="145" width="64" height="54" rx="10" fill="#9fc8e7" stroke="#327db5" stroke-width="2.2" />
+      <text x="800" y="179" text-anchor="middle" font-family="Arial, sans-serif" font-size="21" font-weight="700" font-style="italic" fill="#17212a">ẑ₁</text>
+      <rect x="858" y="145" width="64" height="54" rx="10" fill="#9fc8e7" stroke="#327db5" stroke-width="2.2" />
+      <text x="890" y="179" text-anchor="middle" font-family="Arial, sans-serif" font-size="21" font-weight="700" font-style="italic" fill="#17212a">ẑ₂</text>
+      <text x="845" y="219" text-anchor="middle" font-family="Consolas, monospace" font-size="11" fill="#327db5">
+        [B,1664,2,14,28] · latent L1
+      </text>
+
+      <!-- Aligned action outputs -->
+      <text x="1185" y="126" text-anchor="middle" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#bf8500">
+        32-step Action Chunk
+      </text>
+      <path d="M1075 179 C1110 177,1140 158,1177 126 C1214 94,1253 103,1307 166"
+            fill="none" stroke="#bf8500" stroke-width="2.6" marker-end="url(#arrow-gold)" />
+      <rect x="1078" y="203" width="64" height="50" rx="10" fill="#ffe9a7" stroke="#bf8500" stroke-width="2.2" />
+      <text x="1110" y="235" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#17191c">a₁</text>
+      <text x="1185" y="235" text-anchor="middle" font-family="Arial, sans-serif" font-size="19" font-weight="700" fill="#17191c">···</text>
+      <rect x="1225" y="203" width="70" height="50" rx="10" fill="#ffe9a7" stroke="#bf8500" stroke-width="2.2" />
+      <text x="1260" y="235" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#17191c">a₃₂</text>
+      <text x="1185" y="271" text-anchor="middle" font-family="Consolas, monospace" font-size="11" fill="#bf8500">
+        [B,32,7] · flow matching
+      </text>
+
+      <!-- Main MoT container -->
+      <rect x="220" y="292" width="1115" height="266" rx="19" fill="#ffffff" stroke="#69737e" stroke-width="2.4" />
+      <text x="777" y="324" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#17191c">
+        28 × Three-stream Mixture-of-Transformers Layer
+      </text>
+
+      <!-- Expert modules -->
+      <rect x="248" y="344" width="285" height="184" rx="15" fill="#edf5e7" stroke="#608f45" stroke-width="2.2" />
+      <rect x="558" y="344" width="438" height="184" rx="15" fill="#edf7fd" stroke="#327db5" stroke-width="2.2" />
+      <rect x="1021" y="344" width="286" height="184" rx="15" fill="#fff7dd" stroke="#bf8500" stroke-width="2.2" />
+
+      <text x="390" y="375" text-anchor="middle" font-family="Arial, sans-serif" font-size="23" font-weight="700" fill="#24311e">
+        Qwen Language Expert
+      </text>
+      <text x="390" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#5f6d59">
+        frozen · width 2048 · 16 heads
+      </text>
+
+      <text x="777" y="375" text-anchor="middle" font-family="Arial, sans-serif" font-size="25" font-weight="700" fill="#19364b">
+        JEPAPredictor
+      </text>
+      <text x="777" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#607789">
+        trainable · deterministic · 196 tokens
+      </text>
+
+      <text x="1164" y="375" text-anchor="middle" font-family="Arial, sans-serif" font-size="25" font-weight="700" fill="#49370a">
+        ActionDiT
+      </text>
+      <text x="1164" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#806c35">
+        trainable · flow matching · 32 tokens
+      </text>
+
+      <!-- Shared attention band -->
+      <rect x="269" y="413" width="1017" height="59" rx="11" fill="#f4f6f8" stroke="#66717c" stroke-width="2" />
+      <text x="777" y="438" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#20242a">
+        Shared Structured Attention over [ Language | Video | Action ]
+      </text>
+      <text x="777" y="459" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#68717b">
+        concatenate Q/K/V → masked attention (16 × 128) → split back to three expert streams
+      </text>
+
+      <text x="390" y="504" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#5f6d59">
+        Qwen MLP · 2048→6144→2048
+      </text>
+      <text x="777" y="504" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#607789">
+        proprio cross-attn · FFN 2048→8192→2048
+      </text>
+      <text x="1164" y="504" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#806c35">
+        timestep AdaLN · proprio cross-attn · FFN 8192
+      </text>
+
+      <!-- Output arrows -->
+      <path d="M845 344 L845 233" fill="none" stroke="#327db5" stroke-width="2" />
+      <path d="M800 233 L890 233" fill="none" stroke="#327db5" stroke-width="2" />
+      <path d="M800 233 L800 201" fill="none" stroke="#327db5" stroke-width="2" marker-end="url(#arrow-blue)" />
+      <path d="M890 233 L890 201" fill="none" stroke="#327db5" stroke-width="2" marker-end="url(#arrow-blue)" />
+      <path d="M1185 344 L1185 256" fill="none" stroke="#bf8500" stroke-width="2" marker-end="url(#arrow-gold)" />
+      <text x="1200" y="286" font-family="Arial, sans-serif" font-size="10" fill="#bf8500">flow integration</text>
+
+      <!-- Language tokens -->
+      <text x="390" y="593" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#608f45">
+        task tokens · causal
+      </text>
+      <rect x="285" y="608" width="58" height="51" rx="9" fill="#dceecf" stroke="#608f45" stroke-width="2" />
+      <text x="314" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#24311e">l₁</text>
+      <rect x="359" y="608" width="58" height="51" rx="9" fill="#dceecf" stroke="#608f45" stroke-width="2" />
+      <text x="388" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#24311e">l₂</text>
+      <text x="453" y="640" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#24311e">···</text>
+      <rect x="480" y="608" width="58" height="51" rx="9" fill="#dceecf" stroke="#608f45" stroke-width="2" />
+      <text x="509" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#24311e">lL</text>
+      <path d="M390 608 L390 530" fill="none" stroke="#333941" stroke-width="2" marker-end="url(#arrow-black)" />
+
+      <!-- Aligned visual latent row -->
+      <text x="800" y="581" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#327db5">
+        V-JEPA states
+      </text>
+      <rect x="678" y="608" width="64" height="51" rx="9" fill="#8ebfe2" stroke="#327db5" stroke-width="2.2" />
+      <text x="710" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#17212a">z₀</text>
+      <rect x="768" y="608" width="64" height="51" rx="9" fill="#b9d9ee" stroke="#327db5" stroke-width="2.2" />
+      <text x="800" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#17212a">z₁</text>
+      <rect x="858" y="608" width="64" height="51" rx="9" fill="#e2f0f9" stroke="#327db5" stroke-width="2.2" />
+      <text x="890" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" font-weight="700" font-style="italic" fill="#17212a">z₂</text>
+      <text x="710" y="679" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#327db5">context</text>
+      <text x="800" y="679" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#327db5">context + target</text>
+      <text x="890" y="679" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#327db5">target</text>
+      <path d="M710 608 L710 575 L800 575 L800 608" fill="none" stroke="#327db5" stroke-width="2" />
+      <path d="M755 575 L755 530" fill="none" stroke="#327db5" stroke-width="2" marker-end="url(#arrow-blue)" />
+
+      <!-- Action flow tokens -->
+      <text x="1185" y="593" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#bf8500">
+        flow-noised action tokens
+      </text>
+      <rect x="1078" y="608" width="64" height="51" rx="9" fill="#ffe9a7" stroke="#bf8500" stroke-width="2.2" />
+      <text x="1110" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="19" font-weight="700" font-style="italic" fill="#17191c">aτ₁</text>
+      <text x="1185" y="640" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#17191c">···</text>
+      <rect x="1225" y="608" width="70" height="51" rx="9" fill="#ffe9a7" stroke="#bf8500" stroke-width="2.2" />
+      <text x="1260" y="641" text-anchor="middle" font-family="Arial, sans-serif" font-size="19" font-weight="700" font-style="italic" fill="#17191c">aτ₃₂</text>
+      <path d="M1110 608 L1110 575 L1260 575 L1260 608" fill="none" stroke="#bf8500" stroke-width="2" />
+      <path d="M1185 575 L1185 530" fill="none" stroke="#bf8500" stroke-width="2" marker-end="url(#arrow-gold)" />
+
+      <!-- Encoders -->
+      <path d="M250 711 L550 711 L533 765 L267 765 Z" fill="#dceecf" stroke="#687364" stroke-width="2" />
+      <text x="400" y="739" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#24311e">
+        Qwen Token Embedding
+      </text>
+      <text x="400" y="758" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#66705f">
+        vocabulary 151936 · max length 128
+      </text>
+      <path d="M400 711 L400 663" fill="none" stroke="#333941" stroke-width="2" marker-end="url(#arrow-black)" />
+
+      <path d="M610 711 L990 711 L973 765 L627 765 Z" fill="#cfe5f5" stroke="#687364" stroke-width="2" />
+      <text x="800" y="736" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#19364b">
+        Frozen V-JEPA 2.1 ViT-Gigantic
+      </text>
+      <text x="800" y="757" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#607789">
+        3 causal tubelets · 48 blocks · 1664-d
+      </text>
+      <path d="M800 711 L800 663" fill="none" stroke="#327db5" stroke-width="2" marker-end="url(#arrow-blue)" />
+
+      <path d="M1035 711 L1335 711 L1318 765 L1052 765 Z" fill="#ffe7a0" stroke="#687364" stroke-width="2" />
+      <text x="1185" y="739" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#49370a">
+        Action Flow Encoder
+      </text>
+      <text x="1185" y="758" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#806c35">
+        Linear 7→2048 · timestep embedding
+      </text>
+      <path d="M1185 711 L1185 663" fill="none" stroke="#bf8500" stroke-width="2" marker-end="url(#arrow-gold)" />
+
+      <!-- Proprio condition -->
+      <path d="M775 795 L1125 795 L1111 839 L789 839 Z" fill="#e5f1de" stroke="#5d8b43" stroke-width="2" />
+      <text x="950" y="821" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="700" fill="#355126">
+        use s₀ only: [B,8] → Linear 4096 context token
+      </text>
+      <path d="M950 795 L950 560 L835 560 L835 530" fill="none" stroke="#5d8b43" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-green)" />
+      <path d="M950 560 L1164 560 L1164 530" fill="none" stroke="#5d8b43" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#arrow-green)" />
+      <text x="966" y="552" font-family="Arial, sans-serif" font-size="10" fill="#5d8b43">proprio cross-attn</text>
+
+      <!-- Attention inset -->
+      <path d="M1286 442 L1385 442" fill="none" stroke="#68717b" stroke-width="2" marker-end="url(#arrow-black)" />
+      <rect x="1390" y="282" width="198" height="300" rx="15" fill="#ffffff" stroke="#69737e" stroke-width="2" />
+      <text x="1489" y="312" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" font-weight="700" fill="#20242a">
+        Attention Mask
+      </text>
+      <text x="1489" y="331" text-anchor="middle" font-family="Arial, sans-serif" font-size="8" fill="#737b84">
+        row=query · col=key · task-only
+      </text>
+
+      <text x="1452" y="357" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#5d8b43">L</text>
+      <text x="1498" y="357" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#327db5">V</text>
+      <text x="1544" y="357" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#bf8500">A</text>
+      <text x="1419" y="395" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#5d8b43">L</text>
+      <text x="1419" y="441" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#327db5">V</text>
+      <text x="1419" y="487" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#bf8500">A</text>
+
+      <rect x="1430" y="370" width="42" height="42" rx="6" fill="#dceecf" stroke="#608f45" />
+      <text x="1451" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#355126">C</text>
+      <rect x="1477" y="370" width="42" height="42" rx="6" fill="#f2f3f5" stroke="#c4c8cc" />
+      <text x="1498" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#9aa0a6">—</text>
+      <rect x="1524" y="370" width="42" height="42" rx="6" fill="#f2f3f5" stroke="#c4c8cc" />
+      <text x="1545" y="397" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#9aa0a6">—</text>
+
+      <rect x="1430" y="417" width="42" height="42" rx="6" fill="#e7f2df" stroke="#87a873" />
+      <text x="1451" y="444" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#4f7639">✓</text>
+      <rect x="1477" y="417" width="42" height="42" rx="6" fill="#d8ebf7" stroke="#327db5" />
+      <text x="1498" y="444" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="700" fill="#285f87">C</text>
+      <rect x="1524" y="417" width="42" height="42" rx="6" fill="#f2f3f5" stroke="#c4c8cc" />
+      <text x="1545" y="444" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" fill="#9aa0a6">—</text>
+
+      <rect x="1430" y="464" width="42" height="42" rx="6" fill="#e7f2df" stroke="#87a873" />
+      <text x="1451" y="491" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#4f7639">✓</text>
+      <rect x="1477" y="464" width="42" height="42" rx="6" fill="#d8ebf7" stroke="#327db5" />
+      <text x="1498" y="491" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="700" fill="#285f87">z₀</text>
+      <rect x="1524" y="464" width="42" height="42" rx="6" fill="#fff0b8" stroke="#bf8500" />
+      <text x="1545" y="491" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" font-weight="700" fill="#896100">✓</text>
+
+      <text x="1489" y="526" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#68717b">
+        C = causal · ✓ = allowed
+      </text>
+      <text x="1489" y="543" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#68717b">
+        V cannot read actions
+      </text>
+      <text x="1489" y="560" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="#68717b">
+        A reads first visual state only
+      </text>
+
+      <!-- Raw inputs -->
+      <text x="400" y="943" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#5d8b43">
+        Task Prompt
+      </text>
+      <text x="400" y="971" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" fill="#5d8b43">
+        “pick up object → basket”
+      </text>
+      <path d="M400 915 L400 769" fill="none" stroke="#333941" stroke-width="2" marker-end="url(#arrow-black)" />
+
+      <!-- Three clean frame thumbnails -->
+      <g clip-path="url(#frame-1)">
+        <rect x="636" y="918" width="108" height="66" fill="#dbe7ef" />
+        <rect x="650" y="950" width="80" height="22" rx="3" fill="#b9783e" />
+        <rect x="671" y="954" width="38" height="12" fill="#63a5c8" />
+        <path d="M640 927 L665 948 L676 942 M740 927 L718 948 L708 942" fill="none" stroke="#24282d" stroke-width="6" stroke-linecap="round" />
+        <circle cx="678" cy="941" r="5" fill="#24282d" />
+        <circle cx="706" cy="941" r="5" fill="#24282d" />
+      </g>
+      <g clip-path="url(#frame-2)">
+        <rect x="758" y="918" width="108" height="66" fill="#dbe7ef" />
+        <rect x="772" y="950" width="80" height="22" rx="3" fill="#b9783e" />
+        <rect x="793" y="954" width="38" height="12" fill="#63a5c8" />
+        <path d="M762 927 L788 946 L799 941 M862 927 L840 947 L830 941" fill="none" stroke="#24282d" stroke-width="6" stroke-linecap="round" />
+        <circle cx="801" cy="940" r="5" fill="#24282d" />
+        <circle cx="828" cy="940" r="5" fill="#24282d" />
+      </g>
+      <g clip-path="url(#frame-3)">
+        <rect x="880" y="918" width="108" height="66" fill="#dbe7ef" />
+        <rect x="894" y="950" width="80" height="22" rx="3" fill="#b9783e" />
+        <rect x="915" y="954" width="38" height="12" fill="#63a5c8" />
+        <path d="M884 927 L910 945 L922 940 M984 927 L962 946 L952 940" fill="none" stroke="#24282d" stroke-width="6" stroke-linecap="round" />
+        <circle cx="924" cy="939" r="5" fill="#24282d" />
+        <circle cx="950" cy="939" r="5" fill="#24282d" />
+      </g>
+      <rect x="636" y="918" width="108" height="66" rx="5" fill="none" stroke="#aeb6bf" />
+      <rect x="758" y="918" width="108" height="66" rx="5" fill="none" stroke="#aeb6bf" />
+      <rect x="880" y="918" width="108" height="66" rx="5" fill="none" stroke="#aeb6bf" />
+      <text x="750" y="955" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#20242a">···</text>
+      <text x="812" y="1009" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#327db5">
+        9 Dual-camera Context Frames
+      </text>
+      <text x="812" y="1027" text-anchor="middle" font-family="Consolas, monospace" font-size="10" fill="#327db5">
+        [B,3,9,224,448]
+      </text>
+      <path d="M800 912 L800 769" fill="none" stroke="#327db5" stroke-width="2" marker-end="url(#arrow-blue)" />
+
+      <path d="M1105 956 C1140 954,1171 934,1208 902 C1245 870,1286 879,1336 940"
+            fill="none" stroke="#bf8500" stroke-width="2.6" />
+      <text x="1220" y="986" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#bf8500">
+        Action Sequence + Noise
+      </text>
+      <text x="1220" y="1007" text-anchor="middle" font-family="Consolas, monospace" font-size="10" fill="#bf8500">
+        action [B,32,7]
+      </text>
+      <path d="M1185 912 L1185 769" fill="none" stroke="#bf8500" stroke-width="2" marker-end="url(#arrow-gold)" />
+
+      <text x="1038" y="929" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#5d8b43">
+        proprio [B,32,8]
+      </text>
+      <path d="M1038 913 L1038 864 L950 864 L950 843" fill="none" stroke="#5d8b43" stroke-width="2" marker-end="url(#arrow-green)" />
+    </svg>
+  </div>
+</body>
+</html>

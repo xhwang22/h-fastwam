@@ -16,6 +16,11 @@ from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_fro
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
+from fastwam.utils.video_latent_cache import (
+    VideoLatentCacheError,
+    load_video_latent,
+    load_video_latent_cache_manifest,
+)
 from accelerate import PartialState
 logger = get_logger(__name__)
 
@@ -71,6 +76,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        video_latent_cache_dir: Optional[str] = None,
+        drop_video_when_cached: bool = False,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -102,6 +109,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.video_latent_cache_dir = None
+        self.video_latent_cache_manifest = None
+        self.drop_video_when_cached = bool(drop_video_when_cached)
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -137,9 +147,40 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
+
+        if video_latent_cache_dir is not None:
+            self.set_video_latent_cache(
+                cache_dir=video_latent_cache_dir,
+                expected_length=len(self),
+                drop_video=self.drop_video_when_cached,
+            )
         
     def __len__(self):
         return len(self.lerobot_dataset)
+
+    def set_video_latent_cache(
+        self,
+        *,
+        cache_dir: str | os.PathLike,
+        expected_length: Optional[int] = None,
+        drop_video: bool = False,
+    ):
+        expected_length = len(self) if expected_length is None else int(expected_length)
+        manifest = load_video_latent_cache_manifest(
+            cache_dir,
+            expected_length=expected_length,
+        )
+        self.video_latent_cache_dir = os.path.realpath(os.path.expanduser(str(cache_dir)))
+        self.video_latent_cache_manifest = manifest
+        self.drop_video_when_cached = bool(drop_video)
+        self.lerobot_dataset._set_return_images(not self.drop_video_when_cached)
+        logger.info(
+            "Configured video latent cache: dir=%s length=%d drop_video=%s",
+            self.video_latent_cache_dir,
+            expected_length,
+            self.drop_video_when_cached,
+        )
+        return self
 
     def _get(self, idx):
         sample_idx = idx
@@ -165,6 +206,31 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
+
+        sample_idx = int(sample.get("idx", sample_idx))
+
+        if self.video_latent_cache_dir is not None and self.drop_video_when_cached:
+            task = sample["instruction"]
+            if self.override_instruction is not None:
+                task = self.override_instruction
+            instruction = DEFAULT_PROMPT.format(task=task)
+            data = {
+                "video_latents": self._load_cached_video_latent(sample_idx),
+                "action": sample["action"],
+                "proprio": sample["proprio"][:-1, :],
+                "prompt": instruction,
+                "sample_idx": torch.tensor(sample_idx, dtype=torch.long),
+                "image_is_pad": sample["image_is_pad"][self.video_sample_indices],
+                "action_is_pad": sample["action_is_pad"],
+                "proprio_is_pad": sample["proprio_is_pad"],
+            }
+            if self.load_text_context:
+                context, context_mask = self._get_cached_text_context(instruction)
+                context[~context_mask] = 0.0
+                context_mask = torch.ones_like(context_mask)
+                data["context"] = context
+                data["context_mask"] = context_mask
+            return data
         
         image_is_pad = sample["image_is_pad"]
 
@@ -249,10 +315,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
+            "sample_idx": torch.tensor(sample_idx, dtype=torch.long),
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if self.video_latent_cache_dir is not None:
+            data["video_latents"] = self._load_cached_video_latent(sample_idx)
+            if self.drop_video_when_cached:
+                del data["video"]
         if self.load_text_context:
             context, context_mask = self._get_cached_text_context(instruction)
             # NOTE: to keep consistent with wan2.2's behavior
@@ -261,6 +332,19 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             data["context"] = context
             data["context_mask"] = context_mask
         return data
+
+    def _load_cached_video_latent(self, sample_idx: int) -> torch.Tensor:
+        try:
+            return load_video_latent(
+                self.video_latent_cache_dir,
+                self.video_latent_cache_manifest,
+                sample_idx,
+            )
+        except Exception as exc:
+            raise VideoLatentCacheError(
+                f"Failed to load cached video latent for sample {sample_idx} "
+                f"from {self.video_latent_cache_dir}"
+            ) from exc
 
     def _get_cached_text_context(self, prompt: str):
         if self.text_embedding_cache_dir is None:
@@ -299,6 +383,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         try:
             data = self._get(idx)
+        except VideoLatentCacheError:
+            raise
         except Exception as e:
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
@@ -368,6 +454,8 @@ class InterleavedRobotVideoDataset(RobotVideoDataset):
     def __getitem__(self, idx):
         try:
             return self._get_segments(idx)
+        except VideoLatentCacheError:
+            raise
         except Exception as e:
             print(f"Error processing interleaved sample idx {idx}: {e}. Returning a random sample instead.")
             print(traceback.format_exc())

@@ -4,6 +4,7 @@ import inspect
 import functools
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -385,7 +386,7 @@ class Wan22Trainer:
             {"params": dit_params, "lr": self.learning_rate},
         ]
 
-        # Include DINO MLP projection in optimizer if using DINOEncoder and not frozen.
+        # Include the optional visual-encoder projection when it is trainable.
         if getattr(self.model, "use_visual_encoder", False) and not self.freeze_visual_encoder:
             proj_params = [p for p in self.model.visual_encoder.projection.parameters() if p.requires_grad]
             if proj_params:  # skip_projection=True → nn.Identity() → no params
@@ -845,7 +846,7 @@ class Wan22Trainer:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
 
-        # If using DINOEncoder, always unfreeze its MLP projection (backbone stays frozen).
+        # Unfreeze an optional visual-encoder MLP projection (backbone stays frozen).
         if getattr(model, "use_visual_encoder", False) and not self.freeze_visual_encoder:
             proj_params = list(model.visual_encoder.projection.parameters())
             if proj_params:  # has MLP (not skip_projection mode)
@@ -863,6 +864,7 @@ class Wan22Trainer:
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        video_latents = sample.get("video_latents", None)
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -927,8 +929,26 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
+        if video_latents is not None:
+            if not isinstance(video_latents, torch.Tensor):
+                raise TypeError(
+                    f"`sample['video_latents']` must be a tensor, got {type(video_latents)}"
+                )
+            if video_latents.ndim == 4:
+                video_latents = video_latents.unsqueeze(0)
+            if video_latents.ndim != 5:
+                raise ValueError(
+                    "Cached eval video latents must be [D,T,H,W] or [B,D,T,H,W], "
+                    f"got {tuple(video_latents.shape)}"
+                )
+            if video_latents.shape[0] != video.shape[0]:
+                raise ValueError(
+                    f"Cached eval latent batch {video_latents.shape[0]} != video batch {video.shape[0]}"
+                )
+
         return {
             "video": video,
+            "video_latents": video_latents,
             "prompt": prompt,
             "action": action,
             "proprio": proprio,
@@ -1100,12 +1120,11 @@ class Wan22Trainer:
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
 
-        # When using a non-VAE visual encoder (DINO / V-JEPA2), video decode
-        # is unavailable. HFastWAM VAE mode can now use its FastWAM-compatible
-        # infer() path; visual-encoder mode remains action-only.
-        _is_hfastwam = hasattr(model, "language_expert") and hasattr(model, "infer_action")
+        # Action metrics must use the same action-only path as deployment.
+        # VAE models may additionally run joint infer() below for video metrics,
+        # but its returned action must not replace the deployment-aligned result.
+        _can_infer_action = callable(getattr(model, "infer_action", None))
         _can_decode_video = not getattr(model, "use_visual_encoder", False)
-        _is_hfastwam_action_only = _is_hfastwam and not _can_decode_video
 
         prompt = sample["prompt"][0] if sample.get("prompt") is not None else None
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
@@ -1123,16 +1142,24 @@ class Wan22Trainer:
         psnr_rollout_vs_decode = 0.0
         ssim_rollout_vs_decode = 0.0
 
-        if _is_hfastwam_action_only and action is not None:
-            pred = model.infer_action(
-                input_image=input_image,
-                action_horizon=sample.get("action_horizon"),
-                proprio=proprio,
-                prompt=prompt,
-                num_inference_steps=self.eval_num_inference_steps,
-                seed=42,
-                tiled=False,
-            )
+        if _can_infer_action and action is not None:
+            action_infer_kwargs = {
+                "prompt": prompt,
+                "input_image": input_image,
+                "action_horizon": sample.get("action_horizon"),
+                "proprio": proprio,
+                "num_inference_steps": self.eval_num_inference_steps,
+                "seed": 42,
+                "tiled": False,
+            }
+            if sample.get("context") is not None:
+                # FastWAM training commonly omits the text encoder and uses
+                # cached T5 context. This is equivalent to deployment after
+                # prompt encoding, while still exercising infer_action().
+                action_infer_kwargs["prompt"] = None
+                action_infer_kwargs["context"] = sample["context"][0]
+                action_infer_kwargs["context_mask"] = sample["context_mask"][0]
+            pred = model.infer_action(**action_infer_kwargs)
             pred_action = pred.get("action", None)
 
         if _can_decode_video:
@@ -1163,7 +1190,8 @@ class Wan22Trainer:
             )
 
             pred_video = pred["video"]
-            pred_action = pred.get("action", None)
+            if pred_action is None:
+                pred_action = pred.get("action", None)
 
             # 3. inference metrics against GT video
             pred_video_tensor = pil_frames_to_video_tensor(pred_video)
@@ -1366,9 +1394,49 @@ class Wan22Trainer:
             self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+            self._prune_old_checkpoints()
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
+
+    def _prune_old_checkpoints(self):
+        """Keep only the most recent ``FASTWAM_KEEP_LAST_CKPT`` checkpoints.
+
+        Removes older ``state/step_XXXXXX`` dirs and ``weights/step_XXXXXX.pt``
+        files (matched by step number) so the (shared, finite) cephfs volume
+        does not fill up under frequent saving. Default keep=3; set
+        ``FASTWAM_KEEP_LAST_CKPT=0`` to disable pruning.
+        """
+        try:
+            keep = int(os.environ.get("FASTWAM_KEEP_LAST_CKPT", "3"))
+        except ValueError:
+            keep = 3
+        if keep <= 0:
+            return
+
+        # Collect saved steps from the state dir (authoritative for resume).
+        steps = []
+        if os.path.isdir(self.state_dir):
+            for name in os.listdir(self.state_dir):
+                m = re.match(r"step_(\d+)$", name)
+                if m:
+                    steps.append(int(m.group(1)))
+        steps = sorted(set(steps))
+        if len(steps) <= keep:
+            return
+
+        for step in steps[:-keep]:
+            tag = f"step_{step:06d}"
+            stale_state = os.path.join(self.state_dir, tag)
+            stale_weights = os.path.join(self.weights_dir, f"{tag}.pt")
+            try:
+                if os.path.isdir(stale_state):
+                    shutil.rmtree(stale_state, ignore_errors=True)
+                if os.path.isfile(stale_weights):
+                    os.remove(stale_weights)
+                logger.info("Pruned old checkpoint %s (keep last %d).", tag, keep)
+            except OSError as exc:
+                logger.warning("Failed to prune checkpoint %s: %s", tag, exc)
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)

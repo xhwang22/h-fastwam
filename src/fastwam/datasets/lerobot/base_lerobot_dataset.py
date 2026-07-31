@@ -219,12 +219,18 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.action_meta:
             sample["action"][meta["key"]] = self._get_action(meta, lerobot_sample)
 
-        for meta in self.image_meta:
-            sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
+        if self.return_images:
+            for meta in self.image_meta:
+                sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
 
         sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
         sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
-        sample["image_is_pad"] = lerobot_sample[f"{self.image_meta[0]['lerobot_key']}_is_pad"]
+        if self.return_images:
+            sample["image_is_pad"] = lerobot_sample[
+                f"{self.image_meta[0]['lerobot_key']}_is_pad"
+            ]
+        else:
+            sample["image_is_pad"] = torch.zeros(self.obs_size, dtype=torch.bool)
 
         sample = self._get_additional_data(sample, lerobot_sample)
 

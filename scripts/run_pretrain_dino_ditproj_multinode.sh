@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -70,9 +70,9 @@ info "  MASTER_PORT    = ${MASTER_PORT}"
 info "  NPROC_PER_NODE = ${NPROC_PER_NODE}"
 info "  TOTAL_GPUS     = $(( NNODES * NPROC_PER_NODE ))"
 
-TJ5_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints"
+CKPT_BASE="${REPO_ROOT}/checkpoints"
 
-export DIFFSYNTH_MODEL_BASE_PATH="${TJ5_BASE}/"
+export DIFFSYNTH_MODEL_BASE_PATH="${CKPT_BASE}/"
 export MODEL="${MODEL:-pretrain_dino_ditproj}"
 export TASK="${TASK:-pretrain_dino_openvid}"
 export DATA="${DATA:-openvid}"

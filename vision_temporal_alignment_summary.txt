@@ -1,0 +1,149 @@
+FastWAM 首先从 33 个状态帧中每 4 步采样一次，得到
+
+s0, s4, s8, s12, s16, s20, s24, s28, s32
+
+共 9 帧，再由视觉编码器将其压缩成 3 个 latent。不同视觉编码器的压缩方式如下：
+
+1. 原始 Wan VAE
+
+VAE 使用因果 3D 卷积处理全部 9 帧，并在时间维度进行 4 倍下采样。最终三个 latent 的时间终点大致对应 s0、s16 和 s32。每个 latent 可以汇总截至该时间点的历史信息，但不会看到更晚的未来帧。
+
+2. 普通 V-JEPA2.1 和 Qwen3-VL
+
+它们的视觉编码器要求每两帧组成一个 temporal tubelet。9 帧会先补成 10 帧，并组成：
+
+(s0, s4), (s8, s12), (s16, s20), (s24, s28), (s32, s32)
+
+整个视频的 5 个 tubelet 会先一起经过非因果的双向 Transformer attention，然后代码选择第 0、2、4 个位置，即：
+
+(s0, s4), (s16, s20), (s32, s32)
+
+由于选择发生在整段视频完成 attention 之后，后两个 latent 虽然位于 (s16, s20) 和 (s32, s32)，但可能包含全部 9 帧的信息。
+
+为了保证 action 推理时的当前视觉条件不包含未来，首个 latent 会被独立编码的 s0 替换，可以近似理解为：
+
+z0 = E(s0, s0)
+z1 = 整段视频编码后位于 (s16, s20) 的特征
+z2 = 整段视频编码后位于 (s32, s32) 的特征
+
+3. V-JEPA2.1 Predictor
+
+Predictor 开启了 causal_tubelet_encoding，不会把整段视频一起编码，而是分别独立编码三个因果 tubelet：
+
+z0 = E(s0, s0)
+z1 = E(s12, s16)
+z2 = E(s28, s32)
+
+三个 tubelet 彼此不可见，时间终点严格对应 s0、s16 和 s32。Predictor 随后学习 z0 -> z1 和 z1 -> z2。
+
+4. DINO
+
+DINO 是单图像编码器，9 帧会被逐帧独立编码，本身没有跨时间 attention 或历史融合。
+
+理想的时间对齐方式应当保留：
+
+z0 = DINO(s0)
+z1 = DINO(s16)
+z2 = DINO(s32)
+
+但是之前实验使用的当前代码存在时间索引偏差，实际保留的是：
+
+z0 = DINO(s0)
+z1 = DINO(s4)
+z2 = DINO(s20)
+
+因此，之前每个模型的训练与评测配置是一致的，但四种设置之间的 latent 时间语义并未完全对齐。旧 checkpoint 应继续按照其训练时的方式评测；若要进行严格公平的横向比较，需要修正 DINO，并让普通 V-JEPA/Qwen3-VL 使用统一的因果时间编码后重新训练。
+
+新增的 causal-prefix 配置会分别编码截止 s0、s16 和 s32 的三个前缀，并取每个前缀的末端 latent：
+
+z0 = last(E[s0, s0])
+z1 = last(E[s0, s0, s4, s8, s12, s16])
+z2 = last(E[s0, s0, s4, s8, s12, s16, s20, s24, s28, s32])
+
+对应的新启动脚本为：
+
+scripts/run_libero_hfastwam_8card_small_qwen3vl_causal_prefix.sh
+scripts/run_libero_hfastwam_8card_small_vjepa21_causal_prefix.sh
+scripts/run_robotwin_hfastwam_8card_small_qwen3vl_causal_prefix.sh
+scripts/run_robotwin_hfastwam_8card_small_vjepa21_causal_prefix.sh
+
+Native temporal resolution
+==========================
+
+该设置不再强制所有视觉编码器输出 3 个时间 latent，而是保留各自的自然时间分辨率：
+
+Wan VAE:
+9 sampled frames -> 3 causal VAE latents
+
+DINO:
+9 sampled frames -> 9 independent image latents
+
+Qwen3-VL / V-JEPA 2.1 Flow DiT:
+9 sampled frames -> pad to 10 frames -> 5 global video tubelet latents
+
+V-JEPA 2.1 Predictor:
+9 sampled frames -> 5 independent causal tubelets:
+(s0,s0), (s4,s8), (s12,s16), (s20,s24), (s28,s32)
+
+LIBERO:
+
+scripts/run_libero_hfastwam_8card_small_dino_native_temporal.sh
+scripts/run_libero_hfastwam_8card_small_qwen3vl_native_temporal.sh
+scripts/run_libero_hfastwam_8card_small_vjepa21_native_temporal.sh
+scripts/run_libero_hfastwam_8card_small_vjepa21_predictor_native_temporal.sh
+
+RoboTwin:
+
+scripts/run_robotwin_hfastwam_8card_small_dino_native_temporal.sh
+scripts/run_robotwin_hfastwam_8card_small_qwen3vl_native_temporal.sh
+scripts/run_robotwin_hfastwam_8card_small_vjepa21_native_temporal.sh
+scripts/run_robotwin_hfastwam_8card_small_vjepa21_predictor_native_temporal.sh
+
+这些脚本保持 global batch size 128，并通过 gradient accumulation 降低单卡 batch：
+
+DINO T=9: grad_accum=8
+Qwen3-VL / V-JEPA Flow T=5: grad_accum=2
+V-JEPA Predictor T=5: grad_accum=4
+
+DINO native temporal 默认 standardise_output=false，避免训练时 9 帧联合 batch
+standardisation 与 action-only 推理时单帧 standardisation 不一致。可通过显式设置
+STANDARDISE_OUTPUT=true 覆盖。
+
+Automatic visual latent cache
+=============================
+
+上述 8 个 native temporal 脚本现在默认启用视觉 latent 缓存：
+
+1. 启动时检查对应 cache manifest、数据指纹、encoder 权重指纹、实现代码指纹和 shard 布局。
+2. 如果缓存不完整，多卡进程先按 shard 分工计算缺失 latent。
+3. 缓存完成后自动开始正常训练。
+4. 下次使用相同配置启动时直接读取 BF16 safetensors，不再运行视觉 encoder。
+5. cached training 不再解码原始视频，只读取动作、状态、文本和 latent。
+6. evaluation/infer_action 仍然读取实时图像并运行 encoder，不使用离线缓存。
+
+默认目录：
+
+data/video_latent_cache/<benchmark>/<encoder_setting>/{train,val}
+
+可以统一改到其他磁盘：
+
+VIDEO_LATENT_CACHE_ROOT=/path/to/cache \
+  bash scripts/run_libero_hfastwam_8card_small_vjepa21_native_temporal.sh
+
+也可以直接指定某一个实验的完整目录：
+
+VIDEO_LATENT_CACHE_DIR=/path/to/exact/cache \
+  bash scripts/run_robotwin_hfastwam_8card_small_dino_native_temporal.sh
+
+缓存参数可通过以下环境变量覆盖：
+
+LATENT_CACHE_SHARD_SIZE
+LATENT_CACHE_BATCH_SIZE
+LATENT_CACHE_NUM_WORKERS
+LATENT_CACHE_DTYPE
+LATENT_CACHE_DROP_TRAIN_VIDEO
+LATENT_CACHE_INCLUDE_VAL
+
+Qwen3-VL 和普通 V-JEPA Flow 的 native cached 脚本默认关闭 batch-dependent
+standardise_output，以保证逐样本缓存和单帧 action 推理的表示一致。Predictor 的
+causal state-wise standardisation 可以安全缓存，因此保持开启。

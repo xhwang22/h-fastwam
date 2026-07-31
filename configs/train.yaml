@@ -35,6 +35,18 @@ max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
 
+# Optional persistent frozen visual-encoder cache. When enabled, training first
+# fills missing BF16 safetensors shards, then bypasses the encoder on every step.
+video_latent_cache:
+  enabled: false
+  root: null
+  shard_size: 32
+  batch_size: 1
+  num_workers: 4
+  dtype: bf16
+  drop_train_video: true
+  include_val: false
+
 # wandb
 wandb:
   enabled: false

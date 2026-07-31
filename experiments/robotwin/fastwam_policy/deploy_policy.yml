@@ -11,6 +11,7 @@ eval_num_episodes: 100
 sim_cfg_path: null
 sim_task: null
 sim_cfg_name: sim_robotwin.yaml
+sim_resolved_cfg_path: null
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null
@@ -24,3 +25,4 @@ rand_device: cpu
 tiled: false
 timing_enabled: false
 skip_get_obs_within_replan: false
+eval_video_log: true

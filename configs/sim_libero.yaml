@@ -48,6 +48,7 @@ EVALUATION:
 
   # Optional external inputs
   dataset_stats_path: /apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/runs/libero_uncond_2cam224_1e-4/2026-04-01_21-10-12/dataset_stats.json
+  train_config_path: null
   device: cuda
 
 MULTIRUN:

@@ -8,7 +8,7 @@ from pathlib import Path
 
 os.environ["MUJOCO_GL"] = "osmesa"
 os.environ["PYOPENGL_PLATFORM"] = "osmesa"
-os.environ["DIFFSYNTH_MODEL_BASE_PATH"] = "/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
+os.environ.setdefault("DIFFSYNTH_MODEL_BASE_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints"))
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 project_root = Path(__file__).resolve().parent
@@ -75,7 +75,7 @@ def main():
             overrides=[
                 "model=fastwam_vjepa2ac_predictor",
                 "task=libero_uncond_2cam224_1e-4",
-                "ckpt=/apdcephfs_tj5/share_302528826/shaunxhwang/ckpts/libero_vjepa2ac_predictor/step_021700.pt",
+                "ckpt=",
                 "EVALUATION.output_dir=/tmp/debug_sanity_check",
                 "EVALUATION.dataset_stats_path=runs/libero_vjepa2ac_predictor/w1mn_2026-05-11_13-58-10/dataset_stats.json",
             ],

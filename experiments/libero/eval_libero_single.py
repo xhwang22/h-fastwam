@@ -15,7 +15,16 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from tqdm import tqdm
-torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+# LIBERO's get_task_init_states() uses torch.load on pickled numpy init states.
+# torch>=2.6 defaults weights_only=True, which rejects numpy globals; allowlist
+# the ones the init-state pickles need (trusted local files shipped with LIBERO).
+torch.serialization.add_safe_globals([
+    np.core.multiarray._reconstruct,
+    np.core.multiarray.scalar,
+    np.ndarray,
+    np.dtype,
+    type(np.dtype("float64")),
+])
 #try:
 #    import rootutils
 #
@@ -118,6 +127,49 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
         "Please pass EVALUATION.dataset_stats_path=/path/to/dataset_stats.json."
     )
     raise FileNotFoundError(msg)
+
+
+def _resolve_train_config_path(cfg: DictConfig) -> Optional[Path]:
+    explicit = cfg.EVALUATION.get("train_config_path")
+    if explicit is not None and str(explicit).strip().lower() not in {"", "none", "null"}:
+        path = Path(os.path.expanduser(os.path.expandvars(str(explicit))))
+        if not path.is_absolute():
+            path = project_root / path
+        path = path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Training config not found: {path}")
+        return path
+
+    ckpt = Path(os.path.expanduser(os.path.expandvars(str(cfg.ckpt))))
+    if not ckpt.is_absolute():
+        ckpt = project_root / ckpt
+    for parent in list(ckpt.resolve().parents)[:6]:
+        candidate = parent / "config.yaml"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _align_eval_cfg_to_training(cfg: DictConfig) -> tuple[DictConfig, Optional[Path]]:
+    train_config_path = _resolve_train_config_path(cfg)
+    if train_config_path is None:
+        return cfg, None
+
+    train_cfg = OmegaConf.load(train_config_path)
+    runtime_overlay = OmegaConf.create(
+        {
+            "ckpt": cfg.ckpt,
+            "gpu_id": cfg.gpu_id,
+            "EVALUATION": OmegaConf.to_container(cfg.EVALUATION, resolve=True),
+            "MULTIRUN": OmegaConf.to_container(cfg.MULTIRUN, resolve=True),
+        }
+    )
+    aligned_cfg = OmegaConf.merge(train_cfg, runtime_overlay)
+    # Training may consume cached text embeddings without loading the frozen
+    # encoder. Evaluation receives raw task text and must recreate those same
+    # embeddings, so this changes no trainable weights.
+    OmegaConf.update(aligned_cfg, "model.load_text_encoder", True, force_add=True)
+    return aligned_cfg, train_config_path
 
 
 def _validate_visual_encoder_ckpt_compat(model: torch.nn.Module, ckpt: str) -> None:
@@ -729,14 +781,17 @@ def run_single_task(
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
 def eval_single_process(cfg: DictConfig):
     start_time = time.time()
+
+    if cfg.ckpt is None:
+        raise ValueError("cfg.ckpt must not be None.")
+    cfg, train_config_path = _align_eval_cfg_to_training(cfg)
     partial_state = PartialState()
     partial_state.config = cfg
 
     if cfg.get("seed") is not None:
         set_global_seed(int(cfg.seed), get_worker_init_fn=False)
-
-    if cfg.ckpt is None:
-        raise ValueError("cfg.ckpt must not be None.")
+    if train_config_path is not None:
+        logging.info("Aligned LIBERO eval to saved training config: %s", train_config_path)
     _validate_visualize_future_video_cfg(cfg)
 
     env_num = int(cfg.EVALUATION.get("env_num", 1))
@@ -788,6 +843,16 @@ def eval_single_process(cfg: DictConfig):
 
     local_log_dir = Path(cfg.EVALUATION.output_dir)
     local_log_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(
+        config=cfg,
+        f=str(
+            local_log_dir
+            / (
+                f"resolved_eval_config_{cfg.EVALUATION.task_suite_name}_"
+                f"task{int(cfg.EVALUATION.task_id)}.yaml"
+            )
+        ),
+    )
     video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
     predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"

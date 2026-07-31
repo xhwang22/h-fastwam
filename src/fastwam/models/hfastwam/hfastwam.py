@@ -295,9 +295,148 @@ class HFastWAM(nn.Module):
     def _encode_video_latents(self, video: torch.Tensor, tiled: bool = False):
         """Encode [B, 3, T, H, W] → video-expert latents."""
         if self.use_visual_encoder:
+            causal_tubelets = bool(
+                getattr(self.visual_encoder, "causal_tubelet_encoding", False)
+            )
+            causal_prefixes = bool(
+                getattr(self.visual_encoder, "causal_prefix_encoding", False)
+            )
+            if causal_tubelets and causal_prefixes:
+                raise ValueError(
+                    "causal_tubelet_encoding and causal_prefix_encoding are mutually exclusive."
+                )
+            if causal_prefixes:
+                return self._encode_causal_visual_prefixes(video)
+            if causal_tubelets:
+                return self._encode_causal_visual_states(video)
             return self.visual_encoder.encode(video, device=self.device)
         with torch.no_grad():
             return self.vae.encode(video, device=self.device, tiled=tiled)
+
+    @torch.no_grad()
+    def _encode_causal_visual_prefixes(self, video: torch.Tensor) -> torch.Tensor:
+        """Encode prefixes ending at each latent-state anchor without future frames."""
+        if video.ndim != 5 or video.shape[1] != 3:
+            raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
+
+        encoder = self.visual_encoder
+        temporal_patch = int(getattr(encoder, "_temporal_patch", 1))
+        temporal_stride = int(getattr(encoder, "temporal_downsample_factor", 1))
+        if temporal_patch < 1 or temporal_stride < 1:
+            raise ValueError("Visual encoder temporal patch/downsample factors must be positive.")
+
+        _, _, num_frames, _, _ = video.shape
+        if num_frames < 1:
+            raise ValueError("video must contain at least one frame.")
+        if (num_frames - 1) % temporal_stride != 0:
+            raise ValueError(
+                "Causal prefix anchors must include the final frame: "
+                f"num_frames={num_frames}, temporal_stride={temporal_stride}."
+            )
+
+        states = []
+        for frame_index in range(0, num_frames, temporal_stride):
+            prefix = video[:, :, : frame_index + 1]
+            pad_frames = (-prefix.shape[2]) % temporal_patch
+            if pad_frames:
+                first = prefix[:, :, 0:1].expand(-1, -1, pad_frames, -1, -1)
+                prefix = torch.cat([first, prefix], dim=2)
+
+            prefix_latents = encoder.encode(prefix, device=self.device)
+            if prefix_latents.ndim != 5 or prefix_latents.shape[2] < 1:
+                raise ValueError(
+                    "Causal prefix encoding must produce [B,D,T,H,W] with T>=1, "
+                    f"got {tuple(prefix_latents.shape)}."
+                )
+            states.append(prefix_latents[:, :, -1:])
+
+        return torch.cat(states, dim=2)
+
+    @torch.no_grad()
+    def _encode_causal_visual_states(self, video: torch.Tensor) -> torch.Tensor:
+        """Encode each state from only the frames available at that state."""
+        if video.ndim != 5 or video.shape[1] != 3:
+            raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
+
+        encoder = self.visual_encoder
+        temporal_patch = int(getattr(encoder, "_temporal_patch", 1))
+        temporal_stride = int(getattr(encoder, "temporal_downsample_factor", 1))
+        if temporal_patch < 1 or temporal_stride < 1:
+            raise ValueError("Visual encoder temporal patch/downsample factors must be positive.")
+
+        batch_size, channels, num_frames, height, width = video.shape
+        if num_frames < 1:
+            raise ValueError("video must contain at least one frame.")
+        state_indices = range(0, num_frames, temporal_stride)
+        clips = []
+        for frame_index in state_indices:
+            start = frame_index - temporal_patch + 1
+            if start < 0:
+                padding = video[:, :, 0:1].expand(
+                    -1, -1, -start, -1, -1,
+                )
+                clip = torch.cat([padding, video[:, :, : frame_index + 1]], dim=2)
+            else:
+                clip = video[:, :, start : frame_index + 1]
+            if clip.shape[2] != temporal_patch:
+                raise ValueError(
+                    f"Failed to build a {temporal_patch}-frame causal tubelet at "
+                    f"frame {frame_index}: got {clip.shape[2]} frames."
+                )
+            clips.append(clip)
+
+        num_states = len(clips)
+        flat_clips = torch.stack(clips, dim=1).reshape(
+            batch_size * num_states,
+            channels,
+            temporal_patch,
+            height,
+            width,
+        )
+        flat_latents = encoder.encode(flat_clips, device=self.device)
+        if flat_latents.shape[2] != 1:
+            raise ValueError(
+                "Causal tubelet encoding must produce one latent state per clip, "
+                f"got T_lat={flat_latents.shape[2]}."
+            )
+
+        latent_dim, latent_h, latent_w = (
+            flat_latents.shape[1],
+            flat_latents.shape[3],
+            flat_latents.shape[4],
+        )
+        return flat_latents.reshape(
+            batch_size,
+            num_states,
+            latent_dim,
+            latent_h,
+            latent_w,
+        ).permute(0, 2, 1, 3, 4).contiguous()
+
+    @torch.no_grad()
+    def _align_first_conditioning_latent(
+        self,
+        video: torch.Tensor,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match training's clean first latent to single-frame inference."""
+        if (
+            not self.use_visual_encoder
+            or bool(getattr(self.visual_encoder, "causal_tubelet_encoding", False))
+            or bool(getattr(self.visual_encoder, "causal_prefix_encoding", False))
+            or not bool(getattr(self.visual_encoder, "requires_independent_first_frame", False))
+        ):
+            return latents
+
+        first_latent = self._encode_first_frame(video[:, :, 0])
+        if first_latent.shape[1:] != latents[:, :, 0:1].shape[1:]:
+            raise ValueError(
+                "Single-frame and full-video visual latents have incompatible shapes: "
+                f"{tuple(first_latent.shape)} vs {tuple(latents[:, :, 0:1].shape)}."
+            )
+        aligned = latents.clone()
+        aligned[:, :, 0:1] = first_latent.to(device=latents.device, dtype=latents.dtype)
+        return aligned
 
     @torch.no_grad()
     def _encode_first_frame(self, image: torch.Tensor, tiled: bool = False) -> torch.Tensor:
@@ -324,6 +463,42 @@ class HFastWAM(nn.Module):
             frame = video_tensor[:, t].permute(1, 2, 0).numpy()
             frames.append(Image.fromarray(frame))
         return frames
+
+    def _prepare_training_video_latents(
+        self,
+        *,
+        video: Optional[torch.Tensor],
+        cached_latents: Optional[torch.Tensor],
+        tiled: bool = False,
+        source: str,
+    ) -> torch.Tensor:
+        if cached_latents is not None:
+            if not torch.is_tensor(cached_latents) or cached_latents.ndim != 5:
+                raise ValueError(
+                    f"{source} cached video latents must be [B,D,T,H,W], got "
+                    f"{type(cached_latents)} with shape {getattr(cached_latents, 'shape', None)}"
+                )
+            expected_dim = int(
+                self.visual_encoder.z_dim if self.use_visual_encoder else self.vae.model.z_dim
+            )
+            if int(cached_latents.shape[1]) != expected_dim:
+                raise ValueError(
+                    f"{source} cached latent channel mismatch: expected {expected_dim}, "
+                    f"got {cached_latents.shape[1]}."
+                )
+            return cached_latents.detach().to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                non_blocking=True,
+            )
+
+        if video is None:
+            raise ValueError(f"{source} requires either raw video or cached video latents.")
+        video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        if video.ndim != 5 or video.shape[1] != 3:
+            raise ValueError(f"{source} video must be [B,3,T,H,W], got {tuple(video.shape)}")
+        latents = self._encode_video_latents(video, tiled=tiled)
+        return self._align_first_conditioning_latent(video, latents)
 
     # ------------------------------------------------------------------ #
     # Cross-attention context for video/action pre_dit
@@ -629,8 +804,8 @@ class HFastWAM(nn.Module):
         if prompt is None:
             return sample
 
-        video = sample.get("video", None)
-        batch_size = int(video.shape[0]) if torch.is_tensor(video) and video.ndim >= 1 else 1
+        vision = sample.get("video", sample.get("video_latents", None))
+        batch_size = int(vision.shape[0]) if torch.is_tensor(vision) and vision.ndim >= 1 else 1
         if isinstance(prompt, str):
             prompts = [prompt]
         elif isinstance(prompt, (list, tuple)):
@@ -1067,8 +1242,10 @@ class HFastWAM(nn.Module):
         return route, modality_mask
 
     def _validate_sample(self, sample: dict) -> tuple[str, dict[str, bool]]:
-        if "video" not in sample:
-            raise ValueError("H-FastWAM always needs sample['video'] (unified vision).")
+        if "video" not in sample and "video_latents" not in sample:
+            raise ValueError(
+                "H-FastWAM training needs sample['video'] or sample['video_latents']."
+            )
         route, modality_mask = self._resolve_training_route(sample)
         if modality_mask["language"]:
             if "task_token_ids" not in sample:
@@ -1167,10 +1344,15 @@ class HFastWAM(nn.Module):
             raise TypeError("`sample['segments']` must be a dict of tensors/lists.")
 
         video = segments.get("video")
-        if video is None:
-            raise ValueError("Interleaved H-FastWAM input requires `segments['video']`.")
-        if video.ndim == 5:
-            num_segments = int(video.shape[0])
+        cached_latents = segments.get("video_latents")
+        vision_ref = video if video is not None else cached_latents
+        if vision_ref is None:
+            raise ValueError(
+                "Interleaved H-FastWAM input requires `segments['video']` or "
+                "`segments['video_latents']`."
+            )
+        if vision_ref.ndim == 5:
+            num_segments = int(vision_ref.shape[0])
             batched_segments = {}
             for key, value in segments.items():
                 if key == "segment_mask":
@@ -1191,22 +1373,30 @@ class HFastWAM(nn.Module):
                     batched_segments[key] = [list(value)] if isinstance(value, (list, tuple)) else value
             segment_mask = segments.get("segment_mask", sample.get("segment_mask", None))
             if segment_mask is None:
-                segment_mask = torch.ones((1, num_segments), dtype=torch.bool, device=video.device)
+                segment_mask = torch.ones(
+                    (1, num_segments), dtype=torch.bool, device=vision_ref.device
+                )
             else:
-                segment_mask = segment_mask.to(device=video.device, dtype=torch.bool)
+                segment_mask = segment_mask.to(device=vision_ref.device, dtype=torch.bool)
                 if segment_mask.ndim == 1:
                     segment_mask = segment_mask.unsqueeze(0)
             batched_segments["segment_mask"] = segment_mask
             return self._training_loss_interleaved_segments({"segments": batched_segments}, tiled=tiled)
-        if video.ndim != 6:
+        if vision_ref.ndim != 6:
             raise ValueError(
-                "Interleaved `video` must be [N,3,T,H,W] or [B,N,3,T,H,W], "
-                f"got {tuple(video.shape)}"
+                "Interleaved vision input must be [N,D,T,H,W] or [B,N,D,T,H,W], "
+                f"got {tuple(vision_ref.shape)}"
             )
-        B, N, C, T, H, W = video.shape
+        B, N = int(vision_ref.shape[0]), int(vision_ref.shape[1])
+        if video is not None and cached_latents is not None:
+            if tuple(video.shape[:2]) != tuple(cached_latents.shape[:2]):
+                raise ValueError(
+                    "Interleaved raw/cached vision batch mismatch: "
+                    f"video={tuple(video.shape[:2])}, latents={tuple(cached_latents.shape[:2])}."
+                )
         segment_mask = segments.get("segment_mask", sample.get("segment_mask", None))
         if segment_mask is not None:
-            segment_mask = segment_mask.to(device=video.device, dtype=torch.bool)
+            segment_mask = segment_mask.to(device=vision_ref.device, dtype=torch.bool)
             if segment_mask.ndim == 1 and B == 1:
                 segment_mask = segment_mask.unsqueeze(0)
             if segment_mask.shape != (B, N):
@@ -1225,7 +1415,7 @@ class HFastWAM(nn.Module):
                         "segment_mask": torch.ones(
                             (1, int(valid_idx.numel())),
                             dtype=torch.bool,
-                            device=video.device,
+                            device=vision_ref.device,
                         )
                     }
                     for key, value in segments.items():
@@ -1263,9 +1453,26 @@ class HFastWAM(nn.Module):
                     for key in loss_sums
                 }
                 return torch.stack(total_losses).mean(), loss_dict
-        flat_video = video.reshape(B * N, C, T, H, W).to(device=self.device, dtype=self.torch_dtype)
-        if C != 3:
-            raise ValueError(f"Interleaved `video` channel dim must be 3, got {C}")
+        flat_video = None
+        if video is not None:
+            if video.ndim != 6:
+                raise ValueError(
+                    f"Interleaved raw video must be [B,N,3,T,H,W], got {tuple(video.shape)}"
+                )
+            _, _, C, T, H, W = video.shape
+            if C != 3:
+                raise ValueError(f"Interleaved `video` channel dim must be 3, got {C}")
+            flat_video = video.reshape(B * N, C, T, H, W)
+
+        flat_cached_latents = None
+        if cached_latents is not None:
+            if cached_latents.ndim != 6:
+                raise ValueError(
+                    "Interleaved cached video latents must be [B,N,D,T,H,W], "
+                    f"got {tuple(cached_latents.shape)}"
+                )
+            D, T_lat, H_lat, W_lat = cached_latents.shape[2:]
+            flat_cached_latents = cached_latents.reshape(B * N, D, T_lat, H_lat, W_lat)
 
         task_ids = segments.get("task_token_ids")
         if task_ids is None and "prompt" in segments:
@@ -1316,7 +1523,12 @@ class HFastWAM(nn.Module):
             subtask_len = int(flat_lang_pre["segments"]["subtask_len"])
             lang_pre = self._merge_segment_pre_state(flat_lang_pre, batch_size=B, num_segments=N)
 
-        input_latents = self._encode_video_latents(flat_video, tiled=tiled)
+        input_latents = self._prepare_training_video_latents(
+            video=flat_video,
+            cached_latents=flat_cached_latents,
+            tiled=tiled,
+            source="segments",
+        )
 
         if self.is_jepa_predictor:
             if input_latents.shape[2] < 2:
@@ -1324,31 +1536,6 @@ class HFastWAM(nn.Module):
                     "JEPA predictor interleaved training requires ≥2 temporal latent frames per segment; "
                     f"got {input_latents.shape[2]}."
                 )
-            # Train/infer alignment for the JEPA predictor's *starting* frame.
-            #
-            # At inference (`infer_action`), the model only has the single current
-            # observation. V-JEPA (temporal_patch=2) cannot encode 1 frame, so
-            # `_encode_first_frame` duplicates it into a [f, f] clip → a ZERO-MOTION
-            # latent. The action expert then attends to this zero-motion first
-            # frame, and the predictor (if rolled out) starts from it.
-            #
-            # In training, however, `input_latents[:, :, 0]` is the first real
-            # tubelet (f0, f1) which carries genuine inter-frame MOTION. So the
-            # first latent the action expert attends to — and the predictor's
-            # start frame — is OUT OF DISTRIBUTION vs inference.
-            #
-            # Fix: re-encode the segment's first video frame as a duplicated
-            # single-frame (zero-motion) latent and substitute it for frame 0, so
-            # training sees the same starting representation as inference. Context
-            # frame 0 becomes zero-motion; targets stay the real (motion) future
-            # frames — matching the inference scenario "predict the real future
-            # from a zero-motion start". The encoder is frozen, so no grad impact.
-            with torch.no_grad():
-                first_frame_latent = self._encode_first_frame(flat_video[:, :, 0])
-            input_latents = input_latents.clone()
-            input_latents[:, :, 0:1] = first_frame_latent.to(
-                dtype=input_latents.dtype, device=input_latents.device
-            )
             context_latents = input_latents[:, :, :-1]  # [B*N, D, T-1, H, W]
             target_video = input_latents[:, :, 1:]       # [B*N, D, T-1, H, W]
             fuse_flag = False
@@ -1534,7 +1721,14 @@ class HFastWAM(nn.Module):
           - ``language_video``: language tokens present, action absent/invalid
           - ``full``: language tokens present, valid action present
         """
-        if "segments" in sample or ("video" in sample and getattr(sample["video"], "ndim", 0) == 6):
+        if (
+            "segments" in sample
+            or ("video" in sample and getattr(sample["video"], "ndim", 0) == 6)
+            or (
+                "video_latents" in sample
+                and getattr(sample["video_latents"], "ndim", 0) == 6
+            )
+        ):
             return self._training_loss_interleaved_segments(sample, tiled=tiled)
 
         sample = self._ensure_language_tokens_from_prompt(sample)
@@ -1563,21 +1757,36 @@ class HFastWAM(nn.Module):
             lang_segments = lang_pre["segments"]
             batch_size = int(task_ids.shape[0])
         else:
-            video_in = sample["video"]
-            if video_in.ndim != 5:
-                raise ValueError(f"sample['video'] must be [B,3,T,H,W], got {tuple(video_in.shape)}")
-            batch_size = int(video_in.shape[0])
+            vision_in = sample.get("video", sample.get("video_latents"))
+            if vision_in.ndim != 5:
+                raise ValueError(
+                    "Non-interleaved vision input must be [B,D,T,H,W], "
+                    f"got {tuple(vision_in.shape)}"
+                )
+            batch_size = int(vision_in.shape[0])
 
         # ---------- Prepare video pre_dit ---------- #
-        video = sample["video"].to(device=self.device, dtype=self.torch_dtype)
-        if video.ndim != 5 or video.shape[1] != 3:
-            raise ValueError(f"sample['video'] must be [B,3,T,H,W], got {tuple(video.shape)}")
-        if int(video.shape[0]) != batch_size:
+        video = sample.get("video")
+        cached_latents = sample.get("video_latents")
+        vision_batch = video if video is not None else cached_latents
+        if video is not None and cached_latents is not None:
+            if int(video.shape[0]) != int(cached_latents.shape[0]):
+                raise ValueError(
+                    "Raw/cached vision batch mismatch: "
+                    f"video={video.shape[0]}, latents={cached_latents.shape[0]}."
+                )
+        if int(vision_batch.shape[0]) != batch_size:
             raise ValueError(
-                f"Batch mismatch across modalities: video batch={video.shape[0]} vs expected {batch_size}"
+                f"Batch mismatch across modalities: vision batch={vision_batch.shape[0]} "
+                f"vs expected {batch_size}"
             )
 
-        input_latents = self._encode_video_latents(video, tiled=tiled)
+        input_latents = self._prepare_training_video_latents(
+            video=video,
+            cached_latents=cached_latents,
+            tiled=tiled,
+            source="sample",
+        )
 
         proprio_ctx, proprio_mask = self._make_proprio_text_context(
             sample.get("proprio"),
@@ -2400,7 +2609,7 @@ class HFastWAM(nn.Module):
                 f"got {video_expert_type!r}"
             )
 
-        # Visual encoder (DINO/V-JEPA2) for video expert (optional)
+        # Visual encoder (DINO/Qwen3-VL/V-JEPA) for video expert (optional)
         dino_visual_encoder = None
         if visual_encoder_config is not None:
             ve_cfg = dict(visual_encoder_config)
@@ -2408,6 +2617,14 @@ class HFastWAM(nn.Module):
             dino_visual_encoder = build_visual_encoder(
                 encoder_type=encoder_type, torch_dtype=torch_dtype, **ve_cfg,
             ).to(device=device)
+            encoder_dim = int(dino_visual_encoder.z_dim)
+            video_in_dim = int(video_dit_config.get("in_dim", -1))
+            video_out_dim = int(video_dit_config.get("out_dim", -1))
+            if video_in_dim != encoder_dim or video_out_dim != encoder_dim:
+                raise ValueError(
+                    "Visual encoder and video expert dimensions must match: "
+                    f"encoder={encoder_dim}, in_dim={video_in_dim}, out_dim={video_out_dim}."
+                )
 
         # Wan2.2 components (VAE + tokenizer; Wan DiT only for wan_dit path).
         # When video_expert_type='jepa_predictor', pass skip_dit_build=True so

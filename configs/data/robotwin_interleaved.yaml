@@ -1,0 +1,132 @@
+# Interleaved RoboTwin 2.0 dataset — the robotwin counterpart of
+# libero_2cam_interleaved.yaml. Uses the SAME generic InterleavedRobotVideoDataset
+# (it just wraps RobotVideoDataset and stacks `num_segments` temporally-strided
+# chunks per sample), so no extra dataset class is required: the 3-camera
+# "robotwin" concat, 14-dim action/state, and z-score normalisation are all
+# inherited from the parent via the constructor args below.
+#
+# Differences vs configs/data/robotwin.yaml (the plain RobotVideoDataset config):
+#   * _target_ -> InterleavedRobotVideoDataset
+#   * num_segments / segment_stride added
+#   * load_text_context=false + text_embedding_cache_dir=null (HFastWAM's Qwen3-VL
+#     tokenises the raw `prompt` itself; no precomputed T5 cache needed), matching
+#     libero_2cam_interleaved.
+train:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.InterleavedRobotVideoDataset
+  dataset_dirs:
+    - ./data/robotwin2.0/robotwin2.0
+  shape_meta:
+    images:
+      - key: cam_high
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: cam_left_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: cam_right_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+    action:
+      - key: default
+        raw_shape: 14
+        shape: 14
+    state:
+      - key: default
+        raw_shape: 14
+        shape: 14
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4 # 32 action, 9 video frames
+  video_size: [384, 320] # final resize video
+  camera_key: null
+  val_set_proportion: 0.01
+  is_training_set: true
+  pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  num_segments: 1
+  segment_stride: null # defaults to num_frames - 1 for non-overlapping chunks
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 14
+    proprio_output_dim: 14
+    action_state_transforms: null
+    use_stepwise_action_norm: False
+    norm_default_mode: "z-score"
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+  text_embedding_cache_dir: null
+  load_text_context: false
+  context_len: 128
+
+val:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.InterleavedRobotVideoDataset
+  dataset_dirs:
+    - ./data/robotwin2.0/robotwin2.0
+  shape_meta:
+    images:
+      - key: cam_high
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: cam_left_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+      - key: cam_right_wrist
+        raw_shape: [3, 480, 640]
+        shape: [3, 240, 320]
+    action:
+      - key: default
+        raw_shape: 14
+        shape: 14
+    state:
+      - key: default
+        raw_shape: 14
+        shape: 14
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4 # 32 action, 9 video frames
+  video_size: [384, 320] # final resize video
+  camera_key: null
+  val_set_proportion: 0.01
+  is_training_set: false
+  pretrained_norm_stats: ./data/robotwin2.0/dataset_stats.json
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  num_segments: 1
+  segment_stride: null # defaults to num_frames - 1 for non-overlapping chunks
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 14
+    proprio_output_dim: 14
+    action_state_transforms: null
+    use_stepwise_action_norm: False
+    norm_default_mode: "z-score"
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+  text_embedding_cache_dir: null
+  load_text_context: false
+  context_len: 128

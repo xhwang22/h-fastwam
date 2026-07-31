@@ -3,7 +3,9 @@
 Supported backends:
 
 * **DINOv3 / DINOv2** — frozen image ViT, per-frame encoding + temporal stride.
+* **Qwen3-VL vision** — frozen SigLIP2-initialized video ViT.
 * **V-JEPA 2** — frozen video ViT, native spatiotemporal encoding.
+* **V-JEPA 2.1** — frozen dense-feature video ViT.
 
 Both produce latents with the same shape convention as the VAE encoder:
 ``[B, output_dim, T_lat, H_lat, W_lat]`` so the downstream DiT / MoT
@@ -30,15 +32,18 @@ Usage::
 
 from __future__ import annotations
 
+import importlib
+import json
 import logging
+import sys
 from abc import ABC, abstractmethod
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from math import ceil
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +119,8 @@ def build_visual_encoder(
     """Build a visual encoder by type string.
 
     Args:
-        encoder_type: ``"dino"`` or ``"vjepa2"``.
+        encoder_type: Registered encoder backend, e.g. ``"dino"``,
+            ``"qwen3_vl_vision"``, ``"vjepa2"``, or ``"vjepa2_1"``.
         torch_dtype: model dtype.
         **kwargs: forwarded to the encoder constructor.
     """
@@ -147,6 +153,9 @@ class BaseVisualEncoder(ABC, nn.Module):
     upsampling_factor: int
     temporal_downsample_factor: int
     projection: nn.Module
+    requires_independent_first_frame: bool = False
+    causal_tubelet_encoding: bool = False
+    causal_prefix_encoding: bool = False
 
     @abstractmethod
     def encode(
@@ -200,6 +209,32 @@ class BaseVisualEncoder(ABC, nn.Module):
         rest_strided = rest[:, :, ::temporal_downsample_factor]
         return torch.cat([first, rest_strided], dim=2)
 
+    @staticmethod
+    def _select_temporal_states(
+        features: torch.Tensor,
+        original_num_frames: int,
+        temporal_patch_size: int,
+        temporal_downsample_factor: int,
+    ) -> torch.Tensor:
+        """Select exactly the latent states at times 0, stride, 2*stride, ..."""
+        if original_num_frames < 1:
+            raise ValueError("Visual encoder input must contain at least one frame.")
+        if temporal_patch_size < 1 or temporal_downsample_factor < 1:
+            raise ValueError("Temporal patch/downsample factors must be positive.")
+
+        target_frames = (original_num_frames - 1) // temporal_downsample_factor + 1
+        source_indices = (
+            torch.arange(target_frames, device=features.device)
+            * temporal_downsample_factor
+            // temporal_patch_size
+        ).to(dtype=torch.long)
+        if int(source_indices[-1]) >= features.shape[2]:
+            raise ValueError(
+                "Temporal state selection exceeds encoder output: "
+                f"max_index={int(source_indices[-1])}, available={features.shape[2]}."
+            )
+        return features.index_select(2, source_indices)
+
     # ---- Per-channel standardisation (anti-collapse) ---------------------- #
     @staticmethod
     def _channel_standardise(
@@ -217,6 +252,23 @@ class BaseVisualEncoder(ABC, nn.Module):
         # Compute stats over (B, T, H, W), keeping D.
         mean = latents.mean(dim=(0, 2, 3, 4), keepdim=True)   # [1, D, 1, 1, 1]
         var = latents.var(dim=(0, 2, 3, 4), keepdim=True)      # [1, D, 1, 1, 1]
+        return (latents - mean) / (var.sqrt() + eps)
+
+    def _standardise_latents(
+        self,
+        latents: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if not (
+            bool(getattr(self, "causal_tubelet_encoding", False))
+            or bool(getattr(self, "causal_prefix_encoding", False))
+        ):
+            return self._channel_standardise(latents, eps=eps)
+
+        # Causal modes normalize each state independently so normalization
+        # statistics cannot reveal information from another temporal state.
+        mean = latents.mean(dim=(3, 4), keepdim=True)
+        var = latents.var(dim=(3, 4), keepdim=True, unbiased=False)
         return (latents - mean) / (var.sqrt() + eps)
 
     # ---- train/eval override ---------------------------------------------- #
@@ -446,6 +498,347 @@ _ENCODER_REGISTRY["dino"] = DINOEncoder
 
 
 # ========================================================================== #
+# Qwen3-VL vision tower (SigLIP2-initialized video ViT)
+# ========================================================================== #
+
+class Qwen3VLVisualEncoder(BaseVisualEncoder):
+    """Frozen Qwen3-VL vision tower with raw patch-token output.
+
+    This loads only ``model.visual.*`` from the Qwen3-VL checkpoint. The
+    language-facing spatial mergers and DeepStack projection heads are removed,
+    so the output remains in the native 1024-dimensional visual feature space.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-VL-2B-Instruct",
+        output_dim: int = 48,
+        mlp_hidden_dim: Optional[int] = None,
+        freeze_backbone: bool = True,
+        spatial_downsample: int = 16,
+        temporal_downsample: int = 4,
+        standardise_output: bool = True,
+        skip_projection: bool = False,
+        causal_tubelet_encoding: bool = False,
+        causal_prefix_encoding: bool = False,
+        local_files_only: bool = True,
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        self.model_name = model_name
+        self.standardise_output = standardise_output
+        self.skip_projection = skip_projection
+        self._freeze_backbone = freeze_backbone
+        self.requires_independent_first_frame = True
+        self.causal_tubelet_encoding = causal_tubelet_encoding
+        self.causal_prefix_encoding = causal_prefix_encoding
+
+        self.backbone = self._load_vision_backbone(
+            model_name=model_name,
+            dtype=torch_dtype,
+            local_files_only=local_files_only,
+        )
+        config = self.backbone.config
+        self._hidden_dim = int(config.hidden_size)
+        self._patch_size = int(config.patch_size)
+        self._temporal_patch = int(config.temporal_patch_size)
+        self._spatial_merge = int(config.spatial_merge_size)
+
+        self.output_dim = self._hidden_dim if skip_projection else output_dim
+        self.z_dim = self.output_dim
+        self.upsampling_factor = spatial_downsample
+        self.temporal_downsample_factor = temporal_downsample
+
+        logger.info(
+            "Qwen3VLVisualEncoder: model=%s hidden_dim=%d patch=%d temporal_patch=%d "
+            "output_dim=%d skip_projection=%s freeze=%s",
+            model_name,
+            self._hidden_dim,
+            self._patch_size,
+            self._temporal_patch,
+            self.output_dim,
+            skip_projection,
+            freeze_backbone,
+        )
+
+        if freeze_backbone:
+            self.backbone.eval()
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad = False
+
+        if skip_projection:
+            self.projection = nn.Identity()
+        else:
+            hidden_dim = mlp_hidden_dim if mlp_hidden_dim is not None else 2 * self._hidden_dim
+            self.projection = nn.Sequential(
+                nn.Linear(self._hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            ).to(dtype=torch_dtype)
+            for module in self.projection.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _weight_files(model_name: str, local_files_only: bool) -> list[str]:
+        local_path = Path(model_name)
+        if local_path.is_dir():
+            index_path = local_path / "model.safetensors.index.json"
+            if index_path.is_file():
+                with index_path.open("r", encoding="utf-8") as handle:
+                    weight_map = json.load(handle).get("weight_map", {})
+                filenames = {
+                    filename
+                    for key, filename in weight_map.items()
+                    if key.startswith("model.visual.")
+                }
+                if not filenames:
+                    raise ValueError(f"No Qwen3-VL visual weights found in {index_path}.")
+                return [str(local_path / filename) for filename in sorted(filenames)]
+
+            weights_path = local_path / "model.safetensors"
+            if not weights_path.is_file():
+                raise FileNotFoundError(
+                    f"Qwen3-VL checkpoint directory has no safetensors weights: {local_path}"
+                )
+            return [str(weights_path)]
+
+        try:
+            from huggingface_hub import hf_hub_download
+            from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+        except Exception as exc:  # pragma: no cover
+            raise ImportError("Qwen3-VL visual loading requires huggingface_hub.") from exc
+
+        try:
+            index_path = hf_hub_download(
+                repo_id=model_name,
+                filename="model.safetensors.index.json",
+                local_files_only=local_files_only,
+            )
+        except (EntryNotFoundError, LocalEntryNotFoundError):
+            index_path = None
+
+        if index_path is None:
+            return [
+                hf_hub_download(
+                    repo_id=model_name,
+                    filename="model.safetensors",
+                    local_files_only=local_files_only,
+                )
+            ]
+
+        with open(index_path, "r", encoding="utf-8") as handle:
+            weight_map = json.load(handle).get("weight_map", {})
+        filenames = {
+            filename
+            for key, filename in weight_map.items()
+            if key.startswith("model.visual.")
+        }
+        if not filenames:
+            raise ValueError(f"No Qwen3-VL visual weights found in {index_path}.")
+        return [
+            hf_hub_download(
+                repo_id=model_name,
+                filename=filename,
+                local_files_only=local_files_only,
+            )
+            for filename in sorted(filenames)
+        ]
+
+    @classmethod
+    def _load_vision_backbone(
+        cls,
+        model_name: str,
+        dtype: torch.dtype,
+        local_files_only: bool,
+    ) -> nn.Module:
+        try:
+            from accelerate import init_empty_weights
+            from safetensors import safe_open
+            from transformers import AutoConfig
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+        except Exception as exc:  # pragma: no cover
+            raise ImportError(
+                "Qwen3-VL visual loading requires transformers>=4.57, accelerate, "
+                "and safetensors."
+            ) from exc
+
+        full_config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        vision_config = getattr(full_config, "vision_config", None)
+        if vision_config is None:
+            raise ValueError(f"{model_name} has no Qwen3-VL `vision_config`.")
+
+        with init_empty_weights():
+            backbone = Qwen3VLVisionModel(vision_config)
+
+        # Keep the pre-merge token norm, but remove the language-facing spatial
+        # concatenation/projection and DeepStack projection heads.
+        backbone.final_norm = backbone.merger.norm
+        backbone.merger = nn.Identity()
+        backbone.deepstack_merger_list = nn.ModuleList()
+        backbone.deepstack_visual_indexes = []
+
+        state_dict = {}
+        excluded_prefixes = ("merger.", "deepstack_merger_list.")
+        for path in cls._weight_files(model_name, local_files_only):
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not key.startswith("model.visual."):
+                        continue
+                    relative_key = key.removeprefix("model.visual.")
+                    if relative_key.startswith("merger.norm."):
+                        relative_key = "final_norm." + relative_key.removeprefix("merger.norm.")
+                    if relative_key.startswith(excluded_prefixes):
+                        continue
+                    state_dict[relative_key] = handle.get_tensor(key)
+
+        if not state_dict:
+            raise ValueError(f"No usable Qwen3-VL visual backbone weights found for {model_name}.")
+
+        incompatible = backbone.load_state_dict(state_dict, strict=True, assign=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise ValueError(
+                "Failed to load Qwen3-VL visual backbone cleanly: "
+                f"missing={incompatible.missing_keys[:8]} "
+                f"unexpected={incompatible.unexpected_keys[:8]}"
+            )
+        return backbone.to(dtype=dtype)
+
+    def encode(
+        self,
+        videos,
+        device="cuda",
+        tiled=False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+        return_pre_standardise=False,
+    ):
+        videos = videos.to(device=device)
+        batch_size, channels, num_frames, height, width = videos.shape
+        if channels != 3:
+            raise ValueError(f"Qwen3VLVisualEncoder expects 3 channels, got {channels}.")
+        if height % self._patch_size != 0 or width % self._patch_size != 0:
+            raise ValueError(
+                f"Input size {(height, width)} must be divisible by patch size "
+                f"{self._patch_size}."
+            )
+
+        patch_h = height // self._patch_size
+        patch_w = width // self._patch_size
+        if patch_h % self._spatial_merge != 0 or patch_w % self._spatial_merge != 0:
+            raise ValueError(
+                f"Patch grid {(patch_h, patch_w)} must be divisible by Qwen spatial "
+                f"merge size {self._spatial_merge}."
+            )
+
+        original_frames = num_frames
+        pad_frames = (-num_frames) % self._temporal_patch
+        if pad_frames:
+            videos = torch.cat(
+                [videos, videos[:, :, -1:].expand(-1, -1, pad_frames, -1, -1)],
+                dim=2,
+            )
+            num_frames = videos.shape[2]
+
+        grid_t = num_frames // self._temporal_patch
+        merge = self._spatial_merge
+        patches = videos.permute(0, 2, 1, 3, 4).contiguous()
+        patches = patches.view(
+            batch_size,
+            grid_t,
+            self._temporal_patch,
+            channels,
+            patch_h // merge,
+            merge,
+            self._patch_size,
+            patch_w // merge,
+            merge,
+            self._patch_size,
+        )
+        patches = patches.permute(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        patches = patches.reshape(
+            batch_size * grid_t * patch_h * patch_w,
+            channels * self._temporal_patch * self._patch_size * self._patch_size,
+        )
+        grid_thw = torch.tensor(
+            [[grid_t, patch_h, patch_w]] * batch_size,
+            device=videos.device,
+            dtype=torch.long,
+        )
+
+        with torch.no_grad():
+            outputs = self.backbone(patches, grid_thw=grid_thw, return_dict=True)
+            tokens = self.backbone.final_norm(outputs.last_hidden_state)
+
+        expected_tokens = batch_size * grid_t * patch_h * patch_w
+        if tokens.shape != (expected_tokens, self._hidden_dim):
+            raise ValueError(
+                "Unexpected Qwen3-VL visual output shape: "
+                f"got {tuple(tokens.shape)}, expected "
+                f"{(expected_tokens, self._hidden_dim)}."
+            )
+
+        tokens = self.projection(tokens)
+        tokens = tokens.view(
+            batch_size,
+            grid_t,
+            patch_h // merge,
+            patch_w // merge,
+            merge,
+            merge,
+            self.output_dim,
+        )
+        tokens = tokens.permute(0, 6, 1, 2, 4, 3, 5).reshape(
+            batch_size,
+            self.output_dim,
+            grid_t,
+            patch_h,
+            patch_w,
+        )
+
+        latent_h = height // self.upsampling_factor
+        latent_w = width // self.upsampling_factor
+        if patch_h != latent_h or patch_w != latent_w:
+            tokens = F.interpolate(
+                tokens.float(),
+                size=(tokens.shape[2], latent_h, latent_w),
+                mode="trilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
+
+        tokens = self._select_temporal_states(
+            tokens,
+            original_num_frames=original_frames,
+            temporal_patch_size=self._temporal_patch,
+            temporal_downsample_factor=self.temporal_downsample_factor,
+        )
+
+        if self.skip_projection:
+            if self.standardise_output:
+                tokens = self._standardise_latents(tokens)
+            if return_pre_standardise:
+                return tokens, None
+            return tokens
+
+        raw_tokens = tokens
+        if self.standardise_output:
+            tokens = self._standardise_latents(tokens)
+        if return_pre_standardise:
+            return tokens, raw_tokens
+        return tokens
+
+
+_ENCODER_REGISTRY["qwen3_vl_vision"] = Qwen3VLVisualEncoder
+_ENCODER_REGISTRY["siglip2_qwen3vl"] = Qwen3VLVisualEncoder
+
+
+# ========================================================================== #
 # V-JEPA 2 (video encoder — native spatiotemporal)
 # ========================================================================== #
 
@@ -488,6 +881,8 @@ class VJEPA2Encoder(BaseVisualEncoder):
         temporal_downsample: int = 4,
         standardise_output: bool = True,
         skip_projection: bool = False,
+        causal_tubelet_encoding: bool = False,
+        causal_prefix_encoding: bool = False,
         torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -495,6 +890,9 @@ class VJEPA2Encoder(BaseVisualEncoder):
         self.standardise_output = standardise_output
         self.skip_projection = skip_projection
         self._freeze_backbone = freeze_backbone
+        self.requires_independent_first_frame = True
+        self.causal_tubelet_encoding = causal_tubelet_encoding
+        self.causal_prefix_encoding = causal_prefix_encoding
 
         # Load backbone
         spec = _VJEPA2_MODEL_SPECS.get(model_name, {})
@@ -550,17 +948,19 @@ class VJEPA2Encoder(BaseVisualEncoder):
         """
         videos = videos.to(device=device)
         B, C, T, H, W = videos.shape
+        original_frames = T
         H_lat = H // self.upsampling_factor
         W_lat = W // self.upsampling_factor
 
-        # V-JEPA 2 requires at least `_temporal_patch` frames (typically 2).
-        # For single-frame input (inference), repeat the frame to meet the
-        # minimum and keep only the first temporal output afterwards.
-        _single_frame = T < self._temporal_patch
-        if _single_frame:
-            pad_T = self._temporal_patch
-            videos = videos.expand(B, C, pad_T, H, W).contiguous()
-            T = pad_T
+        # Pad to a complete temporal tubelet. This also turns single-frame
+        # inference into the zero-motion clip [f0, f0].
+        pad_frames = (-T) % self._temporal_patch
+        if pad_frames:
+            videos = torch.cat(
+                [videos, videos[:, :, -1:].expand(-1, -1, pad_frames, -1, -1)],
+                dim=2,
+            )
+            T = videos.shape[2]
 
         # V-JEPA 2 expects [B, T, C, H, W] or processor-normalised input.
         # Convert from [-1,1] → ImageNet normalised, then to [B, T, C, H, W].
@@ -598,36 +998,18 @@ class VJEPA2Encoder(BaseVisualEncoder):
             projected = projected.reshape(B, T_p, self.output_dim, H_lat, W_lat)
             projected = projected.permute(0, 2, 1, 3, 4)  # [B, output_dim, T_p, H_lat, W_lat]
 
-        # Temporal alignment to VAE convention: T_lat = (T-1)//temp_ds + 1
-        # V-JEPA already did temporal_patch (2×) downsampling → T_p = T//2.
-        # Need to further stride to match target T_lat.
-        T_lat_target = (T - 1) // self.temporal_downsample_factor + 1
-        T_current = projected.shape[2]
-
-        if T_current > T_lat_target:
-            # Additional temporal stride
-            extra_stride = max(1, ceil(T_current / T_lat_target))
-            projected = projected[:, :, ::extra_stride]
-            # Trim to exact T_lat if needed
-            projected = projected[:, :, :T_lat_target]
-        elif T_current < T_lat_target:
-            # Upsample temporally (rare — only if T_p < T_lat)
-            projected = F.interpolate(
-                projected.float().reshape(B * self.output_dim, 1, T_current, H_lat, W_lat),
-                size=(T_lat_target, H_lat, W_lat),
-                mode="trilinear",
-                align_corners=False,
-            ).to(dtype=projected.dtype).reshape(B, self.output_dim, T_lat_target, H_lat, W_lat)
-
-        # Single-frame input: keep only the first temporal slice.
-        if _single_frame:
-            projected = projected[:, :, :1]
+        projected = self._select_temporal_states(
+            projected,
+            original_num_frames=original_frames,
+            temporal_patch_size=self._temporal_patch,
+            temporal_downsample_factor=self.temporal_downsample_factor,
+        )
 
         # In skip_projection mode: no SIGReg, but standardise is still
         # useful to normalise features to mean=0 std=1 per channel.
         if self.skip_projection:
             if self.standardise_output:
-                projected = self._channel_standardise(projected)
+                projected = self._standardise_latents(projected)
             if return_pre_standardise:
                 return projected, None
             return projected
@@ -635,11 +1017,11 @@ class VJEPA2Encoder(BaseVisualEncoder):
         if return_pre_standardise:
             latents_raw = projected
             if self.standardise_output:
-                projected = self._channel_standardise(projected)
+                projected = self._standardise_latents(projected)
             return projected, latents_raw
 
         if self.standardise_output:
-            projected = self._channel_standardise(projected)
+            projected = self._standardise_latents(projected)
         return projected
 
     def _extract_tokens(self, frames: torch.Tensor) -> torch.Tensor:
@@ -757,6 +1139,8 @@ class VJEPA2ACEncoder(VJEPA2Encoder):
         temporal_downsample: int = 4,
         standardise_output: bool = True,
         skip_projection: bool = False,
+        causal_tubelet_encoding: bool = False,
+        causal_prefix_encoding: bool = False,
         checkpoint_source: str = "torch_hub",
         checkpoint_path: Optional[str] = None,
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -770,6 +1154,9 @@ class VJEPA2ACEncoder(VJEPA2Encoder):
         self.standardise_output = standardise_output
         self.skip_projection = skip_projection
         self._freeze_backbone = freeze_backbone
+        self.requires_independent_first_frame = True
+        self.causal_tubelet_encoding = causal_tubelet_encoding
+        self.causal_prefix_encoding = causal_prefix_encoding
         self.checkpoint_source = checkpoint_source
         self.checkpoint_path = checkpoint_path
 
@@ -986,3 +1373,279 @@ class VJEPA2ACEncoder(VJEPA2Encoder):
 
 
 _ENCODER_REGISTRY["vjepa2_ac"] = VJEPA2ACEncoder
+
+
+# ========================================================================== #
+# V-JEPA 2.1 (dense-feature video encoder)
+# ========================================================================== #
+
+_VJEPA21_MODEL_SPECS = {
+    "vjepa2_1_vit_base_384": {
+        "builder": "vit_base",
+        "checkpoint_key": "ema_encoder",
+        "checkpoint_file": "vjepa2_1_vitb_dist_vitG_384.pt",
+        "hidden_dim": 768,
+    },
+    "vjepa2_1_vit_large_384": {
+        "builder": "vit_large",
+        "checkpoint_key": "ema_encoder",
+        "checkpoint_file": "vjepa2_1_vitl_dist_vitG_384.pt",
+        "hidden_dim": 1024,
+    },
+    "vjepa2_1_vit_giant_384": {
+        "builder": "vit_giant_xformers",
+        "checkpoint_key": "target_encoder",
+        "checkpoint_file": "vjepa2_1_vitg_384.pt",
+        "hidden_dim": 1408,
+    },
+    "vjepa2_1_vit_gigantic_384": {
+        "builder": "vit_gigantic_xformers",
+        "checkpoint_key": "target_encoder",
+        "checkpoint_file": "vjepa2_1_vitG_384.pt",
+        "hidden_dim": 1664,
+    },
+}
+
+
+class VJEPA21Encoder(VJEPA2Encoder):
+    """Frozen V-JEPA 2.1 encoder loaded from the official local checkpoint."""
+
+    def __init__(
+        self,
+        model_name: str = "vjepa2_1_vit_gigantic_384",
+        output_dim: int = 48,
+        mlp_hidden_dim: Optional[int] = None,
+        freeze_backbone: bool = True,
+        spatial_downsample: int = 16,
+        temporal_downsample: int = 4,
+        standardise_output: bool = True,
+        skip_projection: bool = False,
+        causal_tubelet_encoding: bool = False,
+        causal_prefix_encoding: bool = False,
+        checkpoint_source: str = "local",
+        checkpoint_path: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ):
+        nn.Module.__init__(self)
+        if checkpoint_source != "local":
+            raise ValueError(
+                "VJEPA21Encoder currently requires checkpoint_source='local' so all "
+                "distributed ranks load the same pre-downloaded checkpoint safely."
+            )
+
+        spec = _VJEPA21_MODEL_SPECS.get(model_name)
+        if spec is None:
+            raise ValueError(
+                f"Unknown V-JEPA 2.1 model '{model_name}'. "
+                f"Available: {sorted(_VJEPA21_MODEL_SPECS)}"
+            )
+        if checkpoint_path is None:
+            raise ValueError(
+                "VJEPA21Encoder requires checkpoint_path to the official "
+                f"{spec['checkpoint_file']} checkpoint."
+            )
+
+        self.model_name = model_name
+        self.standardise_output = standardise_output
+        self.skip_projection = skip_projection
+        self._freeze_backbone = freeze_backbone
+        self.requires_independent_first_frame = True
+        self.causal_tubelet_encoding = causal_tubelet_encoding
+        self.causal_prefix_encoding = causal_prefix_encoding
+        self.checkpoint_source = checkpoint_source
+        self.checkpoint_path = checkpoint_path
+        self.repo_path = repo_path
+        self._spatial_patch = 16
+        self._temporal_patch = 2
+
+        self.backbone = self._load_vjepa21_backbone(
+            spec=spec,
+            checkpoint_path=checkpoint_path,
+            repo_path=repo_path,
+            dtype=torch_dtype,
+        )
+        self.processor = None
+        self._hidden_dim = int(spec["hidden_dim"])
+        actual_hidden_dim = int(getattr(self.backbone, "embed_dim", -1))
+        if actual_hidden_dim != self._hidden_dim:
+            raise ValueError(
+                f"V-JEPA 2.1 hidden dim mismatch for {model_name}: "
+                f"expected {self._hidden_dim}, got {actual_hidden_dim}."
+            )
+
+        self.output_dim = self._hidden_dim if skip_projection else output_dim
+        self.z_dim = self.output_dim
+        self.upsampling_factor = spatial_downsample
+        self.temporal_downsample_factor = temporal_downsample
+
+        logger.info(
+            "VJEPA21Encoder: model=%s hidden_dim=%d output_dim=%d "
+            "skip_projection=%s freeze=%s checkpoint=%s",
+            model_name,
+            self._hidden_dim,
+            self.output_dim,
+            skip_projection,
+            freeze_backbone,
+            checkpoint_path,
+        )
+
+        if freeze_backbone:
+            self.backbone.eval()
+            for parameter in self.backbone.parameters():
+                parameter.requires_grad = False
+
+        if skip_projection:
+            self.projection = nn.Identity()
+        else:
+            hidden_dim = mlp_hidden_dim if mlp_hidden_dim is not None else 2 * self._hidden_dim
+            self.projection = nn.Sequential(
+                nn.Linear(self._hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            ).to(dtype=torch_dtype)
+
+    @staticmethod
+    def _load_vjepa21_backbone(
+        spec: dict,
+        checkpoint_path: str,
+        repo_path: Optional[str],
+        dtype: torch.dtype,
+    ) -> nn.Module:
+        checkpoint = Path(checkpoint_path).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"V-JEPA 2.1 checkpoint not found: {checkpoint}")
+
+        if repo_path is None:
+            repo = Path(torch.hub.get_dir()) / "facebookresearch_vjepa2_main"
+        else:
+            repo = Path(repo_path).expanduser()
+        repo = repo.resolve()
+        model_file = repo / "app" / "vjepa_2_1" / "models" / "vision_transformer.py"
+        if not model_file.is_file():
+            raise FileNotFoundError(
+                f"V-JEPA 2.1 source tree not found at {repo}. Expected {model_file}."
+            )
+
+        repo_string = str(repo)
+        sys.path.insert(0, repo_string)
+        try:
+            module = importlib.import_module("app.vjepa_2_1.models.vision_transformer")
+            utils_module = importlib.import_module("app.vjepa_2_1.models.utils.modules")
+        finally:
+            if sys.path[0] == repo_string:
+                sys.path.pop(0)
+            else:
+                sys.path.remove(repo_string)
+
+        module_path = Path(module.__file__).resolve()
+        if repo not in module_path.parents:
+            raise ImportError(
+                f"Loaded V-JEPA 2.1 code from {module_path}, expected source under {repo}."
+            )
+
+        # The official RoPE helper computes positions in fp32, which promotes
+        # q/k while v stays bf16 and makes SDPA reject the mixed dtypes. Keep
+        # the trigonometry in fp32, then restore the attention tensor dtype.
+        if not getattr(utils_module, "_fastwam_dtype_safe_rope", False):
+            original_rotate = utils_module.rotate_queries_or_keys
+
+            def _dtype_safe_rotate(x, pos, n_registers, has_cls_first):
+                rotated = original_rotate(
+                    x.float(),
+                    pos.float(),
+                    n_registers=n_registers,
+                    has_cls_first=has_cls_first,
+                )
+                return rotated.to(dtype=x.dtype)
+
+            utils_module.rotate_queries_or_keys = _dtype_safe_rotate
+            utils_module._fastwam_dtype_safe_rope = True
+
+        builder = getattr(module, spec["builder"], None)
+        if builder is None:
+            raise ValueError(f"V-JEPA 2.1 source has no builder '{spec['builder']}'.")
+
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            backbone = builder(
+                patch_size=16,
+                img_size=(384, 384),
+                num_frames=64,
+                tubelet_size=2,
+                use_sdpa=True,
+                use_SiLU=False,
+                wide_SiLU=True,
+                uniform_power=False,
+                use_rope=True,
+                img_temporal_dim_size=1,
+                interpolate_rope=True,
+            )
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+        checkpoint_blob = torch.load(
+            checkpoint,
+            map_location="cpu",
+            mmap=True,
+            weights_only=True,
+        )
+        checkpoint_key = spec["checkpoint_key"]
+        if checkpoint_key not in checkpoint_blob:
+            raise ValueError(
+                f"V-JEPA 2.1 checkpoint {checkpoint} has no '{checkpoint_key}' state dict."
+            )
+
+        state_dict = {}
+        for key, value in checkpoint_blob[checkpoint_key].items():
+            clean_key = key
+            for prefix in ("module.", "backbone.", "encoder."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix):]
+            state_dict[clean_key] = value
+
+        incompatible = backbone.load_state_dict(state_dict, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise ValueError(
+                "Failed to load V-JEPA 2.1 backbone cleanly: "
+                f"missing={incompatible.missing_keys[:8]} "
+                f"unexpected={incompatible.unexpected_keys[:8]}"
+            )
+        return backbone.to(dtype=dtype)
+
+    def _extract_tokens(self, frames: torch.Tensor) -> torch.Tensor:
+        video = frames.permute(0, 2, 1, 3, 4).contiguous()
+        output = self.backbone(video)
+        if isinstance(output, torch.Tensor):
+            tokens = output
+        elif isinstance(output, (tuple, list)):
+            tokens = output[0]
+        elif hasattr(output, "last_hidden_state"):
+            tokens = output.last_hidden_state
+        else:
+            raise ValueError(
+                f"VJEPA21Encoder: unexpected backbone output type {type(output)}."
+            )
+
+        expected_tokens = (
+            (frames.shape[1] // self._temporal_patch)
+            * (frames.shape[3] // self._spatial_patch)
+            * (frames.shape[4] // self._spatial_patch)
+        )
+        if tokens.ndim != 3:
+            raise ValueError(
+                f"VJEPA21Encoder expected [B,N,D] tokens, got {tuple(tokens.shape)}."
+            )
+        if tokens.shape[1] > expected_tokens:
+            tokens = tokens[:, -expected_tokens:, :]
+        if tokens.shape[1] != expected_tokens:
+            raise ValueError(
+                f"VJEPA21Encoder token count mismatch: got {tokens.shape[1]}, "
+                f"expected {expected_tokens}."
+            )
+        return tokens
+
+
+_ENCODER_REGISTRY["vjepa2_1"] = VJEPA21Encoder
+_ENCODER_REGISTRY["vjepa21"] = VJEPA21Encoder

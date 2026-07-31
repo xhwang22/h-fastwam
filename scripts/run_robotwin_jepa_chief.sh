@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -59,7 +59,7 @@ TOTAL_GPUS=$(( NNODES * NPROC_PER_NODE ))
 # ---------------------------------------------------------------------------
 # 2. Data paths — default to the shared tj5 copy (one mount, all nodes see it).
 # ---------------------------------------------------------------------------
-TJ5_DATA_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/data"
+TJ5_DATA_BASE="${REPO_ROOT}/data"
 DATA_ROOT="${DATA_ROOT:-${TJ5_DATA_BASE}/robotwin2.0/robotwin2.0}"
 DATA_STATS="${DATA_STATS:-${TJ5_DATA_BASE}/robotwin2.0/dataset_stats.json}"
 # Text embeddings are tiny (1MB each, read once per episode) and the rsync of

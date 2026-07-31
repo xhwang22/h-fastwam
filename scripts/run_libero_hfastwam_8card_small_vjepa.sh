@@ -20,7 +20,7 @@
 #     bash scripts/run_libero_hfastwam_8card_small_vjepa.sh
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -31,15 +31,32 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # --- 8 GPUs / torchrun topology ---
+# Single-node: leave NODE_IP_LIST unset.
+# Multi-node:  NODE_IP_LIST="ip0,ip1,..."  (first IP = rank-0/master)
+#              NODE_RANK=<this node's index>  (set per node: 0, 1, 2, ...)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
-MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
+if [[ -n "${NODE_IP_LIST:-}" ]]; then
+  IFS=',' read -ra _NODES <<< "${NODE_IP_LIST}"
+  NNODES="${#_NODES[@]}"
+  MASTER_ADDR="${MASTER_ADDR:-${_NODES[0]%%:*}}"
+else
+  NNODES=1
+  MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+fi
+NODE_RANK="${NODE_RANK:-0}"
+# shellcheck source=_multinode_ssh_dispatch.sh
+source "${SCRIPT_DIR}/_multinode_ssh_dispatch.sh"
+_multinode_dispatch "${BASH_SOURCE[0]}"
 
-# --- make sure DeepSpeed is OFF (accelerate -> DDP under torchrun) ---
+# --- DeepSpeed ZeRO-2 is ON via the accelerate config; clear stale overrides. ---
 unset ACCELERATE_USE_DEEPSPEED
 unset ACCELERATE_DEEPSPEED_CONFIG_FILE
 unset DS_CONFIG
+# torch ZeroRedundancyOptimizer must stay OFF on the DeepSpeed path.
+unset FASTWAM_USE_ZERO_REDUNDANCY_OPTIMIZER
+ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_ds.yaml}"
 
 # --- offline / fast init ---
 export HF_HUB_OFFLINE=1
@@ -59,16 +76,27 @@ export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond1}"
 export FASTWAM_PROFILE_STEPS="${FASTWAM_PROFILE_STEPS:-5}"
 
 # --- data / model paths (match the singlecard script) ---
-export DIFFSYNTH_MODEL_BASE_PATH="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
-LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data}"
 
-# Global batch = nproc * batch_size * grad_accum = 8 * 1 * 16 = 128.
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
+# Effective (global) batch stays FIXED regardless of GPU count:
+#   global_batch = world_size * batch_size * grad_accum,  world_size = nproc * nnodes
+# We pin GLOBAL_BATCH_SIZE and derive the per-GPU batch_size from the ACTUAL world
+# size, so scaling from 8 → 32 GPUs keeps the same effective batch (e.g. 128/32/1=4).
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+WORLD_SIZE=$(( NPROC_PER_NODE * NNODES ))
+_BATCH_DENOM=$(( WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS ))
+if (( GLOBAL_BATCH_SIZE % _BATCH_DENOM != 0 )); then
+  echo "[8card-small-vjepa] ERROR: GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} not divisible by world_size*grad_accum=${_BATCH_DENOM} (nproc=${NPROC_PER_NODE} nnodes=${NNODES} grad_accum=${GRADIENT_ACCUMULATION_STEPS})." >&2
+  exit 1
+fi
+BATCH_SIZE=$(( GLOBAL_BATCH_SIZE / _BATCH_DENOM ))
 
-RUN_NAME="${RUN_NAME:-libero_hfastwam_8card_small_vjepa}"
+RUN_NAME="${RUN_NAME:-libero_hfastwam_8card_small_vjepa_ds}"
 LOG_DIR="${REPO_ROOT}/runs/libero_hfastwam/${RUN_NAME}"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/train.log.rank0"
+LOG_FILE="${LOG_DIR}/train.log.rank${NODE_RANK}"
 
 # --- wandb (default ON) ---
 # API key is read from ~/.wandb_key (chmod 600, NOT in the repo / git / logs).
@@ -103,28 +131,32 @@ if [[ "${NO_CKPT:-0}" == "1" ]]; then
 fi
 
 CMD=(
-  torchrun
-    --nnodes=1
-    --node_rank=0
-    --nproc_per_node="${NPROC_PER_NODE}"
-    --master_addr="${MASTER_ADDR}"
-    --master_port="${MASTER_PORT}"
+  accelerate launch
+    --config_file "${ACCEL_CONFIG}"
+    --num_machines "${NNODES}"
+    --machine_rank "${NODE_RANK}"
+    --main_process_ip "${MASTER_ADDR}"
+    --main_process_port "${MASTER_PORT}"
+    --num_processes "$(( NPROC_PER_NODE * NNODES ))"
+    --deepspeed_multinode_launcher standard
     scripts/train.py
       task=libero_uncond_2cam224_1e-4
       data=libero_2cam_interleaved
       model=hfastwam_small_vjepa
       output_dir="${LOG_DIR}"
       "${WANDB_OVERRIDES[@]}"
-      batch_size=1
+      batch_size="${BATCH_SIZE}"
       gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}"
       log_every=1
-      num_workers=0
+      num_workers="${NUM_WORKERS:-8}"
+      dataloader_prefetch_factor="${DATALOADER_PREFETCH_FACTOR:-4}"
+      dataloader_persistent_workers="${DATALOADER_PERSISTENT_WORKERS:-true}"
       dataloader_timeout=0
       data.train.num_segments=1
       data.val.num_segments=1
       "data.train.dataset_dirs=[${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_10_no_noops_lerobot]"
       "data.val.dataset_dirs=[${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_object_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_goal_no_noops_lerobot,${LIBERO_DATA_ROOT}/libero_mujoco3.3.2/libero_10_no_noops_lerobot]"
-      num_epochs=3
+      num_epochs=10
       max_steps=null
       model.knowledge_insulation=false
       model.freeze_language_expert=true
@@ -135,6 +167,7 @@ CMD=(
 )
 
 echo "[8card-small-vjepa] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE} grad_accum=${GRADIENT_ACCUMULATION_STEPS} NO_CKPT=${NO_CKPT:-0} PROFILE_STEPS=${FASTWAM_PROFILE_STEPS}"
+echo "[8card-small-vjepa] DeepSpeed ZeRO-2 via ${ACCEL_CONFIG} (global_batch=${GLOBAL_BATCH_SIZE} = world_size ${WORLD_SIZE} * batch_size ${BATCH_SIZE} * grad_accum ${GRADIENT_ACCUMULATION_STEPS})"
 echo "[8card-small-vjepa] model=hfastwam_small_vjepa (small experts 2048/16/28 random-init + frozen V-JEPA2-AC ViT-g encoder, in/out_dim=1408)"
 echo "[8card-small-vjepa] master=${MASTER_ADDR}:${MASTER_PORT}"
 echo "[8card-small-vjepa] log=${LOG_FILE}"

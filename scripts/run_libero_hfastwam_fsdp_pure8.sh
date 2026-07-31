@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
   source "${CONDA_ACTIVATE}" fastwam
@@ -29,8 +29,8 @@ export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-0}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond1}"
 
-export DIFFSYNTH_MODEL_BASE_PATH="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/"
-LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
+LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-data}"
 ACTION_DIT_PRETRAINED_PATH="${ACTION_DIT_PRETRAINED_PATH:-${REPO_ROOT}/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt}"
 LOG_DIR="${REPO_ROOT}/runs/libero_hfastwam/${RUN_NAME}"
 mkdir -p "${LOG_DIR}"
@@ -65,7 +65,7 @@ CMD=(
       model.skip_dit_load_from_pretrain=false
       model.skip_video_dit_load_from_pretrain=false
       model.action_dit_pretrained_path="${ACTION_DIT_PRETRAINED_PATH}"
-      num_epochs=3
+      num_epochs=10
       max_steps=null
       model.knowledge_insulation=false
       model.freeze_language_expert=true

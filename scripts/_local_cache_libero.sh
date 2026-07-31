@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-SRC_ROOT="${LIBERO_SOURCE_ROOT:-/apdcephfs_tj5/share_302528826/shaunxhwang/data}"
+SRC_ROOT="${LIBERO_SOURCE_ROOT:-data}"
 DST_ROOT="${LOCAL_LIBERO_DATA_ROOT:-/tmp/fastwam_data/libero}"
 PARALLEL="${LOCAL_CACHE_PARALLEL:-4}"
 LOG_DIR="${LOCAL_CACHE_LOG_DIR:-/tmp/local_cache_libero}"

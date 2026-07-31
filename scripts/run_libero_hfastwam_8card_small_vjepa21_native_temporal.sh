@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# LIBERO V-JEPA 2.1 Flow DiT native temporal resolution: retain 5 tubelets.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export MODEL_CONFIG="${MODEL_CONFIG:-hfastwam_small_vjepa21}"
+export RUN_NAME="${RUN_NAME:-libero_hfastwam_8card_small_vjepa21_native_t5_ds}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
+export TEMPORAL_DOWNSAMPLE=2
+export STANDARDISE_OUTPUT="${STANDARDISE_OUTPUT:-false}"
+export VIDEO_LATENT_CACHE_DIR="${VIDEO_LATENT_CACHE_DIR:-${VIDEO_LATENT_CACHE_ROOT:-${REPO_ROOT}/data/video_latent_cache}/libero/vjepa21_native_t5_raw}"
+export LATENT_CACHE_BATCH_SIZE="${LATENT_CACHE_BATCH_SIZE:-1}"
+exec bash "${SCRIPT_DIR}/run_libero_hfastwam_8card_small_vjepa21.sh" "$@"

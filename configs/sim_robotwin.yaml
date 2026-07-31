@@ -33,15 +33,23 @@ EVALUATION:
   tiled: false
   timing_enabled: false
   skip_get_obs_within_replan: true
+  eval_video_log: true
 
   # Runtime inputs
   dataset_stats_path: null
+  train_config_path: null
   device: cuda
+  # Keep policy inference on `device`; only move SAPIEN rendering to the CPU.
+  render_backend: gpu
+  swiftshader_icd_path: checkpoints/swiftshader/vk_swiftshader_icd.json
 
 MULTIRUN:
   enabled: false
   num_gpus: 8
   max_tasks_per_gpu: 2
+  max_retries: 2
+  task_shard_count: 1
+  task_shard_index: 0
 
 hydra:
   job:

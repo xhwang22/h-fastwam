@@ -557,6 +557,15 @@ def run_training(cfg: DictConfig):
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
 
+    from .utils.video_latent_cache import ensure_training_video_latent_caches
+
+    ensure_training_video_latent_caches(
+        cfg=cfg,
+        model=model,
+        train_dataset=train_ds,
+        val_dataset=val_ds,
+    )
+
     trainer = Wan22Trainer(
         cfg=cfg,
         model=model,

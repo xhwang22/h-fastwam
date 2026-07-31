@@ -25,8 +25,8 @@ cd "${REPO_ROOT}"
 err()  { echo "[w1-multinode] ERROR: $*" >&2; exit 1; }
 info() { echo "[w1-multinode] $*"; }
 
-TJ5_BASE="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints"
-VJEPA2_CKPT="${TJ5_BASE}/vjepa2/vjepa2-ac-vitg.pt"
+CKPT_BASE="${REPO_ROOT}/checkpoints"
+VJEPA2_CKPT="${CKPT_BASE}/vjepa2/vjepa2-ac-vitg.pt"
 
 # Run rank-0-only checks (the launcher itself runs on every node).
 NODE_RANK_RESOLVED="${NODE_RANK:-${INDEX:-0}}"
@@ -74,7 +74,7 @@ export RUN_PREFIX="${RUN_PREFIX:-w1mn}"
 export RUN_NAME="${RUN_NAME:-${RUN_PREFIX}_$(date +%Y-%m-%d_%H-%M-%S)}"
 
 # Hand off to the torchrun-based launcher with W-1-specific env set.
-export DIFFSYNTH_MODEL_BASE_PATH="${TJ5_BASE}/"
+export DIFFSYNTH_MODEL_BASE_PATH="${CKPT_BASE}/"
 export MODEL="${MODEL:-fastwam_vjepa2ac_predictor}"
 export TASK="${TASK:-libero_uncond_2cam224_1e-4}"
 export DATA="${DATA:-libero_2cam}"

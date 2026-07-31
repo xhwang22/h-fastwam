@@ -30,6 +30,7 @@ Examples:
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -42,6 +43,7 @@ from omegaconf import DictConfig, OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POLICY_NAME = "fastwam_policy"
+CPU_RENDER_SITE_DIR = PROJECT_ROOT / "experiments" / "robotwin" / "cpu_render"
 
 
 def _resolve_path(path_str: str, *, base: Path) -> Path:
@@ -146,6 +148,78 @@ def _append_override(overrides: list[str], key: str, value: Any, *, skip_none: b
     overrides.extend([f"--{key}", _format_override_value(value)])
 
 
+def _configure_cpu_rendering(
+    cfg: DictConfig,
+    env: dict[str, str],
+    cmd: list[str],
+) -> list[str]:
+    backend = str(cfg.EVALUATION.render_backend).strip().lower()
+    if backend == "gpu":
+        return cmd
+    if backend != "cpu":
+        raise ValueError(
+            f"Unsupported EVALUATION.render_backend={backend!r}; expected 'gpu' or 'cpu'."
+        )
+
+    swiftshader_icd = _resolve_path(
+        str(cfg.EVALUATION.swiftshader_icd_path),
+        base=PROJECT_ROOT,
+    )
+    if not swiftshader_icd.is_file():
+        raise FileNotFoundError(f"SwiftShader ICD not found: {swiftshader_icd}")
+    if shutil.which("xvfb-run") is None:
+        raise FileNotFoundError(
+            "xvfb-run is required for CPU rendering but was not found in PATH."
+        )
+    if not CPU_RENDER_SITE_DIR.is_dir():
+        raise FileNotFoundError(
+            f"CPU render sitecustomize directory not found: {CPU_RENDER_SITE_DIR}"
+        )
+
+    env["VK_ICD_FILENAMES"] = str(swiftshader_icd)
+    env["VK_DRIVER_FILES"] = str(swiftshader_icd)
+    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or "/tmp"
+    env["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/dev/null"
+    env["FASTWAM_ROBOTWIN_CPU_RENDER"] = "1"
+    env.pop("LD_LIBRARY_PATH", None)
+
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    pythonpath_parts = [str(CPU_RENDER_SITE_DIR)]
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+
+    return [
+        "xvfb-run",
+        "-a",
+        "-s",
+        "-screen 0 1280x720x24",
+        *cmd,
+    ]
+
+
+def _build_resolved_sim_cfg(cfg: DictConfig) -> DictConfig:
+    train_config_path = _resolve_optional_path(
+        cfg.EVALUATION.train_config_path,
+        base=PROJECT_ROOT,
+    )
+    if train_config_path is None:
+        return OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    if not train_config_path.is_file():
+        raise FileNotFoundError(f"Training config not found: {train_config_path}")
+
+    train_cfg = OmegaConf.load(train_config_path)
+    runtime_overlay = OmegaConf.create(
+        {
+            "ckpt": cfg.ckpt,
+            "gpu_id": cfg.gpu_id,
+            "EVALUATION": OmegaConf.to_container(cfg.EVALUATION, resolve=True),
+            "MULTIRUN": OmegaConf.to_container(cfg.MULTIRUN, resolve=True),
+        }
+    )
+    return OmegaConf.merge(train_cfg, runtime_overlay)
+
+
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
 def main(cfg: DictConfig):
     if cfg.ckpt is None:
@@ -194,6 +268,11 @@ def main(cfg: DictConfig):
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
+    resolved_sim_cfg_path = run_output_dir / (
+        f"resolved_sim_config_{str(cfg.EVALUATION.task_name)}.yaml"
+    )
+    resolved_sim_cfg = _build_resolved_sim_cfg(cfg)
+    OmegaConf.save(config=resolved_sim_cfg, f=str(resolved_sim_cfg_path))
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg, ckpt_path)
 
@@ -208,6 +287,7 @@ def main(cfg: DictConfig):
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
     _append_override(overrides, "sim_task", sim_task)
+    _append_override(overrides, "sim_resolved_cfg_path", str(resolved_sim_cfg_path))
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
@@ -221,6 +301,7 @@ def main(cfg: DictConfig):
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    _append_override(overrides, "eval_video_log", cfg.EVALUATION.eval_video_log)
     _append_override(
         overrides,
         "skip_get_obs_within_replan",
@@ -240,6 +321,7 @@ def main(cfg: DictConfig):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
+    cmd = _configure_cpu_rendering(cfg=cfg, env=env, cmd=cmd)
 
     with open(log_file, "w", encoding="utf-8") as log_f:
         process = subprocess.Popen(

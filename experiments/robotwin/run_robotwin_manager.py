@@ -127,6 +127,7 @@ class RunningState:
     task_name: str
     gpu_id: int
     phase: str  # "clean" | "random"
+    attempt: int
     process: subprocess.Popen[str]
 
 
@@ -152,6 +153,9 @@ def main(cfg: DictConfig):
     max_tasks_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if max_tasks_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
+    max_retries = int(cfg.MULTIRUN.get("max_retries", 2))
+    if max_retries < 0:
+        raise ValueError("`MULTIRUN.max_retries` must be >= 0.")
     gpu_ids = list(range(num_gpus))
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
@@ -161,10 +165,25 @@ def main(cfg: DictConfig):
     run_output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    manager_log = run_output_dir / "manager.log"
-    failed_tasks_file = run_output_dir / "failed_tasks.txt"
-    summary_csv = run_output_dir / "summary.csv"
-    summary_json = run_output_dir / "summary.json"
+    task_shard_count = int(cfg.MULTIRUN.get("task_shard_count", 1))
+    task_shard_index = int(cfg.MULTIRUN.get("task_shard_index", 0))
+    if task_shard_count <= 0:
+        raise ValueError("`MULTIRUN.task_shard_count` must be > 0.")
+    if not 0 <= task_shard_index < task_shard_count:
+        raise ValueError(
+            "`MULTIRUN.task_shard_index` must satisfy "
+            f"0 <= index < count, got index={task_shard_index}, count={task_shard_count}."
+        )
+
+    shard_suffix = (
+        ""
+        if task_shard_count == 1
+        else f".shard{task_shard_index}-of-{task_shard_count}"
+    )
+    manager_log = run_output_dir / f"manager{shard_suffix}.log"
+    failed_tasks_file = run_output_dir / f"failed_tasks{shard_suffix}.txt"
+    summary_csv = run_output_dir / f"summary{shard_suffix}.csv"
+    summary_json = run_output_dir / f"summary{shard_suffix}.json"
 
     task_name_cfg = cfg.EVALUATION.task_name
     if task_name_cfg is None or str(task_name_cfg).strip() == "":
@@ -172,14 +191,22 @@ def main(cfg: DictConfig):
     else:
         tasks = [str(task_name_cfg)]
 
+    if task_shard_count > 1:
+        tasks = [
+            task
+            for task_index, task in enumerate(tasks)
+            if task_index % task_shard_count == task_shard_index
+        ]
+
     extra_overrides = _collect_worker_overrides()
 
     task_rates: dict[str, dict[str, float | None]] = {
         task: {"clean": None, "random": None} for task in tasks
     }
     failed_records: list[dict[str, Any]] = []
-    pending_tasks = deque(tasks)
+    pending_phases: deque[tuple[str, str]] = deque()
     running_states: list[RunningState] = []
+    attempt_counts: dict[tuple[str, str], int] = {}
 
     phase_to_task_config = {
         "clean": "demo_clean",
@@ -207,10 +234,26 @@ def main(cfg: DictConfig):
         cmd.extend(extra_overrides)
         return cmd
 
+    for task_name in tasks:
+        clean_file = run_output_dir / task_name / _phase_result_filename("clean")
+        random_file = run_output_dir / task_name / _phase_result_filename("random")
+        if clean_file.exists():
+            task_rates[task_name]["clean"] = _parse_success_rate(clean_file)
+        if random_file.exists():
+            task_rates[task_name]["random"] = _parse_success_rate(random_file)
+
+        if task_rates[task_name]["clean"] is None:
+            pending_phases.append((task_name, "clean"))
+        elif task_rates[task_name]["random"] is None:
+            pending_phases.append((task_name, "random"))
+
     def launch_phase(task_name: str, gpu_id: int, phase: str) -> RunningState:
+        phase_key = (task_name, phase)
+        attempt = attempt_counts.get(phase_key, 0) + 1
+        attempt_counts[phase_key] = attempt
         cmd = build_cmd(task_name=task_name, gpu_id=gpu_id, phase=phase)
         log(
-            f"launch task={task_name} phase={phase} gpu={gpu_id} "
+            f"launch task={task_name} phase={phase} gpu={gpu_id} attempt={attempt} "
             f"cmd={' '.join(cmd)}"
         )
         process = subprocess.Popen(
@@ -222,6 +265,7 @@ def main(cfg: DictConfig):
             task_name=task_name,
             gpu_id=gpu_id,
             phase=phase,
+            attempt=attempt,
             process=process,
         )
 
@@ -253,9 +297,9 @@ def main(cfg: DictConfig):
         return count
 
     def try_launch_pending(gpu_id: int) -> None:
-        while len(pending_tasks) > 0 and gpu_running_count(gpu_id) < max_tasks_per_gpu:
-            task_name = pending_tasks.popleft()
-            running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase="clean"))
+        while len(pending_phases) > 0 and gpu_running_count(gpu_id) < max_tasks_per_gpu:
+            task_name, phase = pending_phases.popleft()
+            running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase=phase))
 
     def write_outputs() -> None:
         clean_mean = _mean_or_none([task_rates[t]["clean"] for t in tasks])
@@ -302,15 +346,14 @@ def main(cfg: DictConfig):
 
     log(
         f"manager start tasks={len(tasks)} gpu_ids={gpu_ids} "
-        f"max_tasks_per_gpu={max_tasks_per_gpu} output_dir={run_output_dir}"
+        f"max_tasks_per_gpu={max_tasks_per_gpu} max_retries={max_retries} "
+        f"task_shard={task_shard_index}/{task_shard_count} "
+        f"pending_phases={len(pending_phases)} output_dir={run_output_dir}"
     )
 
     # Launch initial tasks for each GPU up to capacity.
     for gpu_id in gpu_ids:
         try_launch_pending(gpu_id)
-
-    has_failure = False
-    failure_message = ""
 
     while len(running_states) > 0:
         progressed = False
@@ -323,47 +366,61 @@ def main(cfg: DictConfig):
             running_states.remove(state)
 
             if return_code != 0:
-                has_failure = True
                 failure_message = (
                     f"worker failed: task={state.task_name}, phase={state.phase}, "
-                    f"gpu={gpu_id}, return_code={return_code}"
-                )
-                failed_records.append(
-                    {
-                        "task_name": state.task_name,
-                        "phase": state.phase,
-                        "gpu_id": gpu_id,
-                        "return_code": return_code,
-                        "reason": "process_failed",
-                    }
+                    f"gpu={gpu_id}, attempt={state.attempt}, return_code={return_code}"
                 )
                 log(failure_message)
-                terminate_all_running()
-                running_states.clear()
-                break
+                if state.attempt <= max_retries:
+                    running_states.append(
+                        launch_phase(
+                            task_name=state.task_name,
+                            gpu_id=gpu_id,
+                            phase=state.phase,
+                        )
+                    )
+                else:
+                    failed_records.append(
+                        {
+                            "task_name": state.task_name,
+                            "phase": state.phase,
+                            "gpu_id": gpu_id,
+                            "return_code": return_code,
+                            "reason": "process_failed",
+                        }
+                    )
+                    try_launch_pending(gpu_id)
+                continue
 
             result_file = run_output_dir / state.task_name / _phase_result_filename(state.phase)
             try:
                 success_rate = _parse_success_rate(result_file)
             except Exception as exc:
-                has_failure = True
                 failure_message = (
                     f"result parse failed: task={state.task_name}, phase={state.phase}, "
-                    f"gpu={gpu_id}, error={repr(exc)}"
-                )
-                failed_records.append(
-                    {
-                        "task_name": state.task_name,
-                        "phase": state.phase,
-                        "gpu_id": gpu_id,
-                        "return_code": return_code,
-                        "reason": "result_parse_failed",
-                    }
+                    f"gpu={gpu_id}, attempt={state.attempt}, error={repr(exc)}"
                 )
                 log(failure_message)
-                terminate_all_running()
-                running_states.clear()
-                break
+                if state.attempt <= max_retries:
+                    running_states.append(
+                        launch_phase(
+                            task_name=state.task_name,
+                            gpu_id=gpu_id,
+                            phase=state.phase,
+                        )
+                    )
+                else:
+                    failed_records.append(
+                        {
+                            "task_name": state.task_name,
+                            "phase": state.phase,
+                            "gpu_id": gpu_id,
+                            "return_code": return_code,
+                            "reason": "result_parse_failed",
+                        }
+                    )
+                    try_launch_pending(gpu_id)
+                continue
 
             task_rates[state.task_name][state.phase] = success_rate
             log(
@@ -381,29 +438,16 @@ def main(cfg: DictConfig):
 
             try_launch_pending(gpu_id)
 
-        if has_failure:
-            break
         if not progressed:
             time.sleep(POLL_INTERVAL_SEC)
-
-    # Mark not started tasks when failure happened.
-    if has_failure:
-        for task_name in pending_tasks:
-            failed_records.append(
-                {
-                    "task_name": task_name,
-                    "phase": "not_started",
-                    "gpu_id": -1,
-                    "return_code": -1,
-                    "reason": "aborted_not_started",
-                }
-            )
 
     write_outputs()
     log(f"summary saved: {summary_csv} and {summary_json}")
 
-    if has_failure:
-        raise RuntimeError(failure_message)
+    if failed_records:
+        raise RuntimeError(
+            f"{len(failed_records)} phase(s) failed after retries; see {failed_tasks_file}"
+        )
 
     log("manager finished successfully")
 

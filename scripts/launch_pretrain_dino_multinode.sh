@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-CONDA_ACTIVATE="/apdcephfs_tj5/share_302528826/shaunxhwang/miniconda3/bin/activate"
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 [[ -f "${CONDA_ACTIVATE}" ]] && source "${CONDA_ACTIVATE}" fastwam
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

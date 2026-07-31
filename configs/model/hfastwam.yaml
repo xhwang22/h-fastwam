@@ -69,7 +69,7 @@ freeze_action_expert: false
 # Language backend
 language_backend: "qwen3"         # legacy | qwen3 (also supports Qwen3-VL text-only)
 language_model_id: "Qwen/Qwen3-VL-2B-Instruct"
-language_local_files_only: false
+language_local_files_only: true   # load from HF_HOME cache (checkpoints/hf_cache), no network
 
 # Video DiT config (DiT-side projection: in_dim=out_dim=1024)
 video_dit_config:

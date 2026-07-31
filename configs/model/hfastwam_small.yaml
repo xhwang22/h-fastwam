@@ -63,7 +63,7 @@ freeze_action_expert: false
 # Language backend (fixed geometry: 16 heads * 128 head_dim = 2048 hidden).
 language_backend: "qwen3"
 language_model_id: "Qwen/Qwen3-VL-2B-Instruct"
-language_local_files_only: false
+language_local_files_only: true   # load from HF_HOME cache (checkpoints/hf_cache), no network
 
 # Video DiT config — SHRUNK & aligned to language (16*128=2048 attention width).
 # in_dim/out_dim kept at 48 for the VAE-48d latent world model.

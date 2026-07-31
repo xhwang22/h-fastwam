@@ -11,7 +11,7 @@ set -e
 
 SRC_TAR_PARTS_GLOB="/apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/data/robotwin2.0/robotwin2.0.tar.gz.part-*"
 SRC_STATS="/apdcephfs_gy2/share_302533218/shaunxhwang/embodied/FastWAM/data/robotwin2.0/dataset_stats.json"
-SRC_CKPT="/apdcephfs_tj5/share_302528826/shaunxhwang/fastwam/checkpoints/checkpoints/vjepa2/vjepa2-ac-vitg.pt"
+SRC_CKPT="${CKPT_BASE}/vjepa2/vjepa2-ac-vitg.pt"  # set CKPT_BASE or place file here
 
 DST_BASE="/dev/shm/fwam"
 DST_DATA_PARENT="${DST_BASE}/data/robotwin2.0"
