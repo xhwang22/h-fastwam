@@ -193,10 +193,28 @@ _fastwam_install_shared_ffmpeg() {
   export LD_LIBRARY_PATH="${FFMPEG_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 }
 
+_fastwam_configure_wandb() {
+  local key_file="${WANDB_API_KEY_FILE:-/fsx/.secrets/wandb_api_key}"
+  if [[ -z "${WANDB_API_KEY:-}" && -f "${key_file}" ]]; then
+    WANDB_API_KEY="$(tr -d '[:space:]' < "${key_file}")"
+  elif [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.wandb_key" ]]; then
+    WANDB_API_KEY="$(tr -d '[:space:]' < "${HOME}/.wandb_key")"
+  fi
+
+  if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    export WANDB_API_KEY
+    export WANDB="${WANDB:-1}"
+    echo "[aws-setup] W&B enabled using a protected key source."
+  else
+    export WANDB="${WANDB:-0}"
+  fi
+}
+
 fastwam_prepare_aws_hyperpod() {
   _fastwam_configure_hyperpod_topology
   _fastwam_configure_aws_network
   _fastwam_install_shared_ffmpeg
+  _fastwam_configure_wandb
 
   if ! command -v accelerate >/dev/null 2>&1; then
     echo "ERROR: accelerate is not installed in the current Python environment." >&2
@@ -208,5 +226,4 @@ fastwam_prepare_aws_hyperpod() {
   export VIDEO_LATENT_CACHE_ENABLED=0
   export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-1024}"
   export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-  export WANDB="${WANDB:-0}"
 }
