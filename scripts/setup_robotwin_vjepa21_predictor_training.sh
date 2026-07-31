@@ -13,6 +13,7 @@ VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1
 VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
 VJEPA21_URL="${VJEPA21_URL:-https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitG_384.pt}"
 VJEPA21_EXPECTED_SIZE="${VJEPA21_EXPECTED_SIZE:-30238058912}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 usage() {
   cat <<EOF
@@ -23,6 +24,7 @@ Environment overrides:
   ROBOTWIN_DATA_ROOT=/path/to/data/robotwin2.0
   HF_HOME=/path/to/huggingface/cache
   TORCH_HOME=/path/to/torch/cache
+  PYTHON_BIN=/path/to/python
   SKIP_DATA=1
   SKIP_MODELS=1
   START_TRAINING=1
@@ -146,14 +148,19 @@ download_vjepa21() {
 }
 
 download_qwen() {
-  require_command python3
-  if ! python3 -c 'import huggingface_hub' >/dev/null 2>&1; then
-    echo "ERROR: huggingface_hub is not installed. Install the project first:" >&2
-    echo "  python3 -m pip install -e ." >&2
-    exit 1
+  require_command "${PYTHON_BIN}"
+  if ! "${PYTHON_BIN}" -c 'import huggingface_hub, safetensors' >/dev/null 2>&1; then
+    if ! "${PYTHON_BIN}" -m pip --version >/dev/null 2>&1; then
+      echo "ERROR: pip is unavailable for ${PYTHON_BIN}." >&2
+      exit 1
+    fi
+    echo "Installing Hugging Face download dependencies..."
+    "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
+      "huggingface-hub>=0.34.0" \
+      "safetensors>=0.5.3"
   fi
   echo "Downloading Qwen3-VL-2B-Instruct into ${HF_HOME}/hub..."
-  HF_HOME="${HF_HOME}" python3 - <<'PY'
+  HF_HOME="${HF_HOME}" "${PYTHON_BIN}" - <<'PY'
 from huggingface_hub import snapshot_download
 
 snapshot_download(
