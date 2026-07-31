@@ -17,6 +17,7 @@ export NCCL_NET_PLUGIN=none
 export NCCL_IB_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0
 export VIDEO_LATENT_CACHE_ENABLED=0
+export GRADIENT_ACCUMULATION_STEPS=1
 
 export FFMPEG_PREFIX="${FFMPEG_PREFIX:-/fsx/ffmpeg-shared}"
 if [[ ! -x "${FFMPEG_PREFIX}/bin/ffmpeg" ]]; then
