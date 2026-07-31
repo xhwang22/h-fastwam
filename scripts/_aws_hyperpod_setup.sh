@@ -174,4 +174,5 @@ fastwam_prepare_aws_hyperpod() {
   export VIDEO_LATENT_CACHE_ENABLED=0
   export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-1024}"
   export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+  export WANDB="${WANDB:-0}"
 }
