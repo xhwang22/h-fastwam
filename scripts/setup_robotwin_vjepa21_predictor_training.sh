@@ -48,25 +48,29 @@ require_command() {
   fi
 }
 
-ensure_git() {
-  if command -v git >/dev/null 2>&1; then
+ensure_system_tools() {
+  local missing=()
+  command -v git >/dev/null 2>&1 || missing+=(git)
+  command -v tmux >/dev/null 2>&1 || missing+=(tmux)
+  if [[ "${#missing[@]}" -eq 0 ]]; then
     return
   fi
 
-  echo "Git is not installed; installing it now..."
+  echo "Installing missing system tools: ${missing[*]}"
   if command -v dnf >/dev/null 2>&1; then
-    dnf install -y git
+    dnf install -y "${missing[@]}"
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y git
+    yum install -y "${missing[@]}"
   elif command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    apt-get install -y git
+    apt-get install -y "${missing[@]}"
   else
-    echo "ERROR: Git is required, but no supported package manager was found." >&2
+    echo "ERROR: missing system tools (${missing[*]}), but no supported package manager was found." >&2
     exit 1
   fi
 
   require_command git
+  require_command tmux
 }
 
 install_python_dependencies() {
@@ -181,7 +185,7 @@ download_data() {
 
 download_vjepa21() {
   require_command curl
-  ensure_git
+  ensure_system_tools
   mkdir -p "$(dirname "${VJEPA21_CHECKPOINT}")" "$(dirname "${VJEPA21_REPO}")"
 
   download_file "${VJEPA21_URL}" "${VJEPA21_CHECKPOINT}" "${VJEPA21_EXPECTED_SIZE}"
@@ -259,7 +263,7 @@ wait_for_shared_assets() {
 }
 
 install_python_dependencies
-ensure_git
+ensure_system_tools
 
 SETUP_NODE_RANK="$(setup_node_rank)"
 if [[ "${SETUP_NODE_RANK}" == "0" ]]; then
