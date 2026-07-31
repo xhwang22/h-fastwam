@@ -19,23 +19,50 @@ _fastwam_require_positive_uint() {
   fi
 }
 
+_fastwam_resolve_nproc_per_node() {
+  if [[ -n "${NPROC_PER_NODE:-}" && "${NPROC_PER_NODE}" != "auto" ]]; then
+    return
+  fi
+  if [[ -n "${PET_NPROC_PER_NODE:-}" && "${PET_NPROC_PER_NODE}" != "auto" ]]; then
+    NPROC_PER_NODE="${PET_NPROC_PER_NODE}"
+    return
+  fi
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    local devices="${CUDA_VISIBLE_DEVICES// /}"
+    if [[ -n "${devices}" && "${devices}" != "NoDevFiles" ]]; then
+      local -a _fastwam_visible_devices
+      IFS=',' read -ra _fastwam_visible_devices <<< "${devices}"
+      NPROC_PER_NODE="${#_fastwam_visible_devices[@]}"
+      return
+    fi
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    NPROC_PER_NODE="$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)"
+    NPROC_PER_NODE="${NPROC_PER_NODE//[[:space:]]/}"
+    if [[ "${NPROC_PER_NODE}" =~ ^[1-9][0-9]*$ ]]; then
+      return
+    fi
+  fi
+  NPROC_PER_NODE=8
+}
+
 _fastwam_configure_hyperpod_topology() {
   local topology_source="single-node"
 
   if [[ -n "${PET_NNODES:-}" ]]; then
     NNODES="${PET_NNODES}"
-    NPROC_PER_NODE="${PET_NPROC_PER_NODE:-${NPROC_PER_NODE:-8}}"
+    _fastwam_resolve_nproc_per_node
     NODE_RANK="${PET_NODE_RANK:?PET_NODE_RANK is required when PET_NNODES is set}"
     MASTER_ADDR="${PET_MASTER_ADDR:?PET_MASTER_ADDR is required when PET_NNODES is set}"
     MASTER_PORT="${PET_MASTER_PORT:-${MASTER_PORT:-29500}}"
     topology_source="HyperPod PET"
   elif [[ -n "${NNODES:-}" && -n "${NODE_RANK:-}" && -n "${MASTER_ADDR:-}" ]]; then
-    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+    _fastwam_resolve_nproc_per_node
     MASTER_PORT="${MASTER_PORT:-29500}"
     topology_source="explicit managed"
   elif [[ -n "${WORLD_SIZE:-}" && -n "${RANK:-}" && -n "${MASTER_ADDR:-}" && -z "${LOCAL_RANK:-}${LOCAL_WORLD_SIZE:-}" ]]; then
     NNODES="${WORLD_SIZE}"
-    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+    _fastwam_resolve_nproc_per_node
     NODE_RANK="${RANK}"
     MASTER_PORT="${MASTER_PORT:-29500}"
     topology_source="PyTorchJob node-level"
@@ -45,7 +72,7 @@ _fastwam_configure_hyperpod_topology() {
     return 2
   else
     NNODES=1
-    NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+    _fastwam_resolve_nproc_per_node
     NODE_RANK=0
     MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
     MASTER_PORT="${MASTER_PORT:-29500}"
