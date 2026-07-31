@@ -40,6 +40,27 @@ require_command() {
   fi
 }
 
+ensure_git() {
+  if command -v git >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "Git is not installed; installing it now..."
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y git
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y git
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y git
+  else
+    echo "ERROR: Git is required, but no supported package manager was found." >&2
+    exit 1
+  fi
+
+  require_command git
+}
+
 download_file() {
   local url="$1"
   local output="$2"
@@ -132,7 +153,7 @@ download_data() {
 
 download_vjepa21() {
   require_command curl
-  require_command git
+  ensure_git
   mkdir -p "$(dirname "${VJEPA21_CHECKPOINT}")" "$(dirname "${VJEPA21_REPO}")"
 
   download_file "${VJEPA21_URL}" "${VJEPA21_CHECKPOINT}" "${VJEPA21_EXPECTED_SIZE}"
