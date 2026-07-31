@@ -171,6 +171,13 @@ fastwam_prepare_aws_hyperpod() {
   _fastwam_configure_aws_network
   _fastwam_install_shared_ffmpeg
 
+  if ! command -v accelerate >/dev/null 2>&1; then
+    echo "ERROR: accelerate is not installed in the current Python environment." >&2
+    echo "Run on every worker node:" >&2
+    echo "  bash scripts/install_aws_python_dependencies.sh" >&2
+    return 1
+  fi
+
   export VIDEO_LATENT_CACHE_ENABLED=0
   export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-1024}"
   export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
