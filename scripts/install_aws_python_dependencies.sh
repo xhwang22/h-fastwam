@@ -19,7 +19,8 @@ fi
 "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
   "transformers==5.12.1" \
   "safetensors>=0.5.3" \
-  "huggingface-hub>=0.34.0"
+  "huggingface-hub>=0.34.0" \
+  "timm>=1.0.19"
 
 "${PYTHON_BIN}" -m pip uninstall -y torchaudio
 
@@ -29,6 +30,7 @@ import safetensors
 import torch
 import torchvision
 import transformers
+import timm
 import accelerate
 import deepspeed
 import fastwam
@@ -38,6 +40,7 @@ print(f"torchvision={torchvision.__version__}")
 print(f"transformers={transformers.__version__}")
 print(f"safetensors={safetensors.__version__}")
 print(f"huggingface_hub={huggingface_hub.__version__}")
+print(f"timm={timm.__version__}")
 print(f"accelerate={accelerate.__version__}")
 print(f"deepspeed={deepspeed.__version__}")
 print(f"fastwam={fastwam.__file__}")
