@@ -162,7 +162,7 @@ fi
 CAUSAL_TUBELET_OVERRIDES=()
 if [[ -n "${CAUSAL_TUBELET_ENCODING:-}" ]]; then
   CAUSAL_TUBELET_OVERRIDES=(
-    "model.visual_encoder_config.causal_tubelet_encoding=${CAUSAL_TUBELET_ENCODING}"
+    "++model.visual_encoder_config.causal_tubelet_encoding=${CAUSAL_TUBELET_ENCODING}"
   )
 fi
 
