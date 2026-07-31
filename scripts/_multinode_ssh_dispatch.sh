@@ -35,7 +35,7 @@ _multinode_wait() {
 
 _multinode_dispatch() {
   # No-op for single-node or if already dispatched by a remote invocation.
-  [[ "${NNODES:-1}" -le 1 || -n "${_MULTINODE_LAUNCHED:-}" ]] && return
+  [[ "${NNODES:-1}" -le 1 || -n "${_MULTINODE_LAUNCHED:-}" || "${FASTWAM_MANAGED_DISTRIBUTED:-0}" == "1" ]] && return
 
   local caller="$1"
 

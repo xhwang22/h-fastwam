@@ -20,6 +20,8 @@ if [[ -n "${NODE_IP_LIST:-}" ]]; then
   IFS=',' read -ra _NODES <<< "${NODE_IP_LIST}"
   NNODES="${#_NODES[@]}"
   MASTER_ADDR="${MASTER_ADDR:-${_NODES[0]%%:*}}"
+elif [[ -n "${NNODES:-}" ]]; then
+  MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 else
   NNODES=1
   MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
