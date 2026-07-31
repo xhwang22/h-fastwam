@@ -98,6 +98,7 @@ _fastwam_configure_hyperpod_topology() {
 
 _fastwam_configure_aws_network() {
   local network_iface
+  local use_efa=0
   network_iface="${NETWORK_IFACE:-$(awk '$2 == "00000000" && $1 != "lo" { print $1; exit }' /proc/net/route)}"
   if [[ -z "${network_iface}" || ! -d "/sys/class/net/${network_iface}" ]]; then
     echo "ERROR: unable to detect a usable network interface; set NETWORK_IFACE explicitly." >&2
@@ -109,6 +110,30 @@ _fastwam_configure_aws_network() {
   export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-${network_iface}}"
 
   if [[ "${FASTWAM_MANAGED_DISTRIBUTED:-0}" == "1" && "${NNODES}" -gt 1 ]]; then
+    case "${FASTWAM_USE_EFA:-auto}" in
+      1|true|yes|on)
+        use_efa=1
+        ;;
+      0|false|no|off)
+        use_efa=0
+        ;;
+      auto)
+        if [[ "${NCCL_NET:-}" != "Socket" ]] && compgen -G '/sys/class/infiniband/*' >/dev/null; then
+          if ! command -v fi_info >/dev/null 2>&1 || fi_info -p efa >/dev/null 2>&1; then
+            use_efa=1
+          fi
+        fi
+        ;;
+      *)
+        echo "ERROR: FASTWAM_USE_EFA must be auto, 0/1, true/false, yes/no, or on/off." >&2
+        return 2
+        ;;
+    esac
+  fi
+
+  if (( use_efa )); then
+    [[ "${NCCL_NET:-}" == "Socket" ]] && unset NCCL_NET
+    [[ "${NCCL_NET_PLUGIN:-}" == "none" ]] && unset NCCL_NET_PLUGIN
     export FI_PROVIDER="${FI_PROVIDER:-efa}"
     export FI_EFA_USE_DEVICE_RDMA="${FI_EFA_USE_DEVICE_RDMA:-1}"
     export FI_EFA_USE_HUGE_PAGE="${FI_EFA_USE_HUGE_PAGE:-0}"
@@ -117,10 +142,12 @@ _fastwam_configure_aws_network() {
     export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-PHB}"
     echo "[aws-setup] network=${network_iface} transport=EFA"
   else
-    export NCCL_NET="${NCCL_NET:-Socket}"
-    export NCCL_NET_PLUGIN="${NCCL_NET_PLUGIN:-none}"
-    export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
-    export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-0}"
+    export NCCL_NET=Socket
+    export NCCL_NET_PLUGIN=none
+    export NCCL_IB_DISABLE=1
+    export NCCL_NET_GDR_LEVEL=0
+    [[ "${FI_PROVIDER:-}" == "efa" ]] && unset FI_PROVIDER
+    unset FI_EFA_USE_DEVICE_RDMA
     echo "[aws-setup] network=${network_iface} transport=Socket"
   fi
 }
