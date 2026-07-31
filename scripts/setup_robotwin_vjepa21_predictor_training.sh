@@ -14,6 +14,10 @@ VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
 VJEPA21_URL="${VJEPA21_URL:-https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitG_384.pt}"
 VJEPA21_EXPECTED_SIZE="${VJEPA21_EXPECTED_SIZE:-30238058912}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+INSTALL_PYTHON_DEPS="${INSTALL_PYTHON_DEPS:-1}"
+SETUP_WAIT_TIMEOUT_SECONDS="${SETUP_WAIT_TIMEOUT_SECONDS:-43200}"
+SETUP_MARKER="${SETUP_MARKER:-${REPO_ROOT}/.robotwin_vjepa21_setup_complete}"
+TRAINING_SCRIPT="${TRAINING_SCRIPT:-run_robotwin_hfastwam_8card_small_vjepa21_predictor_native_temporal_aws.sh}"
 
 usage() {
   cat <<EOF
@@ -27,7 +31,11 @@ Environment overrides:
   PYTHON_BIN=/path/to/python
   SKIP_DATA=1
   SKIP_MODELS=1
+  INSTALL_PYTHON_DEPS=0
   START_TRAINING=1
+  SETUP_WAIT_TIMEOUT_SECONDS=43200
+  SETUP_MARKER=/shared/path/setup-complete
+  TRAINING_SCRIPT=run_robotwin_hfastwam_8card_small_vjepa21_predictor_native_temporal_aws.sh
   VIDEO_LATENT_CACHE_ROOT=/large/cache/path
   KEEP_DATA_ARCHIVES=1
 EOF
@@ -59,6 +67,26 @@ ensure_git() {
   fi
 
   require_command git
+}
+
+install_python_dependencies() {
+  if [[ "${INSTALL_PYTHON_DEPS}" == "0" ]]; then
+    return
+  fi
+  echo "Installing the FastWAM Python training environment..."
+  PYTHON_BIN="${PYTHON_BIN}" bash "${SCRIPT_DIR}/install_aws_python_dependencies.sh"
+}
+
+setup_node_rank() {
+  if [[ -n "${PET_NNODES:-}" ]]; then
+    printf '%s\n' "${PET_NODE_RANK:?PET_NODE_RANK is required when PET_NNODES is set}"
+  elif [[ -n "${NNODES:-}" && "${NNODES}" -gt 1 ]]; then
+    printf '%s\n' "${NODE_RANK:?NODE_RANK is required when NNODES is greater than 1}"
+  elif [[ -n "${WORLD_SIZE:-}" && "${WORLD_SIZE}" -gt 1 && -z "${LOCAL_RANK:-}" ]]; then
+    printf '%s\n' "${RANK:?RANK is required when WORLD_SIZE is greater than 1}"
+  else
+    printf '0\n'
+  fi
 }
 
 download_file() {
@@ -209,12 +237,44 @@ validate_assets() {
   done
 }
 
-if [[ "${SKIP_DATA:-0}" != "1" ]]; then
-  download_data
-fi
-if [[ "${SKIP_MODELS:-0}" != "1" ]]; then
-  download_vjepa21
-  download_qwen
+assets_ready() {
+  [[ -f "${SETUP_MARKER}" ]] &&
+    [[ -f "${ROBOTWIN_DATA_ROOT}/robotwin2.0/meta/info.json" ]] &&
+    [[ -f "${ROBOTWIN_DATA_ROOT}/dataset_stats.json" ]] &&
+    [[ -f "${VJEPA21_CHECKPOINT}" ]] &&
+    [[ -f "${VJEPA21_REPO}/app/vjepa_2_1/models/vision_transformer.py" ]] &&
+    [[ -d "${HF_HOME}/hub/models--Qwen--Qwen3-VL-2B-Instruct" ]]
+}
+
+wait_for_shared_assets() {
+  local deadline=$(( SECONDS + SETUP_WAIT_TIMEOUT_SECONDS ))
+  echo "Waiting for node rank 0 to prepare shared data and models..."
+  until assets_ready; do
+    if (( SECONDS >= deadline )); then
+      echo "ERROR: timed out waiting for shared setup marker ${SETUP_MARKER}." >&2
+      exit 1
+    fi
+    sleep 30
+  done
+}
+
+install_python_dependencies
+ensure_git
+
+SETUP_NODE_RANK="$(setup_node_rank)"
+if [[ "${SETUP_NODE_RANK}" == "0" ]]; then
+  rm -f "${SETUP_MARKER}"
+  if [[ "${SKIP_DATA:-0}" != "1" ]]; then
+    download_data
+  fi
+  if [[ "${SKIP_MODELS:-0}" != "1" ]]; then
+    download_vjepa21
+    download_qwen
+  fi
+  validate_assets
+  touch "${SETUP_MARKER}"
+else
+  wait_for_shared_assets
 fi
 
 validate_assets
@@ -226,6 +286,7 @@ RoboTwin data: ${ROBOTWIN_DATA_ROOT}
 V-JEPA checkpoint: ${VJEPA21_CHECKPOINT}
 V-JEPA source: ${VJEPA21_REPO}
 Qwen cache: ${HF_HOME}/hub/models--Qwen--Qwen3-VL-2B-Instruct
+Setup node rank: ${SETUP_NODE_RANK}
 EOF
 
 if [[ "${START_TRAINING:-0}" == "1" ]]; then
@@ -233,13 +294,11 @@ if [[ "${START_TRAINING:-0}" == "1" ]]; then
   export HF_HOME TORCH_HOME VJEPA21_CHECKPOINT VJEPA21_REPO
   export VIDEO_LATENT_CACHE_ROOT="${VIDEO_LATENT_CACHE_ROOT:-${REPO_ROOT}/data/video_latent_cache}"
   export WANDB="${WANDB:-0}"
-  exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_native_temporal.sh"
+  exec bash "${SCRIPT_DIR}/${TRAINING_SCRIPT}"
 fi
 
 cat <<EOF
 
-Start training with:
-  WANDB=0 \\
-  VIDEO_LATENT_CACHE_ROOT=/path/with/tens-of-terabytes/free \\
-  bash scripts/run_robotwin_hfastwam_8card_small_vjepa21_predictor_native_temporal.sh
+Run setup and training as one command on every worker node:
+  START_TRAINING=1 bash scripts/setup_robotwin_vjepa21_predictor_training.sh
 EOF
