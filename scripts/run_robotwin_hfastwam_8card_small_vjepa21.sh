@@ -159,6 +159,13 @@ if [[ -n "${TEMPORAL_DOWNSAMPLE:-}" ]]; then
   )
 fi
 
+CAUSAL_TUBELET_OVERRIDES=()
+if [[ -n "${CAUSAL_TUBELET_ENCODING:-}" ]]; then
+  CAUSAL_TUBELET_OVERRIDES=(
+    "model.visual_encoder_config.causal_tubelet_encoding=${CAUSAL_TUBELET_ENCODING}"
+  )
+fi
+
 CMD=(
   accelerate launch
     --config_file "${ACCEL_CONFIG}"
@@ -201,6 +208,7 @@ CMD=(
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
       "${TEMPORAL_OVERRIDES[@]}"
+      "${CAUSAL_TUBELET_OVERRIDES[@]}"
       "${VIDEO_LATENT_CACHE_OVERRIDES[@]}"
       "${RESUME_OVERRIDES[@]}"
 )
