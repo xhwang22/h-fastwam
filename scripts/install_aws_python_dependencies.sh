@@ -7,10 +7,10 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
-"${PYTHON_BIN}" -m pip install \
-  "torch==2.7.1" \
-  "torchvision==0.22.1" \
-  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install \
+  torch==2.7.1+cu128 \
+  torchvision==0.22.1+cu128 \
+  --extra-index-url https://download.pytorch.org/whl/cu128
 
 "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
   "transformers==5.12.1" \
