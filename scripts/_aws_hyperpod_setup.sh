@@ -19,6 +19,25 @@ _fastwam_require_positive_uint() {
   fi
 }
 
+_fastwam_configure_proxy() {
+  export FASTWAM_DISABLE_PROXY="${FASTWAM_DISABLE_PROXY:-1}"
+  case "${FASTWAM_DISABLE_PROXY}" in
+    1|true|yes|on)
+      unset http_proxy https_proxy ftp_proxy all_proxy
+      unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY
+      unset no_proxy NO_PROXY
+      echo "[aws-setup] outbound proxy disabled."
+      ;;
+    0|false|no|off)
+      echo "[aws-setup] preserving caller-provided proxy settings."
+      ;;
+    *)
+      echo "ERROR: FASTWAM_DISABLE_PROXY must be 0/1, true/false, yes/no, or on/off." >&2
+      return 2
+      ;;
+  esac
+}
+
 _fastwam_resolve_nproc_per_node() {
   if [[ -n "${NPROC_PER_NODE:-}" && "${NPROC_PER_NODE}" != "auto" ]]; then
     return
@@ -211,6 +230,7 @@ _fastwam_configure_wandb() {
 }
 
 fastwam_prepare_aws_hyperpod() {
+  _fastwam_configure_proxy
   _fastwam_configure_hyperpod_topology
   _fastwam_configure_aws_network
   _fastwam_install_shared_ffmpeg

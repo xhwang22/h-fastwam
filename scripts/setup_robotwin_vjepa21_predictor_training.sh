@@ -5,6 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+FASTWAM_DISABLE_PROXY="${FASTWAM_DISABLE_PROXY:-1}"
+if [[ "${FASTWAM_DISABLE_PROXY}" == "1" ]]; then
+  unset http_proxy https_proxy ftp_proxy all_proxy
+  unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY
+  unset no_proxy NO_PROXY
+fi
+
 ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-${REPO_ROOT}/data/robotwin2.0}"
 ROBOTWIN_DATA_REPO="${ROBOTWIN_DATA_REPO:-yuanty/robotwin2.0-fastwam}"
 HF_HOME="${HF_HOME:-${REPO_ROOT}/checkpoints/hf_cache}"
