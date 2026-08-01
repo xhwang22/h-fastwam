@@ -232,6 +232,16 @@ _fastwam_configure_wandb() {
 fastwam_prepare_aws_hyperpod() {
   _fastwam_configure_proxy
   _fastwam_configure_hyperpod_topology
+  if [[ -n "${FASTWAM_EXPECTED_WORLD_SIZE:-}" ]]; then
+    _fastwam_require_positive_uint \
+      FASTWAM_EXPECTED_WORLD_SIZE \
+      "${FASTWAM_EXPECTED_WORLD_SIZE}"
+    local actual_world_size=$(( NNODES * NPROC_PER_NODE ))
+    if (( actual_world_size != FASTWAM_EXPECTED_WORLD_SIZE )); then
+      echo "ERROR: expected world_size=${FASTWAM_EXPECTED_WORLD_SIZE}, got ${actual_world_size} (${NNODES} nodes x ${NPROC_PER_NODE} processes)." >&2
+      return 2
+    fi
+  fi
   _fastwam_configure_aws_network
   _fastwam_install_shared_ffmpeg
   _fastwam_configure_wandb
