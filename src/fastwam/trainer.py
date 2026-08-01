@@ -1595,6 +1595,7 @@ class Wan22Trainer:
                 if is_first_step and self.accelerator.is_main_process:
                     logger.info("Finished first backward; waiting for optimizer step.")
 
+                _t_before_clip = _cuda_t()
                 if self.accelerator.sync_gradients:
                     self._sync_fsdp_ignored_grads()
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1610,7 +1611,10 @@ class Wan22Trainer:
                         logger.info(
                             "[profile] micro_step fwd=%.3fs bwd=%.3fs clip=%.3fs opt=%.3fs | "
                             "mem alloc=%.2fG reserved=%.2fG max_alloc=%.2fG alloc_retries=%d",
-                            _t_fwd - _t0, _t_bwd - _t_fwd, _t_clip - _t_bwd, _t_opt - _t_clip,
+                            _t_fwd - _t0,
+                            _t_bwd - _t_fwd,
+                            _t_clip - _t_before_clip,
+                            _t_opt - _t_clip,
                             _alloc_gb, _reserved_gb, _max_alloc_gb, _retries,
                         )
                     if not self.accelerator.optimizer_step_was_skipped:
