@@ -21,6 +21,7 @@ from torch.utils.data._utils.collate import default_collate
 
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
+from .utils.profiler_summary import summarize_nccl_profile
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
@@ -1580,6 +1581,10 @@ class Wan22Trainer:
                     logger.info(
                         "[torch-profile] TOP BY CPU TIME:\n%s",
                         _torch_prof.key_averages().table(sort_by="cpu_time_total", row_limit=20),
+                    )
+                    logger.info(
+                        "[torch-profile] NCCL OVERLAP SUMMARY:\n%s",
+                        summarize_nccl_profile(_torch_prof),
                     )
                     _trace_path = os.environ.get("FASTWAM_TORCH_PROFILE_TRACE", "").strip()
                     if _trace_path:
