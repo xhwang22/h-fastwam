@@ -5,6 +5,7 @@ import functools
 import os
 import re
 import shutil
+from contextlib import nullcontext
 from math import ceil
 from pathlib import Path
 import time
@@ -1527,45 +1528,48 @@ class Wan22Trainer:
                 return time.perf_counter()
 
             # --- deep torch profiler (opt-in via FASTWAM_TORCH_PROFILE=1, first step only) --- #
-            _torch_prof_on = (
+            _torch_prof_step = (
                 os.environ.get("FASTWAM_TORCH_PROFILE", "0") == "1"
                 and self.global_step == self.run_start_step
                 and self.batch_in_epoch <= 1
-                and self.accelerator.is_main_process
             )
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
-                if _torch_prof_on:
+                _torch_prof = None
+                if _torch_prof_step:
+                    self.accelerator.wait_for_everyone()
+                if _torch_prof_step and self.accelerator.is_main_process:
                     from torch.profiler import profile, ProfilerActivity
                     logger.info("[torch-profile] capturing first micro-step fwd+bwd ...")
-                    with profile(
+                    _torch_prof = profile(
                         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                         record_shapes=False,
                         with_stack=False,
-                    ) as _prof:
-                        with self.accelerator.autocast():
-                            _loss, _ld = train_model.training_loss(sample)
-                        self.accelerator.backward(_loss)
+                    )
+                _torch_prof_context = _torch_prof if _torch_prof is not None else nullcontext()
+
+                _t0 = _cuda_t()
+                with _torch_prof_context:
+                    with self.accelerator.autocast():
+                        loss, loss_dict = train_model.training_loss(sample)
+                    _t_fwd = _cuda_t()
+                    if is_first_step and self.accelerator.is_main_process:
+                        logger.info("Finished first training_loss forward; running backward.")
+                    self.accelerator.backward(loss)
+                    _t_bwd = _cuda_t()
+                    if _torch_prof_step:
                         torch.cuda.synchronize()
+                if _torch_prof is not None:
                     logger.info(
                         "[torch-profile] TOP BY CUDA TIME:\n%s",
-                        _prof.key_averages().table(sort_by="cuda_time_total", row_limit=20),
+                        _torch_prof.key_averages().table(sort_by="cuda_time_total", row_limit=20),
                     )
                     logger.info(
                         "[torch-profile] TOP BY CPU TIME:\n%s",
-                        _prof.key_averages().table(sort_by="cpu_time_total", row_limit=20),
+                        _torch_prof.key_averages().table(sort_by="cpu_time_total", row_limit=20),
                     )
-
-                _t0 = _cuda_t()
-                with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
-                _t_fwd = _cuda_t()
-                if is_first_step and self.accelerator.is_main_process:
-                    logger.info("Finished first training_loss forward; running backward.")
-                self.accelerator.backward(loss)
-                _t_bwd = _cuda_t()
                 if is_first_step and self.accelerator.is_main_process:
                     logger.info("Finished first backward; waiting for optimizer step.")
 
