@@ -10,7 +10,6 @@ export GRADIENT_ACCUMULATION_STEPS=1
 export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA=1
-export FASTWAM_TORCH_COMPILE=0
 export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_predictor_causal_tubelet_32gpu_b48_cudnn_overlap_efa}"
 
 exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" "$@"
