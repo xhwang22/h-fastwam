@@ -1541,7 +1541,7 @@ class Wan22Trainer:
                 if _torch_prof_step:
                     self.accelerator.wait_for_everyone()
                 if _torch_prof_step:
-                    from torch.profiler import profile, ProfilerActivity
+                    from torch.profiler import profile, ProfilerActivity, record_function
                     if self.accelerator.is_main_process:
                         logger.info(
                             "[torch-profile] capturing first micro-step fwd+bwd on all ranks ..."
@@ -1555,12 +1555,20 @@ class Wan22Trainer:
 
                 _t0 = _cuda_t()
                 with _torch_prof_context:
-                    with self.accelerator.autocast():
-                        loss, loss_dict = train_model.training_loss(sample)
+                    _forward_context = (
+                        record_function("fastwam_forward") if _torch_prof_step else nullcontext()
+                    )
+                    with _forward_context:
+                        with self.accelerator.autocast():
+                            loss, loss_dict = train_model.training_loss(sample)
                     _t_fwd = _cuda_t()
                     if is_first_step and self.accelerator.is_main_process:
                         logger.info("Finished first training_loss forward; running backward.")
-                    self.accelerator.backward(loss)
+                    _backward_context = (
+                        record_function("fastwam_backward") if _torch_prof_step else nullcontext()
+                    )
+                    with _backward_context:
+                        self.accelerator.backward(loss)
                     _t_bwd = _cuda_t()
                     if _torch_prof_step:
                         torch.cuda.synchronize()
@@ -1573,6 +1581,12 @@ class Wan22Trainer:
                         "[torch-profile] TOP BY CPU TIME:\n%s",
                         _torch_prof.key_averages().table(sort_by="cpu_time_total", row_limit=20),
                     )
+                    _trace_path = os.environ.get("FASTWAM_TORCH_PROFILE_TRACE", "").strip()
+                    if _trace_path:
+                        _trace_file = Path(_trace_path).expanduser()
+                        _trace_file.parent.mkdir(parents=True, exist_ok=True)
+                        _torch_prof.export_chrome_trace(str(_trace_file))
+                        logger.info("[torch-profile] Chrome trace written to %s", _trace_file)
                 if is_first_step and self.accelerator.is_main_process:
                     logger.info("Finished first backward; waiting for optimizer step.")
 
