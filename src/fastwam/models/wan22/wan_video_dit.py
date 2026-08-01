@@ -14,9 +14,17 @@ from fastwam.utils.logging_config import get_logger
 logger = get_logger(__name__)
 
 
-def _sdpa_backend_context():
+def _sdpa_backend_context(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+):
     backend_name = os.environ.get("FASTWAM_SDPA_BACKEND", "auto").strip().lower()
     if backend_name == "auto":
+        return nullcontext()
+    if backend_name == "cudnn" and not (
+        q.shape[-2] == k.shape[-2] == v.shape[-2]
+    ):
         return nullcontext()
     backends = {
         "flash": SDPBackend.FLASH_ATTENTION,
@@ -37,7 +45,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        with _sdpa_backend_context():
+        with _sdpa_backend_context(q=q, k=k, v=v):
             x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
         return x
