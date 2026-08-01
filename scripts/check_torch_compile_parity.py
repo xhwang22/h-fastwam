@@ -6,7 +6,9 @@ from __future__ import annotations
 import copy
 
 import torch
+from torch import nn
 
+from fastwam.models.hfastwam.qwen_language_expert import _QwenBlockForMoT
 from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.wan_video_dit import (
     DiTBlock,
@@ -202,6 +204,81 @@ def check_whole_block_checkpoint_fallback() -> None:
     )
 
 
+def check_qwen_block_eager_fallback() -> None:
+    class DummyAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(16, 16)
+            self.k_proj = nn.Linear(16, 16)
+            self.v_proj = nn.Linear(16, 16)
+            self.o_proj = nn.Linear(16, 16)
+            self.q_norm = None
+            self.k_norm = None
+
+    class DummyLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = DummyAttention()
+            self.input_layernorm = nn.LayerNorm(16)
+            self.post_attention_layernorm = nn.LayerNorm(16)
+            self.mlp = nn.Sequential(
+                nn.Linear(16, 32),
+                nn.GELU(),
+                nn.Linear(32, 16),
+            )
+
+    torch.manual_seed(789)
+    reference_block = _QwenBlockForMoT(
+        qwen_layer=DummyLayer(),
+        num_heads=2,
+        attn_head_dim=8,
+        hidden_dim=16,
+    ).train()
+    actual_block = copy.deepcopy(reference_block).train()
+
+    def run(block, use_fallback):
+        values = [
+            torch.randn(2, 4, 16, requires_grad=True),
+            torch.randn(2, 4, 16, requires_grad=True),
+            torch.randn(2, 1, 16, requires_grad=True),
+            torch.randn(2, 1, 16, requires_grad=True),
+            torch.randn(2, 1, 16, requires_grad=True),
+            torch.randn(2, 1, 16, requires_grad=True),
+        ]
+        if use_fallback:
+            output = MoT._apply_expert_post_block(
+                block=block,
+                residual_x=values[0],
+                mixed_attn_out=values[1],
+                gate_msa=values[2],
+                shift_mlp=values[3],
+                scale_mlp=values[4],
+                gate_mlp=values[5],
+                context_payload=None,
+            )
+        else:
+            x = block.gate(values[0], values[2], block.self_attn.o(values[1]))
+            mlp_input = modulate(block.norm2(x), values[3], values[4])
+            output = block.gate(x, values[5], block.ffn(mlp_input))
+        output.square().mean().backward()
+        return (
+            output.detach(),
+            [value.grad.detach() for value in values],
+            None,
+            {
+                name: parameter.grad.detach().clone()
+                for name, parameter in block.named_parameters()
+                if parameter.grad is not None
+            },
+        )
+
+    rng_state = torch.random.get_rng_state()
+    reference = run(reference_block, use_fallback=False)
+    torch.random.set_rng_state(rng_state)
+    actual = run(actual_block, use_fallback=True)
+    assert_result_close(actual, reference, "Qwen block eager fallback")
+
+
 def main() -> None:
     torch.manual_seed(123)
     reference_block = DiTBlock(
@@ -270,6 +347,7 @@ def main() -> None:
         raise AssertionError("Restoring eager post block changed state_dict keys.")
 
     check_whole_block_checkpoint_fallback()
+    check_qwen_block_eager_fallback()
     print("torch.compile post-block output/gradient/state_dict parity passed.")
 
 

@@ -284,16 +284,25 @@ class MoT(nn.Module):
         if context_payload is not None:
             context = context_payload.get("context")
             context_mask = context_payload.get("mask")
-        return block.forward_post(
-            residual_x=residual_x,
-            mixed_attn_out=mixed_attn_out,
-            gate_msa=gate_msa,
-            shift_mlp=shift_mlp,
-            scale_mlp=scale_mlp,
-            gate_mlp=gate_mlp,
-            context=context,
-            context_mask=context_mask,
-        )
+        if hasattr(block, "forward_post"):
+            return block.forward_post(
+                residual_x=residual_x,
+                mixed_attn_out=mixed_attn_out,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                context=context,
+                context_mask=context_mask,
+            )
+
+        x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed_attn_out))
+        if context is not None:
+            if context_mask is not None and context_mask.dim() == 3:
+                context_mask = context_mask.unsqueeze(1)
+            x = x + block.cross_attn(block.norm3(x), context, ctx_mask=context_mask)
+        mlp_input = modulate(block.norm2(x), shift_mlp, scale_mlp)
+        return block.gate(x, gate_mlp, block.ffn(mlp_input))
 
     def _build_expert_attention_io(
         self,
