@@ -2,21 +2,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
+from contextlib import nullcontext
 from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from .helpers.gradient import gradient_checkpoint_forward
 
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-    
+
+def _sdpa_backend_context():
+    backend_name = os.environ.get("FASTWAM_SDPA_BACKEND", "auto").strip().lower()
+    if backend_name == "auto":
+        return nullcontext()
+    backends = {
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "cudnn": SDPBackend.CUDNN_ATTENTION,
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+        "math": SDPBackend.MATH,
+    }
+    if backend_name not in backends:
+        raise ValueError(
+            "FASTWAM_SDPA_BACKEND must be one of: auto, flash, cudnn, efficient, math; "
+            f"got {backend_name!r}."
+        )
+    return sdpa_kernel(backends[backend_name])
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+        with _sdpa_backend_context():
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
         return x
     else:
