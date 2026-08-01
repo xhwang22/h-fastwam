@@ -108,6 +108,7 @@ _fastwam_configure_hyperpod_topology() {
 
   export NNODES NPROC_PER_NODE NODE_RANK MASTER_ADDR MASTER_PORT
   if [[ "${topology_source}" != "single-node" ]]; then
+    unset NODE_IP_LIST
     export FASTWAM_MANAGED_DISTRIBUTED=1
     export _MULTINODE_LAUNCHED=1
   fi
