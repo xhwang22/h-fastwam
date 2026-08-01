@@ -1540,9 +1540,12 @@ class Wan22Trainer:
                 _torch_prof = None
                 if _torch_prof_step:
                     self.accelerator.wait_for_everyone()
-                if _torch_prof_step and self.accelerator.is_main_process:
+                if _torch_prof_step:
                     from torch.profiler import profile, ProfilerActivity
-                    logger.info("[torch-profile] capturing first micro-step fwd+bwd ...")
+                    if self.accelerator.is_main_process:
+                        logger.info(
+                            "[torch-profile] capturing first micro-step fwd+bwd on all ranks ..."
+                        )
                     _torch_prof = profile(
                         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                         record_shapes=False,
@@ -1561,7 +1564,7 @@ class Wan22Trainer:
                     _t_bwd = _cuda_t()
                     if _torch_prof_step:
                         torch.cuda.synchronize()
-                if _torch_prof is not None:
+                if _torch_prof is not None and self.accelerator.is_main_process:
                     logger.info(
                         "[torch-profile] TOP BY CUDA TIME:\n%s",
                         _torch_prof.key_averages().table(sort_by="cuda_time_total", row_limit=20),
