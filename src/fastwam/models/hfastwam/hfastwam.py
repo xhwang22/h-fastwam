@@ -66,6 +66,7 @@ Training phases::
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any, Optional
 
 import torch
@@ -90,6 +91,15 @@ logger = logging.getLogger(__name__)
 
 class HFastWAM(nn.Module):
     """Hierarchical Fast World-Action Model (3-expert MoT)."""
+
+    _MAX_FULL_ATTENTION_MASK_CACHE_ENTRIES = 32
+
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        cache = getattr(self, "_full_attention_mask_cache", None)
+        if cache is not None:
+            cache.clear()
+        return result
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -216,6 +226,7 @@ class HFastWAM(nn.Module):
 
         self.device_str = device
         self.to(device=device, dtype=torch_dtype)
+        self._full_attention_mask_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 
         logger.info(
             "HFastWAM: phase=%s, KI=%s, action_loss_detach_video_expert=%s, strict=%s, freeze(L/V/A)=(%s/%s/%s), "
@@ -659,9 +670,12 @@ class HFastWAM(nn.Module):
     def _context_payload_from_pre_state(pre_state: dict, enabled: bool) -> Optional[dict]:
         if not enabled:
             return None
+        mask = pre_state["context_mask"]
+        if mask is not None and mask.dim() == 3:
+            mask = mask.unsqueeze(1)
         return {
             "context": pre_state["context"],
-            "mask": pre_state["context_mask"],
+            "mask": mask,
         }
 
     @staticmethod
@@ -699,7 +713,7 @@ class HFastWAM(nn.Module):
             k_end = (segment_idx + 1) * context_len
             mask[:, q_start:q_end, :k_end] = key_valid[:, :segment_idx + 1, :].flatten(1).unsqueeze(1)
 
-        return {"context": context, "mask": mask}
+        return {"context": context, "mask": mask.unsqueeze(1)}
 
     def _tokenize_prompt_batch(
         self,
@@ -852,6 +866,21 @@ class HFastWAM(nn.Module):
 
         See module docstring for the rule set.
         """
+        cache_key = (
+            int(task_len),
+            int(subtask_len),
+            int(video_seq_len),
+            int(action_seq_len),
+            int(video_tokens_per_frame),
+            str(getattr(self.video_expert, "video_attention_mask_mode", "")),
+            device.type,
+            device.index,
+        )
+        cached_mask = self._full_attention_mask_cache.get(cache_key)
+        if cached_mask is not None:
+            self._full_attention_mask_cache.move_to_end(cache_key)
+            return cached_mask
+
         S_lang = task_len + subtask_len
         S_vid = int(video_seq_len)
         S_act = int(action_seq_len)
@@ -896,6 +925,12 @@ class HFastWAM(nn.Module):
         # action → action: bidirectional
         mask[a_s:a_e, a_s:a_e] = True
 
+        self._full_attention_mask_cache[cache_key] = mask
+        while (
+            len(self._full_attention_mask_cache)
+            > self._MAX_FULL_ATTENTION_MASK_CACHE_ENTRIES
+        ):
+            self._full_attention_mask_cache.popitem(last=False)
         return mask
 
     @staticmethod
@@ -1675,24 +1710,15 @@ class HFastWAM(nn.Module):
                 num_segments=N,
                 tokens_per_segment=lang_tokens_per_segment,
             )
-            lang_output = self.language_expert.post_dit(flat_lang_tokens_out, flat_lang_pre)
-            language_losses = []
-            if flat_task_ids.shape[1] > 1:
-                task_logits = self.language_expert.lm_head(
-                    lang_output.hidden_states[:, :task_len, :]
-                )
-                language_losses.append(self._compute_language_token_loss(task_logits, flat_task_ids))
-            if flat_subtask_ids is not None and flat_subtask_ids.shape[1] > 1:
-                language_losses.append(
-                    self.language_expert.language_loss(
-                        logits=lang_output.logits,
-                        subtask_token_ids=flat_subtask_ids,
-                    )
-                )
-            if language_losses:
-                loss_language = torch.stack(language_losses).mean()
-                total_loss = total_loss + self.loss_lambda_language * loss_language
-                loss_dict["loss_language"] = self.loss_lambda_language * float(loss_language.detach().item())
+            total_loss = self._add_language_loss(
+                total_loss=total_loss,
+                loss_dict=loss_dict,
+                tokens_out=flat_lang_tokens_out,
+                pre_state=flat_lang_pre,
+                task_ids=flat_task_ids,
+                subtask_ids=flat_subtask_ids,
+                task_len=task_len,
+            )
 
         if action_pre is not None:
             action_tokens_per_segment = int(target_action.shape[1])
@@ -1916,25 +1942,15 @@ class HFastWAM(nn.Module):
         pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
 
         if modality_mask["language"]:
-            lang_output = self.language_expert.post_dit(tokens_out["language"], lang_pre)
-            language_losses = []
-            task_len = int(lang_segments["task_len"])
-            if task_ids.shape[1] > 1:
-                task_logits = self.language_expert.lm_head(
-                    lang_output.hidden_states[:, :task_len, :]
-                )
-                language_losses.append(self._compute_language_token_loss(task_logits, task_ids))
-            if subtask_ids is not None and subtask_ids.shape[1] > 1:
-                language_losses.append(
-                    self.language_expert.language_loss(
-                        logits=lang_output.logits,
-                        subtask_token_ids=subtask_ids,
-                    )
-                )
-            if language_losses:
-                loss_language = torch.stack(language_losses).mean()
-                total_loss = total_loss + self.loss_lambda_language * loss_language
-                loss_dict["loss_language"] = self.loss_lambda_language * float(loss_language.detach().item())
+            total_loss = self._add_language_loss(
+                total_loss=total_loss,
+                loss_dict=loss_dict,
+                tokens_out=tokens_out["language"],
+                pre_state=lang_pre,
+                task_ids=task_ids,
+                subtask_ids=subtask_ids,
+                task_len=int(lang_segments["task_len"]),
+            )
 
         loss_video = self._compute_video_loss(
             pred_video=pred_video,
@@ -2078,6 +2094,47 @@ class HFastWAM(nn.Module):
     # ------------------------------------------------------------------ #
     # Loss helpers
     # ------------------------------------------------------------------ #
+    def _add_language_loss(
+        self,
+        total_loss: torch.Tensor,
+        loss_dict: dict[str, float],
+        tokens_out: torch.Tensor,
+        pre_state: dict,
+        task_ids: torch.Tensor,
+        subtask_ids: Optional[torch.Tensor],
+        task_len: int,
+    ) -> torch.Tensor:
+        has_task_target = task_ids.shape[1] > 1
+        has_subtask_target = subtask_ids is not None and subtask_ids.shape[1] > 1
+        if not has_task_target and not has_subtask_target:
+            return total_loss
+
+        if self.loss_lambda_language == 0.0:
+            loss_dict["loss_language"] = 0.0
+            return total_loss
+
+        lang_output = self.language_expert.post_dit(tokens_out, pre_state)
+        language_losses = []
+        if has_task_target:
+            task_logits = self.language_expert.lm_head(
+                lang_output.hidden_states[:, :task_len, :]
+            )
+            language_losses.append(self._compute_language_token_loss(task_logits, task_ids))
+        if has_subtask_target:
+            language_losses.append(
+                self.language_expert.language_loss(
+                    logits=lang_output.logits,
+                    subtask_token_ids=subtask_ids,
+                )
+            )
+
+        loss_language = torch.stack(language_losses).mean()
+        total_loss = total_loss + self.loss_lambda_language * loss_language
+        loss_dict["loss_language"] = self.loss_lambda_language * float(
+            loss_language.detach().item()
+        )
+        return total_loss
+
     def _compute_video_loss(
         self,
         pred_video: torch.Tensor,

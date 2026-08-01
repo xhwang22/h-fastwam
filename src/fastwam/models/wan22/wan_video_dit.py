@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
+from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
@@ -338,6 +339,15 @@ class Head(nn.Module):
 
 
 class WanVideoDiT(torch.nn.Module):
+    _MAX_FREQS_DEVICE_CACHE_ENTRIES = 16
+
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        cache = getattr(self, "_freqs_device_cache", None)
+        if cache is not None:
+            cache.clear()
+        return result
+
     def __init__(
         self,
         hidden_dim: int,
@@ -414,6 +424,9 @@ class WanVideoDiT(torch.nn.Module):
         ])
         self.head = Head(hidden_dim, out_dim, patch_size, eps)
         self.freqs = precompute_freqs_cis_3d(attn_head_dim)
+        self._freqs_device_cache: OrderedDict[
+            tuple[int, int, int, str, int | None], torch.Tensor
+        ] = OrderedDict()
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, hidden_dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
@@ -629,11 +642,19 @@ class WanVideoDiT(torch.nn.Module):
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
+        freqs_cache_key = (f, h, w, x_tokens.device.type, x_tokens.device.index)
+        freqs = self._freqs_device_cache.get(freqs_cache_key)
+        if freqs is None:
+            freqs = torch.cat([
+                self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
+            self._freqs_device_cache[freqs_cache_key] = freqs
+            while len(self._freqs_device_cache) > self._MAX_FREQS_DEVICE_CACHE_ENTRIES:
+                self._freqs_device_cache.popitem(last=False)
+        else:
+            self._freqs_device_cache.move_to_end(freqs_cache_key)
 
         return {
             "tokens": x_tokens,
