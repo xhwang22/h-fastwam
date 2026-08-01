@@ -277,6 +277,36 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
         self.gate = GateModule()
 
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        warmed = getattr(
+            self,
+            "_fastwam_compiled_forward_post_warmed_signatures",
+            None,
+        )
+        if warmed is not None:
+            warmed.clear()
+        return result
+
+    def forward_post(
+        self,
+        residual_x: torch.Tensor,
+        mixed_attn_out: torch.Tensor,
+        gate_msa: torch.Tensor,
+        shift_mlp: torch.Tensor,
+        scale_mlp: torch.Tensor,
+        gate_mlp: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = self.gate(residual_x, gate_msa, self.self_attn.o(mixed_attn_out))
+        if context is not None:
+            if context_mask is not None and context_mask.dim() == 3:
+                context_mask = context_mask.unsqueeze(1)
+            x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
+        mlp_input = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        return self.gate(x, gate_mlp, self.ffn(mlp_input))
+
     def forward(self, x, context, t_mod, freqs, context_mask=None, self_attn_mask: Optional[torch.Tensor] = None):
         if context_mask is not None and context_mask.dim() == 3:
             context_mask = context_mask.unsqueeze(1) # (B, 1, seq_len, context_len), 1 for heads
@@ -292,11 +322,26 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, self_attn_mask=self_attn_mask))
-        x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
-        return x
+        mixed_attn_out = self.self_attn(
+            input_x,
+            freqs,
+            self_attn_mask=self_attn_mask,
+        )
+        post_forward = getattr(
+            self,
+            "_fastwam_eager_forward_post",
+            self.forward_post,
+        )
+        return post_forward(
+            residual_x=x,
+            mixed_attn_out=mixed_attn_out,
+            gate_msa=gate_msa,
+            shift_mlp=shift_mlp,
+            scale_mlp=scale_mlp,
+            gate_mlp=gate_mlp,
+            context=context,
+            context_mask=context_mask,
+        )
 
 
 class MLP(torch.nn.Module):

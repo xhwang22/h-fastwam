@@ -24,6 +24,7 @@ from .utils.logging_config import get_logger, setup_logging
 from .utils.profiler_summary import summarize_nccl_profile
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
+from .utils.torch_compile import compile_method_in_place
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -366,6 +367,7 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
+        self._maybe_compile_post_blocks()
 
         # Build parameter groups from the post-freeze trainable set only.
         # This is critical for H-FastWAM: model.dit is the whole MoT
@@ -772,6 +774,61 @@ class Wan22Trainer:
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+
+    def _maybe_compile_post_blocks(self):
+        enabled_value = os.environ.get("FASTWAM_TORCH_COMPILE", "0").strip().lower()
+        if enabled_value in {"0", "false", "no", "off"}:
+            return
+        if enabled_value not in {"1", "true", "yes", "on"}:
+            raise ValueError(
+                "FASTWAM_TORCH_COMPILE must be 0/1, true/false, yes/no, or on/off."
+            )
+
+        dynamic_value = os.environ.get("FASTWAM_TORCH_COMPILE_DYNAMIC", "0").strip().lower()
+        if dynamic_value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError(
+                "FASTWAM_TORCH_COMPILE_DYNAMIC must be 0/1, true/false, yes/no, or on/off."
+            )
+        fullgraph_value = os.environ.get("FASTWAM_TORCH_COMPILE_FULLGRAPH", "0").strip().lower()
+        if fullgraph_value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+            raise ValueError(
+                "FASTWAM_TORCH_COMPILE_FULLGRAPH must be 0/1, true/false, yes/no, or on/off."
+            )
+
+        backend = os.environ.get("FASTWAM_TORCH_COMPILE_BACKEND", "inductor")
+        mode = os.environ.get("FASTWAM_TORCH_COMPILE_MODE", "default")
+        dynamic = dynamic_value in {"1", "true", "yes", "on"}
+        fullgraph = fullgraph_value in {"1", "true", "yes", "on"}
+        compiled_blocks = 0
+        config = None
+        for expert_name in ("video_expert", "action_expert"):
+            expert = getattr(self.model, expert_name, None)
+            blocks = getattr(expert, "blocks", None)
+            if blocks is None:
+                raise RuntimeError(
+                    f"FASTWAM_TORCH_COMPILE=1 requires model.{expert_name}.blocks."
+                )
+            for block in blocks:
+                config = compile_method_in_place(
+                    block,
+                    "forward_post",
+                    backend=backend,
+                    mode=mode,
+                    dynamic=dynamic,
+                    fullgraph=fullgraph,
+                )
+                compiled_blocks += 1
+        if config is None:
+            raise RuntimeError("No video/action post-attention blocks were compiled.")
+        logger.info(
+            "torch.compile enabled for %d video/action post-attention blocks: "
+            "backend=%s mode=%s dynamic=%s fullgraph=%s",
+            compiled_blocks,
+            config["backend"],
+            config["mode"],
+            config["dynamic"],
+            config["fullgraph"],
+        )
 
     def _apply_dit_only_train_mode(self, model):
         """Pre-accelerator freeze: only DiT + optional components stay trainable."""
