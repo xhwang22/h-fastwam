@@ -33,6 +33,10 @@ source "${SCRIPT_DIR}/_multinode_ssh_dispatch.sh"
 source "${SCRIPT_DIR}/_auto_resume.sh"
 # shellcheck source=_video_latent_cache_overrides.sh
 source "${SCRIPT_DIR}/_video_latent_cache_overrides.sh"
+# shellcheck source=_robotwin_data_source.sh
+source "${SCRIPT_DIR}/_robotwin_data_source.sh"
+ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
+fastwam_select_robotwin_data_source
 # Resolve WandB key before dispatch so it gets forwarded to remote nodes
 if [[ -z "${WANDB_API_KEY:-}" && -f "${HOME}/.wandb_key" ]]; then
   export WANDB_API_KEY="$(tr -d '[:space:]' < "${HOME}/.wandb_key")"
@@ -88,7 +92,6 @@ export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
 export FASTWAM_PROFILE_STEPS="${FASTWAM_PROFILE_STEPS:-5}"
 
 export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
-ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
 LAUNCH_LABEL="${LAUNCH_LABEL:-robotwin-small-siglip2}"
 
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
@@ -172,7 +175,7 @@ CMD=(
     --deepspeed_multinode_launcher standard
     scripts/train.py
       task=robotwin_uncond_3cam_384_1e-4
-      data=robotwin_interleaved
+    data="${ROBOTWIN_DATA_CONFIG}"
       model="${MODEL_CONFIG}"
       output_dir="${LOG_DIR}"
       "${WANDB_OVERRIDES[@]}"
@@ -185,10 +188,7 @@ CMD=(
       dataloader_timeout=0
       data.train.num_segments=1
       data.val.num_segments=1
-      "data.train.dataset_dirs=[${ROBOTWIN_DATA_ROOT}/robotwin2.0/robotwin2.0]"
-      "data.train.pretrained_norm_stats=${ROBOTWIN_DATA_ROOT}/robotwin2.0/dataset_stats.json"
-      "data.val.dataset_dirs=[${ROBOTWIN_DATA_ROOT}/robotwin2.0/robotwin2.0]"
-      "data.val.pretrained_norm_stats=${ROBOTWIN_DATA_ROOT}/robotwin2.0/dataset_stats.json"
+      "${ROBOTWIN_DATA_OVERRIDES[@]}"
       num_epochs=5
       max_steps=null
       save_every="${SAVE_EVERY}"

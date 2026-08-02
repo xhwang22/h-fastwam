@@ -67,6 +67,49 @@ def _hash_file(path: Path) -> str:
 
 def _dataset_fingerprint(data_cfg: dict) -> dict:
     fingerprints = {}
+    preprocessed_root = data_cfg.get("preprocessed_root")
+    if preprocessed_root:
+        root = Path(str(preprocessed_root)).expanduser().resolve()
+        record = {"path": str(root), "format": "indexed_webdataset"}
+        metadata = {}
+        for name in ("manifest.json", "dataset_stats.json", "dataset.done"):
+            path = root / name
+            if path.is_file():
+                stat = path.stat()
+                metadata[name] = {
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "sha256": _hash_file(path),
+                }
+        summaries = {}
+        for path in sorted((root / "shards").glob("shard-*.summary.json")):
+            stat = path.stat()
+            summaries[path.name] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": _hash_file(path),
+            }
+        record["metadata"] = metadata
+        record["shard_summaries"] = summaries
+        payloads = {}
+        for pattern in (
+            "shard-*.tar",
+            "shard-*.offsets.npy",
+            "shard-*.sizes.npy",
+            "shard-*.state.npy",
+            "shard-*.action.npy",
+            "shard-*.task_index.npy",
+            "shard-*.episodes.json",
+        ):
+            for path in sorted((root / "shards").glob(pattern)):
+                stat = path.stat()
+                payloads[path.name] = {
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+        record["shard_payloads"] = payloads
+        fingerprints[str(root)] = record
+
     for raw_root in data_cfg.get("dataset_dirs", []) or []:
         root = Path(str(raw_root)).expanduser().resolve()
         record = {"path": str(root)}
@@ -120,6 +163,7 @@ def _implementation_fingerprint() -> dict:
         fastwam_root / "models" / "hfastwam" / "hfastwam.py",
         fastwam_root / "models" / "wan22" / "visual_encoder.py",
         fastwam_root / "datasets" / "lerobot" / "robot_video_dataset.py",
+        fastwam_root / "datasets" / "lerobot" / "webdataset_robot_video_dataset.py",
         fastwam_root / "datasets" / "lerobot" / "processors" / "fastwam_processor.py",
         fastwam_root / "datasets" / "dataset_utils.py",
     ]

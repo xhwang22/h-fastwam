@@ -106,6 +106,8 @@ def _pad_segment_tensor(values: list[torch.Tensor], max_segments: int) -> torch.
     if any(value.shape[1:] != first.shape[1:] for value in values):
         shapes = [tuple(value.shape) for value in values]
         raise ValueError(f"Segment tensor trailing shapes must match within a batch, got {shapes}")
+    if all(tuple(value.shape) == tuple(first.shape) for value in values):
+        return torch.stack(values, dim=0)
     padded_shape = (len(values), max_segments, *first.shape[1:])
     padded = first.new_zeros(padded_shape)
     for batch_idx, value in enumerate(values):
@@ -1243,7 +1245,14 @@ class Wan22Trainer:
                 raise ValueError("Eval sample must contain `proprio` for action denormalization.")
             proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
 
-            processor = self.val_dataset.lerobot_dataset.processor
+            processor = getattr(self.val_dataset, "processor", None)
+            if processor is None:
+                lerobot_dataset = getattr(self.val_dataset, "lerobot_dataset", None)
+                processor = getattr(lerobot_dataset, "processor", None)
+            if processor is None:
+                raise AttributeError(
+                    "Validation dataset must expose a processor for action denormalization."
+                )
 
             denorm_actions = {}
             action_meta = processor.shape_meta["action"]

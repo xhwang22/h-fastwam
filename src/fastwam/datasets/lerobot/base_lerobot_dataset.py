@@ -33,6 +33,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        image_sample_indices: Optional[List[int]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -57,6 +58,30 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         fps = fps_list[0]
         
         self.global_sample_stride = global_sample_stride
+        self.image_sample_indices = (
+            None
+            if image_sample_indices is None
+            else [int(index) for index in image_sample_indices]
+        )
+        if self.image_sample_indices is not None:
+            if not self.image_sample_indices:
+                raise ValueError("`image_sample_indices` must not be empty.")
+            invalid_indices = [
+                index
+                for index in self.image_sample_indices
+                if index < 0 or index >= obs_size
+            ]
+            if invalid_indices:
+                raise ValueError(
+                    f"`image_sample_indices` contains out-of-range values "
+                    f"{invalid_indices}; valid range is [0, {obs_size})."
+                )
+            self._image_sample_indices_tensor = torch.tensor(
+                self.image_sample_indices,
+                dtype=torch.long,
+            )
+        else:
+            self._image_sample_indices_tensor = None
 
         self.val_set_proportion = val_set_proportion
         self.is_training_set = is_training_set
@@ -70,7 +95,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps
+                for t in range(-past_obs_size, -past_obs_size + obs_size)
             ]
         
         for meta in self.state_meta:
@@ -144,7 +170,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
         image: torch.Tensor = lerobot_sample[lerobot_key]
         if image.ndim == 3: # time dim will lost when obs_size is 1
-            image = image.unsqueeze(0)        
+            image = image.unsqueeze(0)
+        if self._image_sample_indices_tensor is not None:
+            image = image.index_select(0, self._image_sample_indices_tensor)
         image = (image * 255).to(torch.uint8) # (1, 3, H, W)
         # For config simplication
         # assert image.shape[1:] == raw_shape, f"Image '{key}' shape {image.shape[1:]} mismatch with {raw_shape}."
@@ -225,12 +253,22 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
         sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
-        if self.return_images:
-            sample["image_is_pad"] = lerobot_sample[
-                f"{self.image_meta[0]['lerobot_key']}_is_pad"
-            ]
+        image_padding_key = f"{self.image_meta[0]['lerobot_key']}_is_pad"
+        image_is_pad = lerobot_sample.get(image_padding_key)
+        if image_is_pad is not None:
+            if self._image_sample_indices_tensor is not None:
+                image_is_pad = image_is_pad.index_select(
+                    0,
+                    self._image_sample_indices_tensor,
+                )
+            sample["image_is_pad"] = image_is_pad
         else:
-            sample["image_is_pad"] = torch.zeros(self.obs_size, dtype=torch.bool)
+            image_count = (
+                len(self.image_sample_indices)
+                if self.image_sample_indices is not None
+                else self.obs_size
+            )
+            sample["image_is_pad"] = torch.zeros(image_count, dtype=torch.bool)
 
         sample = self._get_additional_data(sample, lerobot_sample)
 

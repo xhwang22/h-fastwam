@@ -79,6 +79,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video_latent_cache_dir: Optional[str] = None,
         drop_video_when_cached: bool = False,
     ):
+        self.num_frames = int(num_frames)
+        self.action_video_freq_ratio = int(action_video_freq_ratio)
+        if (self.num_frames - 1) % self.action_video_freq_ratio != 0:
+            raise ValueError(
+                "`num_frames - 1` must be divisible by `action_video_freq_ratio`, "
+                f"got {self.num_frames - 1} and {self.action_video_freq_ratio}"
+            )
+        if ((self.num_frames - 1) // self.action_video_freq_ratio) % 4 != 0:
+            raise ValueError(
+                "Video transitions must be divisible by 4 for tokenization, "
+                f"got {(self.num_frames - 1) // self.action_video_freq_ratio}"
+            )
+        self.video_sample_indices = list(
+            range(0, self.num_frames, self.action_video_freq_ratio)
+        )
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -87,16 +103,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            image_sample_indices=self.video_sample_indices,
         )
-    
-        self.num_frames = num_frames
-        self.action_video_freq_ratio = action_video_freq_ratio
-        
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -125,6 +133,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if processor is not None:
             if isinstance(processor, DictConfig):
                 processor = instantiate(processor)
+            set_num_image_obs_steps = getattr(
+                processor,
+                "set_num_image_obs_steps",
+                None,
+            )
+            if callable(set_num_image_obs_steps):
+                set_num_image_obs_steps(len(self.video_sample_indices))
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -147,6 +162,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
+            self.processor = processor
 
         if video_latent_cache_dir is not None:
             self.set_video_latent_cache(
@@ -157,6 +173,29 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         
     def __len__(self):
         return len(self.lerobot_dataset)
+
+    def _select_video_timeline(
+        self,
+        value: torch.Tensor,
+        *,
+        time_dim: int,
+        name: str,
+    ) -> torch.Tensor:
+        actual_frames = int(value.shape[time_dim])
+        expected_frames = len(self.video_sample_indices)
+        if actual_frames == expected_frames:
+            return value
+        if actual_frames == self.num_frames:
+            indices = torch.as_tensor(
+                self.video_sample_indices,
+                device=value.device,
+                dtype=torch.long,
+            )
+            return value.index_select(time_dim, indices)
+        raise ValueError(
+            f"`{name}` has {actual_frames} frames; expected "
+            f"{expected_frames} pre-sampled frames or {self.num_frames} full frames."
+        )
 
     def set_video_latent_cache(
         self,
@@ -208,7 +247,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             sample_idx = np.random.randint(len(self.lerobot_dataset))
 
         sample_idx = int(sample.get("idx", sample_idx))
+        return self._format_processed_sample(sample, sample_idx)
 
+    def _format_processed_sample(self, sample: dict, sample_idx: int) -> dict:
         if self.video_latent_cache_dir is not None and self.drop_video_when_cached:
             task = sample["instruction"]
             if self.override_instruction is not None:
@@ -220,7 +261,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "proprio": sample["proprio"][:-1, :],
                 "prompt": instruction,
                 "sample_idx": torch.tensor(sample_idx, dtype=torch.long),
-                "image_is_pad": sample["image_is_pad"][self.video_sample_indices],
+                "image_is_pad": self._select_video_timeline(
+                    sample["image_is_pad"],
+                    time_dim=0,
+                    name="image_is_pad",
+                ),
                 "action_is_pad": sample["action_is_pad"],
                 "proprio_is_pad": sample["proprio_is_pad"],
             }
@@ -237,13 +282,25 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
         if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+            video = self._select_video_timeline(
+                video,
+                time_dim=1,
+                name="pixel_values",
+            )
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+            video = self._select_video_timeline(
+                video,
+                time_dim=0,
+                name="pixel_values",
+            )
             T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
+        image_is_pad = self._select_video_timeline(
+            image_is_pad,
+            time_dim=0,
+            name="image_is_pad",
+        )
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":

@@ -43,6 +43,7 @@ class FastWAMProcessor(BaseProcessor):
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
+        self.num_image_obs_steps = num_obs_steps
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -87,6 +88,14 @@ class FastWAMProcessor(BaseProcessor):
                         f"`delta_action_dim_mask[{key}]` length must be {expected_dim}, got {len(mask)}."
                     )
                 self.delta_action_dim_mask[key] = torch.as_tensor(mask, dtype=torch.bool)
+
+    def set_num_image_obs_steps(self, num_image_obs_steps: int) -> None:
+        num_image_obs_steps = int(num_image_obs_steps)
+        if num_image_obs_steps <= 0:
+            raise ValueError(
+                f"`num_image_obs_steps` must be positive, got {num_image_obs_steps}"
+            )
+        self.num_image_obs_steps = num_image_obs_steps
 
     @property
     def is_train(self):
@@ -225,7 +234,7 @@ class FastWAMProcessor(BaseProcessor):
                 for trans in current_transforms:
                     image = trans(image)
 
-                meta_shape = [self.num_obs_steps] + shape
+                meta_shape = [self.num_image_obs_steps] + shape
                 assert image.shape == meta_shape, \
                     f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
