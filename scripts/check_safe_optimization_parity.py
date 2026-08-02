@@ -19,7 +19,11 @@ from fastwam.models.wan22.wan_video_dit import (
     RMSNorm,
     WanVideoDiT,
     flash_attention,
+    precompute_freqs_cis,
+    rope_apply_fp32,
+    rope_apply_legacy,
 )
+from fastwam.trainer import _pack_training_metrics
 
 
 def assert_tensor_equal(actual: torch.Tensor, expected: torch.Tensor, name: str) -> None:
@@ -68,6 +72,71 @@ def check_fused_rms_norm() -> None:
             atol=0,
             msg=lambda message: f"RMSNorm weight gradient ({dtype}): {message}",
         )
+
+
+def check_fp32_real_rope() -> None:
+    for dtype in (torch.float32, torch.bfloat16):
+        torch.manual_seed(13)
+        expected_input = torch.randn(
+            4,
+            37,
+            128,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        actual_input = expected_input.detach().clone().requires_grad_(True)
+        freqs = precompute_freqs_cis(32, end=37).view(37, 1, -1)
+
+        expected = rope_apply_legacy(
+            expected_input,
+            freqs,
+            num_heads=4,
+        )
+        actual = rope_apply_fp32(
+            actual_input,
+            freqs,
+            num_heads=4,
+        )
+
+        if dtype == torch.float32:
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=5e-7)
+        else:
+            exact_fraction = float((actual == expected).float().mean().item())
+            if exact_fraction < 0.999:
+                raise AssertionError(
+                    f"BF16 FP32-RoPE exact fraction too low: {exact_fraction:.6f}"
+                )
+            torch.testing.assert_close(actual, expected, rtol=2e-3, atol=7.8125e-3)
+
+        expected.float().square().mean().backward()
+        actual.float().square().mean().backward()
+        torch.testing.assert_close(
+            actual_input.grad,
+            expected_input.grad,
+            rtol=1e-3,
+            atol=1e-7,
+            msg=lambda message: f"RoPE input gradient ({dtype}): {message}",
+        )
+
+
+def check_packed_training_metrics() -> None:
+    loss = torch.tensor(3.0, requires_grad=True)
+    loss_dict = {
+        "loss_video": torch.tensor(1.25),
+        "loss_action": torch.tensor(1.75),
+        "loss_language": torch.tensor(0.0),
+    }
+    keys, packed = _pack_training_metrics(
+        loss=loss,
+        loss_dict=loss_dict,
+        grad_norm=torch.tensor(2.5),
+    )
+    if keys != ["loss_action", "loss_language", "loss_video"]:
+        raise AssertionError(f"Unexpected packed metric order: {keys}")
+    expected = torch.tensor([[3.0, 2.5, 1.75, 0.0, 1.25]])
+    assert_tensor_equal(packed, expected, "packed training metrics")
+    if packed.requires_grad:
+        raise AssertionError("Packed logging metrics must be detached.")
 
 
 def check_identity_projection_bypass() -> None:
@@ -374,7 +443,7 @@ def check_zero_language_loss_skip() -> None:
         language_expert=FailingLanguageExpert(),
     )
     total_loss = torch.tensor(2.0, requires_grad=True)
-    loss_dict: dict[str, float] = {}
+    loss_dict: dict[str, torch.Tensor] = {}
     result = HFastWAM._add_language_loss(
         dummy,
         total_loss=total_loss,
@@ -387,8 +456,13 @@ def check_zero_language_loss_skip() -> None:
     )
     if result is not total_loss:
         raise AssertionError("Zero-weight language loss must preserve the total-loss tensor.")
-    if loss_dict != {"loss_language": 0.0}:
+    if set(loss_dict) != {"loss_language"}:
         raise AssertionError(f"Unexpected zero language loss log: {loss_dict}")
+    assert_tensor_equal(
+        loss_dict["loss_language"],
+        torch.zeros_like(total_loss),
+        "zero language loss metric",
+    )
     result.backward()
     assert_tensor_equal(total_loss.grad, torch.ones_like(total_loss), "total loss gradient")
 
@@ -421,6 +495,8 @@ def check_cache_clear_on_module_apply(
 
 def main() -> None:
     check_fused_rms_norm()
+    check_fp32_real_rope()
+    check_packed_training_metrics()
     check_identity_projection_bypass()
     action_model = check_action_rope_cache()
     video_expert = check_jepa_rope_cache()

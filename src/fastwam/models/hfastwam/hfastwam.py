@@ -1687,7 +1687,7 @@ class HFastWAM(nn.Module):
         )
 
         total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
-        loss_dict: dict[str, float] = {}
+        loss_dict: dict[str, torch.Tensor] = {}
 
         flat_video_tokens_out = self._unmerge_segment_tokens(
             tokens_out["video"], batch_size=B, num_segments=N, tokens_per_segment=video_tokens_per_segment,
@@ -1699,8 +1699,9 @@ class HFastWAM(nn.Module):
             fuse_flag=fuse_flag,
             timestep_video=timestep_video,
         )
-        total_loss = total_loss + self.loss_lambda_video * loss_video
-        loss_dict["loss_video"] = self.loss_lambda_video * float(loss_video.detach().item())
+        weighted_video_loss = self.loss_lambda_video * loss_video
+        total_loss = total_loss + weighted_video_loss
+        loss_dict["loss_video"] = weighted_video_loss.detach()
 
         if lang_pre is not None:
             lang_tokens_per_segment = task_len + subtask_len
@@ -1732,8 +1733,9 @@ class HFastWAM(nn.Module):
                 timestep_action=timestep_action,
                 action_is_pad=flat_action_is_pad,
             )
-            total_loss = total_loss + self.loss_lambda_action * loss_action
-            loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action.detach().item())
+            weighted_action_loss = self.loss_lambda_action * loss_action
+            total_loss = total_loss + weighted_action_loss
+            loss_dict["loss_action"] = weighted_action_loss.detach()
 
         return total_loss, loss_dict
 
@@ -1759,7 +1761,7 @@ class HFastWAM(nn.Module):
 
         sample = self._ensure_language_tokens_from_prompt(sample)
         route, modality_mask = self._validate_sample(sample)
-        loss_dict: dict[str, float] = {}
+        loss_dict: dict[str, torch.Tensor] = {}
         total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
 
         # ---------- Optional language pre_dit ---------- #
@@ -1958,8 +1960,9 @@ class HFastWAM(nn.Module):
             fuse_flag=fuse_flag,
             timestep_video=timestep_video,
         )
-        total_loss = total_loss + self.loss_lambda_video * loss_video
-        loss_dict["loss_video"] = self.loss_lambda_video * float(loss_video.detach().item())
+        weighted_video_loss = self.loss_lambda_video * loss_video
+        total_loss = total_loss + weighted_video_loss
+        loss_dict["loss_video"] = weighted_video_loss.detach()
 
         if modality_mask["action"]:
             pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
@@ -1970,8 +1973,9 @@ class HFastWAM(nn.Module):
                 timestep_action=timestep_action,
                 action_is_pad=action_is_pad,
             )
-            total_loss = total_loss + self.loss_lambda_action * loss_action
-            loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action.detach().item())
+            weighted_action_loss = self.loss_lambda_action * loss_action
+            total_loss = total_loss + weighted_action_loss
+            loss_dict["loss_action"] = weighted_action_loss.detach()
 
         return total_loss, loss_dict
 
@@ -2097,7 +2101,7 @@ class HFastWAM(nn.Module):
     def _add_language_loss(
         self,
         total_loss: torch.Tensor,
-        loss_dict: dict[str, float],
+        loss_dict: dict[str, torch.Tensor],
         tokens_out: torch.Tensor,
         pre_state: dict,
         task_ids: torch.Tensor,
@@ -2110,7 +2114,7 @@ class HFastWAM(nn.Module):
             return total_loss
 
         if self.loss_lambda_language == 0.0:
-            loss_dict["loss_language"] = 0.0
+            loss_dict["loss_language"] = total_loss.detach().new_zeros(())
             return total_loss
 
         lang_output = self.language_expert.post_dit(tokens_out, pre_state)
@@ -2129,10 +2133,9 @@ class HFastWAM(nn.Module):
             )
 
         loss_language = torch.stack(language_losses).mean()
-        total_loss = total_loss + self.loss_lambda_language * loss_language
-        loss_dict["loss_language"] = self.loss_lambda_language * float(
-            loss_language.detach().item()
-        )
+        weighted_language_loss = self.loss_lambda_language * loss_language
+        total_loss = total_loss + weighted_language_loss
+        loss_dict["loss_language"] = weighted_language_loss.detach()
         return total_loss
 
     def _compute_video_loss(

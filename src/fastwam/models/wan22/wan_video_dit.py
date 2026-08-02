@@ -14,6 +14,13 @@ from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+_ROPE_IMPL = os.environ.get("FASTWAM_ROPE_IMPL", "fp32").strip().lower()
+if _ROPE_IMPL not in {"fp32", "legacy"}:
+    raise ValueError(
+        "FASTWAM_ROPE_IMPL must be one of: fp32, legacy; "
+        f"got {_ROPE_IMPL!r}."
+    )
+
 
 def _sdpa_backend_context(
     q: torch.Tensor,
@@ -76,20 +83,55 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     # 1d rope precompute
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-                   [: (dim // 2)].double() / dim))
+    freqs = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, dim, 2)[: (dim // 2)].double()
+            / dim
+        )
+    )
     freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 
-def rope_apply(x, freqs, num_heads):
+def rope_apply_legacy(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
+    if freqs.device.type == "npu":
+        freqs = freqs.to(torch.complex64)
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
     return x_out.to(x.dtype)
+
+
+def rope_apply_fp32(x, freqs, num_heads):
+    shaped = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
+    pairs = shaped.float().reshape(
+        shaped.shape[0],
+        shaped.shape[1],
+        shaped.shape[2],
+        -1,
+        2,
+    )
+    real, imag = pairs.unbind(dim=-1)
+    freqs = freqs.to(torch.complex64)
+    cos = freqs.real
+    sin = freqs.imag
+    rotated = torch.stack(
+        (
+            real * cos - imag * sin,
+            real * sin + imag * cos,
+        ),
+        dim=-1,
+    ).flatten(2)
+    return rotated.to(x.dtype)
+
+
+def rope_apply(x, freqs, num_heads):
+    if _ROPE_IMPL == "legacy":
+        return rope_apply_legacy(x, freqs, num_heads)
+    return rope_apply_fp32(x, freqs, num_heads)
 
 
 def create_group_causal_attn_mask(

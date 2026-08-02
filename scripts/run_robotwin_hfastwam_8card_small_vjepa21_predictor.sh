@@ -191,7 +191,7 @@ CMD=(
       "${WANDB_OVERRIDES[@]}"
       batch_size="${BATCH_SIZE}"
       gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}"
-      log_every=1
+      log_every="${LOG_EVERY:-1}"
       num_workers="${NUM_WORKERS:-8}"
       dataloader_prefetch_factor="${DATALOADER_PREFETCH_FACTOR:-4}"
       dataloader_persistent_workers="${DATALOADER_PERSISTENT_WORKERS:-true}"
