@@ -206,8 +206,11 @@ class MoT(nn.Module):
         key = self._proj_key(name, layer_idx)
         if key not in self.q_proj_to_shared:
             return q, k, v
+        q_proj = self.q_proj_to_shared[key]
+        if isinstance(q_proj, nn.Identity):
+            return q, k, v
         return (
-            self.q_proj_to_shared[key](q),
+            q_proj(q),
             self.k_proj_to_shared[key](k),
             self.v_proj_to_shared[key](v),
         )
@@ -223,7 +226,10 @@ class MoT(nn.Module):
         key = self._proj_key(name, layer_idx)
         if key not in self.o_proj_from_shared:
             return mixed
-        return self.o_proj_from_shared[key](mixed)
+        output_proj = self.o_proj_from_shared[key]
+        if isinstance(output_proj, nn.Identity):
+            return mixed
+        return output_proj(mixed)
 
     def _expert_layer_idx(self, name: str, overlap_idx: int) -> int:
         return int(self.layer_start_indices[name]) + int(overlap_idx)

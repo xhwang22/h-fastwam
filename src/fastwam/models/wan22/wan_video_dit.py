@@ -181,12 +181,15 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
     def forward(self, x):
         dtype = x.dtype
-        return self.norm(x.float()).to(dtype) * self.weight
+        normalized = F.rms_norm(
+            x.float(),
+            normalized_shape=(x.shape[-1],),
+            weight=None,
+            eps=self.eps,
+        )
+        return normalized.to(dtype) * self.weight
 
 
 class AttentionModule(nn.Module):

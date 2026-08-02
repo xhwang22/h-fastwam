@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import copy
+import io
 from collections import OrderedDict
 from types import SimpleNamespace
 
@@ -12,13 +14,133 @@ from fastwam.models.hfastwam.hfastwam import HFastWAM
 from fastwam.models.wan22.action_dit import ActionDiT
 from fastwam.models.wan22.jepa_predictor import JEPAPredictor
 from fastwam.models.wan22.mot import MoT
-from fastwam.models.wan22.wan_video_dit import DiTBlock, WanVideoDiT, flash_attention
+from fastwam.models.wan22.wan_video_dit import (
+    DiTBlock,
+    RMSNorm,
+    WanVideoDiT,
+    flash_attention,
+)
 
 
 def assert_tensor_equal(actual: torch.Tensor, expected: torch.Tensor, name: str) -> None:
     if not torch.equal(actual, expected):
         max_error = float((actual - expected).abs().max().item())
         raise AssertionError(f"{name} differs; max_abs_error={max_error}")
+
+
+def check_fused_rms_norm() -> None:
+    for dtype in (torch.float32, torch.bfloat16):
+        torch.manual_seed(11)
+        expected_norm = RMSNorm(64, eps=1e-6).to(dtype=dtype)
+        actual_norm = copy.deepcopy(expected_norm)
+        expected_input = torch.randn(4, 17, 64, dtype=dtype, requires_grad=True)
+        actual_input = expected_input.detach().clone().requires_grad_(True)
+
+        expected_output = (
+            expected_input.float()
+            * torch.rsqrt(
+                expected_input.float().pow(2).mean(dim=-1, keepdim=True) + 1e-6
+            )
+        ).to(dtype) * expected_norm.weight
+        actual_output = actual_norm(actual_input)
+
+        torch.testing.assert_close(
+            actual_output,
+            expected_output,
+            rtol=0,
+            atol=0,
+            msg=lambda message: f"RMSNorm output ({dtype}): {message}",
+        )
+
+        expected_output.float().square().mean().backward()
+        actual_output.float().square().mean().backward()
+        torch.testing.assert_close(
+            actual_input.grad,
+            expected_input.grad,
+            rtol=1e-3,
+            atol=1e-4,
+            msg=lambda message: f"RMSNorm input gradient ({dtype}): {message}",
+        )
+        torch.testing.assert_close(
+            actual_norm.weight.grad,
+            expected_norm.weight.grad,
+            rtol=0,
+            atol=0,
+            msg=lambda message: f"RMSNorm weight gradient ({dtype}): {message}",
+        )
+
+
+def check_identity_projection_bypass() -> None:
+    torch.manual_seed(12)
+
+    def make_expert():
+        return JEPAPredictor(
+            hidden_dim=16,
+            in_dim=8,
+            out_dim=8,
+            ffn_dim=32,
+            text_dim=16,
+            patch_size=(1, 2, 2),
+            num_heads=2,
+            attn_head_dim=8,
+            num_layers=1,
+            use_text_context=False,
+        )
+
+    mot = MoT(
+        mixtures={"video": make_expert(), "action": make_expert()},
+        mot_checkpoint_mixed_attn=False,
+        strict_expert_compat=False,
+        layer_alignment_mode="tail_overlap",
+        shared_attention_expert="video",
+    )
+    key = "video__0"
+    if not isinstance(mot.q_proj_to_shared[key], torch.nn.Identity):
+        raise AssertionError("Expected an identity projection key for matching experts.")
+
+    q = torch.randn(2, 4, 16, requires_grad=True)
+    k = torch.randn(2, 4, 16, requires_grad=True)
+    v = torch.randn(2, 4, 16, requires_grad=True)
+    q_out, k_out, v_out = mot._project_qkv_to_shared(
+        name="video",
+        layer_idx=0,
+        q=q,
+        k=k,
+        v=v,
+    )
+    if q_out is not q or k_out is not k or v_out is not v:
+        raise AssertionError("Identity QKV projections should return original tensors.")
+
+    mixed = torch.randn(2, 4, 16, requires_grad=True)
+    mixed_out = mot._project_mixed_from_shared(
+        name="video",
+        layer_idx=0,
+        mixed=mixed,
+    )
+    if mixed_out is not mixed:
+        raise AssertionError("Identity output projection should return the original tensor.")
+
+    (q_out.sum() + k_out.sum() + v_out.sum() + mixed_out.sum()).backward()
+    for name, tensor in (("q", q), ("k", k), ("v", v), ("mixed", mixed)):
+        assert_tensor_equal(tensor.grad, torch.ones_like(tensor), f"identity {name} grad")
+
+    payload = io.BytesIO()
+    torch.save(mot, payload)
+    payload.seek(0)
+    restored = torch.load(payload, weights_only=False)
+    restored_q, restored_k, restored_v = restored._project_qkv_to_shared(
+        name="video",
+        layer_idx=0,
+        q=q.detach(),
+        k=k.detach(),
+        v=v.detach(),
+    )
+    if (
+        restored_q.data_ptr() != q.detach().data_ptr()
+        or restored_k.data_ptr() != k.detach().data_ptr()
+        or restored_v.data_ptr() != v.detach().data_ptr()
+    ):
+        raise AssertionError("Serialized identity projections should remain bypassed.")
 
 
 def check_action_rope_cache() -> ActionDiT:
@@ -298,6 +420,8 @@ def check_cache_clear_on_module_apply(
 
 
 def main() -> None:
+    check_fused_rms_norm()
+    check_identity_projection_bypass()
     action_model = check_action_rope_cache()
     video_expert = check_jepa_rope_cache()
     wan_model = check_wan_video_rope_cache()
