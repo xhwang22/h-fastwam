@@ -16,6 +16,9 @@ fi
 
 "${PYTHON_BIN}" -m pip install -e "${REPO_ROOT}"
 
+"${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade --no-deps \
+  "deepspeed==0.19.3"
+
 "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
   "transformers==5.12.1" \
   "safetensors>=0.5.3" \
@@ -34,6 +37,11 @@ import timm
 import accelerate
 import deepspeed
 import fastwam
+
+if deepspeed.__version__ != "0.19.3":
+    raise RuntimeError(
+        f"Expected deepspeed==0.19.3, found {deepspeed.__version__} at {deepspeed.__file__}"
+    )
 
 print(f"torch={torch.__version__}")
 print(f"torchvision={torchvision.__version__}")
