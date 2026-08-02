@@ -515,11 +515,21 @@ def build_datasets(data_cfg: DictConfig):
         train_stats_path = data_cfg.train.get("pretrained_norm_stats")
         default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
-        pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
         # Check if the val dataset class accepts `pretrained_norm_stats`
         val_target = data_cfg.val.get("_target_", "")
         _needs_norm_stats = "lerobot" in val_target.lower() or "robot" in val_target.lower()
-        if _needs_norm_stats:
+        _uses_preprocessed_stats = (
+            "webdataset_robot_video_dataset" in val_target.lower()
+            and not val_stats_path
+            and not train_stats_path
+        )
+        if _uses_preprocessed_stats:
+            logger.info(
+                "Building WebDataset val split with normalization stats from preprocessed_root."
+            )
+            val_ds = instantiate(data_cfg.val)
+        elif _needs_norm_stats:
+            pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
             logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
             val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
         else:
