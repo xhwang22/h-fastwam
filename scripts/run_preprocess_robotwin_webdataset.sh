@@ -15,8 +15,20 @@ WDS_EPISODES_PER_SHARD="${WDS_EPISODES_PER_SHARD:-32}"
 WDS_PNG_COMPRESS_LEVEL="${WDS_PNG_COMPRESS_LEVEL:-1}"
 WDS_DECODE_CHUNK_FRAMES="${WDS_DECODE_CHUNK_FRAMES:-64}"
 
+# TorchCodec needs shared FFmpeg libraries. Reuse the same installation used
+# by the AWS training launchers before starting worker processes.
+# shellcheck source=_aws_hyperpod_setup.sh
+source "${SCRIPT_DIR}/_aws_hyperpod_setup.sh"
+_fastwam_install_shared_ffmpeg
+
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "ERROR: Python executable not found: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+if ! "${PYTHON_BIN}" -c "from torchcodec.decoders import VideoDecoder" >/dev/null 2>&1; then
+  echo "ERROR: TorchCodec still cannot load after FFmpeg setup." >&2
+  echo "FFMPEG_PREFIX=${FFMPEG_PREFIX}" >&2
+  echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}" >&2
   exit 1
 fi
 if [[ ! -f "${SOURCE_ROOT}/meta/info.json" ]]; then
