@@ -38,7 +38,6 @@ The public contract mirrors ``WanVideoDiT`` (``pre_dit`` / ``post_dit`` /
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
-from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -104,15 +103,6 @@ class JEPAHead(nn.Module):
 
 class JEPAPredictor(nn.Module):
     """Deterministic next-frame latent predictor (MoT-compatible video expert)."""
-
-    _MAX_FREQS_DEVICE_CACHE_ENTRIES = 16
-
-    def _apply(self, fn):
-        result = super()._apply(fn)
-        cache = getattr(self, "_freqs_device_cache", None)
-        if cache is not None:
-            cache.clear()
-        return result
 
     def __init__(
         self,
@@ -207,9 +197,6 @@ class JEPAPredictor(nn.Module):
         # variant so non-multiple-of-6 head dims (e.g. native JEPA's 64) yield
         # exactly attn_head_dim/2 complex pairs.
         self.freqs = precompute_freqs_cis_3d_even(self.attn_head_dim)
-        self._freqs_device_cache: OrderedDict[
-            tuple[int, int, int, str, int | None], torch.Tensor
-        ] = OrderedDict()
 
         logger.info(
             "JEPAPredictor: hidden=%d in=%d out=%d heads=%d×%d=%d layers=%d patch=%s "
@@ -361,22 +348,14 @@ class JEPAPredictor(nn.Module):
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
-        freqs_cache_key = (f, h, w, x_tokens.device.type, x_tokens.device.index)
-        freqs = self._freqs_device_cache.get(freqs_cache_key)
-        if freqs is None:
-            freqs = torch.cat(
-                [
-                    self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                    self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                    self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-                ],
-                dim=-1,
-            ).reshape(f * h * w, 1, -1).to(x_tokens.device)
-            self._freqs_device_cache[freqs_cache_key] = freqs
-            while len(self._freqs_device_cache) > self._MAX_FREQS_DEVICE_CACHE_ENTRIES:
-                self._freqs_device_cache.popitem(last=False)
-        else:
-            self._freqs_device_cache.move_to_end(freqs_cache_key)
+        freqs = torch.cat(
+            [
+                self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ],
+            dim=-1,
+        ).reshape(f * h * w, 1, -1).to(x_tokens.device)
 
         # Plain-transformer modulation: t_mod = 0 with gate-initialised blocks.
         t_mod = torch.zeros((1, 6, self.hidden_dim), dtype=x_tokens.dtype, device=x_tokens.device)

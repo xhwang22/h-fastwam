@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import os
-from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any, Dict, Tuple, Optional
 from einops import rearrange
@@ -13,13 +12,6 @@ from .helpers.gradient import gradient_checkpoint_forward
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-_ROPE_IMPL = os.environ.get("FASTWAM_ROPE_IMPL", "fp32").strip().lower()
-if _ROPE_IMPL not in {"fp32", "legacy"}:
-    raise ValueError(
-        "FASTWAM_ROPE_IMPL must be one of: fp32, legacy; "
-        f"got {_ROPE_IMPL!r}."
-    )
 
 
 def _sdpa_backend_context(
@@ -83,55 +75,20 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     # 1d rope precompute
-    freqs = 1.0 / (
-        theta
-        ** (
-            torch.arange(0, dim, 2)[: (dim // 2)].double()
-            / dim
-        )
-    )
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
+                   [: (dim // 2)].double() / dim))
     freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
 
-def rope_apply_legacy(x, freqs, num_heads):
+def rope_apply(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    if freqs.device.type == "npu":
-        freqs = freqs.to(torch.complex64)
+    freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
     x_out = torch.view_as_real(x_out * freqs).flatten(2)
     return x_out.to(x.dtype)
-
-
-def rope_apply_fp32(x, freqs, num_heads):
-    shaped = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    pairs = shaped.float().reshape(
-        shaped.shape[0],
-        shaped.shape[1],
-        shaped.shape[2],
-        -1,
-        2,
-    )
-    real, imag = pairs.unbind(dim=-1)
-    freqs = freqs.to(torch.complex64)
-    cos = freqs.real
-    sin = freqs.imag
-    rotated = torch.stack(
-        (
-            real * cos - imag * sin,
-            real * sin + imag * cos,
-        ),
-        dim=-1,
-    ).flatten(2)
-    return rotated.to(x.dtype)
-
-
-def rope_apply(x, freqs, num_heads):
-    if _ROPE_IMPL == "legacy":
-        return rope_apply_legacy(x, freqs, num_heads)
-    return rope_apply_fp32(x, freqs, num_heads)
 
 
 def create_group_causal_attn_mask(
@@ -223,15 +180,12 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    def norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
     def forward(self, x):
         dtype = x.dtype
-        normalized = F.rms_norm(
-            x.float(),
-            normalized_shape=(x.shape[-1],),
-            weight=None,
-            eps=self.eps,
-        )
-        return normalized.to(dtype) * self.weight
+        return self.norm(x.float()).to(dtype) * self.weight
 
 
 class AttentionModule(nn.Module):
@@ -384,15 +338,6 @@ class Head(nn.Module):
 
 
 class WanVideoDiT(torch.nn.Module):
-    _MAX_FREQS_DEVICE_CACHE_ENTRIES = 16
-
-    def _apply(self, fn):
-        result = super()._apply(fn)
-        cache = getattr(self, "_freqs_device_cache", None)
-        if cache is not None:
-            cache.clear()
-        return result
-
     def __init__(
         self,
         hidden_dim: int,
@@ -469,9 +414,6 @@ class WanVideoDiT(torch.nn.Module):
         ])
         self.head = Head(hidden_dim, out_dim, patch_size, eps)
         self.freqs = precompute_freqs_cis_3d(attn_head_dim)
-        self._freqs_device_cache: OrderedDict[
-            tuple[int, int, int, str, int | None], torch.Tensor
-        ] = OrderedDict()
         if has_ref_conv:
             self.ref_conv = nn.Conv2d(16, hidden_dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
@@ -687,19 +629,11 @@ class WanVideoDiT(torch.nn.Module):
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
-        freqs_cache_key = (f, h, w, x_tokens.device.type, x_tokens.device.index)
-        freqs = self._freqs_device_cache.get(freqs_cache_key)
-        if freqs is None:
-            freqs = torch.cat([
-                self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-            ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
-            self._freqs_device_cache[freqs_cache_key] = freqs
-            while len(self._freqs_device_cache) > self._MAX_FREQS_DEVICE_CACHE_ENTRIES:
-                self._freqs_device_cache.popitem(last=False)
-        else:
-            self._freqs_device_cache.move_to_end(freqs_cache_key)
+        freqs = torch.cat([
+            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
 
         return {
             "tokens": x_tokens,

@@ -163,9 +163,7 @@ class MoT(nn.Module):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
 
-        base_mod = block.modulation
-        if base_mod.dtype != t_mod.dtype or base_mod.device != t_mod.device:
-            base_mod = base_mod.to(dtype=t_mod.dtype, device=t_mod.device)
+        base_mod = block.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (base_mod + t_mod).chunk(6, dim=chunk_dim)
         if has_seq:
             # means t_mod has separate modulation for each token, otherwise same modulation for all tokens in the block
@@ -206,11 +204,8 @@ class MoT(nn.Module):
         key = self._proj_key(name, layer_idx)
         if key not in self.q_proj_to_shared:
             return q, k, v
-        q_proj = self.q_proj_to_shared[key]
-        if isinstance(q_proj, nn.Identity):
-            return q, k, v
         return (
-            q_proj(q),
+            self.q_proj_to_shared[key](q),
             self.k_proj_to_shared[key](k),
             self.v_proj_to_shared[key](v),
         )
@@ -226,10 +221,7 @@ class MoT(nn.Module):
         key = self._proj_key(name, layer_idx)
         if key not in self.o_proj_from_shared:
             return mixed
-        output_proj = self.o_proj_from_shared[key]
-        if isinstance(output_proj, nn.Identity):
-            return mixed
-        return output_proj(mixed)
+        return self.o_proj_from_shared[key](mixed)
 
     def _expert_layer_idx(self, name: str, overlap_idx: int) -> int:
         return int(self.layer_start_indices[name]) + int(overlap_idx)
@@ -257,9 +249,7 @@ class MoT(nn.Module):
         attention_mask: torch.Tensor,
         num_heads: int,
     ) -> torch.Tensor:
-        attn_mask = attention_mask
-        if attn_mask.device != q_cat.device:
-            attn_mask = attn_mask.to(device=q_cat.device)
+        attn_mask = attention_mask.to(device=q_cat.device)
 
         def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
             return flash_attention(q=q, k=k, v=v, num_heads=int(num_heads), ctx_mask=attn_mask)

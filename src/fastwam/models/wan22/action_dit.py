@@ -1,5 +1,4 @@
 import os
-from collections import OrderedDict
 import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional
@@ -31,15 +30,6 @@ class ActionHead(nn.Module):
 
 
 class ActionDiT(nn.Module):
-    _MAX_FREQS_DEVICE_CACHE_ENTRIES = 16
-
-    def _apply(self, fn):
-        result = super()._apply(fn)
-        cache = getattr(self, "_freqs_device_cache", None)
-        if cache is not None:
-            cache.clear()
-        return result
-
     ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
@@ -107,9 +97,6 @@ class ActionDiT(nn.Module):
         )
         self.head = nn.Linear(hidden_dim, action_dim)
         self.freqs = precompute_freqs_cis(attn_head_dim, end=1024)
-        self._freqs_device_cache: OrderedDict[
-            tuple[int, str, int | None], torch.Tensor
-        ] = OrderedDict()
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
@@ -296,15 +283,7 @@ class ActionDiT(nn.Module):
         tokens = self.action_encoder(action_tokens)
         context_emb = self.text_embedding(context)
         context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
-        freqs_cache_key = (seq_len, tokens.device.type, tokens.device.index)
-        freqs = self._freqs_device_cache.get(freqs_cache_key)
-        if freqs is None:
-            freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
-            self._freqs_device_cache[freqs_cache_key] = freqs
-            while len(self._freqs_device_cache) > self._MAX_FREQS_DEVICE_CACHE_ENTRIES:
-                self._freqs_device_cache.popitem(last=False)
-        else:
-            self._freqs_device_cache.move_to_end(freqs_cache_key)
+        freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
 
         return {
             "tokens": tokens,
