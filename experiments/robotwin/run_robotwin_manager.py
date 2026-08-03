@@ -17,7 +17,6 @@ from omegaconf import DictConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SINGLE_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "eval_robotwin_single.py"
-EVAL_STEP_LIMIT_FILE = PROJECT_ROOT / "third_party" / "RoboTwin" / "task_config" / "_eval_step_limit.yml"
 TERMINATE_TIMEOUT_SEC = 10
 POLL_INTERVAL_SEC = 2
 
@@ -64,13 +63,14 @@ def _collect_worker_overrides() -> list[str]:
     return [ov for ov in HydraConfig.get().overrides.task if not _is_blocked_override(ov)]
 
 
-def _load_all_tasks() -> list[str]:
-    if not EVAL_STEP_LIMIT_FILE.exists():
-        raise FileNotFoundError(f"Task list file not found: {EVAL_STEP_LIMIT_FILE}")
-    with EVAL_STEP_LIMIT_FILE.open("r", encoding="utf-8") as f:
+def _load_all_tasks(robotwin_root: Path) -> list[str]:
+    task_file = robotwin_root / "task_config" / "_eval_step_limit.yml"
+    if not task_file.exists():
+        raise FileNotFoundError(f"Task list file not found: {task_file}")
+    with task_file.open("r", encoding="utf-8") as f:
         task_map = yaml.safe_load(f)
     if not isinstance(task_map, dict) or len(task_map) == 0:
-        raise ValueError(f"Invalid task map in: {EVAL_STEP_LIMIT_FILE}")
+        raise ValueError(f"Invalid task map in: {task_file}")
     tasks = list(task_map.keys())
     # Keep original order and remove duplicates.
     seen = set()
@@ -187,7 +187,7 @@ def main(cfg: DictConfig):
 
     task_name_cfg = cfg.EVALUATION.task_name
     if task_name_cfg is None or str(task_name_cfg).strip() == "":
-        tasks = _load_all_tasks()
+        tasks = _load_all_tasks(robotwin_root)
     else:
         tasks = [str(task_name_cfg)]
 
