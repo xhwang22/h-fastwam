@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -122,6 +123,25 @@ def _to_jsonable(value: float | None) -> float | None:
     return float(value)
 
 
+def _atomic_replace_text(path: Path, text: str) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "unknown"
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 @dataclass
 class RunningState:
     task_name: str
@@ -129,6 +149,7 @@ class RunningState:
     phase: str  # "clean" | "random"
     attempt: int
     process: subprocess.Popen[str]
+    log_path: Path
 
 
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
@@ -164,6 +185,8 @@ def main(cfg: DictConfig):
         raise ValueError(f"Invalid EVALUATION.output_dir (missing run_ts): {output_dir}")
     run_output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
     run_output_dir.mkdir(parents=True, exist_ok=True)
+    worker_logs_dir = run_output_dir / "worker_logs"
+    worker_logs_dir.mkdir(parents=True, exist_ok=True)
 
     task_shard_count = int(cfg.MULTIRUN.get("task_shard_count", 1))
     task_shard_index = int(cfg.MULTIRUN.get("task_shard_index", 0))
@@ -213,9 +236,10 @@ def main(cfg: DictConfig):
         "random": "demo_randomized",
     }
 
-    def log(msg: str) -> None:
+    def log(msg: str, *, console: bool = True) -> None:
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-        print(line, flush=True)
+        if console:
+            print(line, flush=True)
         with manager_log.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
             f.flush()
@@ -252,21 +276,33 @@ def main(cfg: DictConfig):
         attempt = attempt_counts.get(phase_key, 0) + 1
         attempt_counts[phase_key] = attempt
         cmd = build_cmd(task_name=task_name, gpu_id=gpu_id, phase=phase)
+        worker_log = worker_logs_dir / (
+            f"{task_name}.{phase}.gpu{gpu_id}.attempt{attempt}.log"
+        )
         log(
             f"launch task={task_name} phase={phase} gpu={gpu_id} attempt={attempt} "
-            f"cmd={' '.join(cmd)}"
+            f"worker_log={worker_log}",
         )
-        process = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            text=True,
+        log(
+            f"worker command task={task_name} phase={phase}: "
+            f"{shlex.join(cmd)}",
+            console=False,
         )
+        with worker_log.open("a", encoding="utf-8") as worker_log_file:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                stdout=worker_log_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
         return RunningState(
             task_name=task_name,
             gpu_id=gpu_id,
             phase=phase,
             attempt=attempt,
             process=process,
+            log_path=worker_log,
         )
 
     def terminate_all_running() -> None:
@@ -305,7 +341,10 @@ def main(cfg: DictConfig):
         clean_mean = _mean_or_none([task_rates[t]["clean"] for t in tasks])
         random_mean = _mean_or_none([task_rates[t]["random"] for t in tasks])
 
-        with summary_csv.open("w", encoding="utf-8", newline="") as f:
+        summary_csv_tmp = summary_csv.with_name(
+            f".{summary_csv.name}.tmp.{os.getpid()}"
+        )
+        with summary_csv_tmp.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["task_name", "clean_success_rate", "random_success_rate"])
             for task in tasks:
@@ -317,6 +356,7 @@ def main(cfg: DictConfig):
                     ]
                 )
             writer.writerow(["__overall__", clean_mean, random_mean])
+        os.replace(summary_csv_tmp, summary_csv)
 
         payload = {
             "per_task": [
@@ -332,17 +372,84 @@ def main(cfg: DictConfig):
                 "random_mean_success_rate": _to_jsonable(random_mean),
             },
         }
-        summary_json.write_text(
+        _atomic_replace_text(
+            summary_json,
             json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
 
-        with failed_tasks_file.open("w", encoding="utf-8") as f:
-            for rec in failed_records:
-                f.write(
-                    f"{rec['task_name']},{rec['phase']},gpu={rec['gpu_id']},"
-                    f"return_code={rec['return_code']},reason={rec['reason']}\n"
-                )
+        failed_lines = []
+        for rec in failed_records:
+            failed_lines.append(
+                f"{rec['task_name']},{rec['phase']},gpu={rec['gpu_id']},"
+                f"return_code={rec['return_code']},reason={rec['reason']}\n"
+            )
+        _atomic_replace_text(
+            failed_tasks_file,
+            "".join(failed_lines),
+        )
+
+    initial_accounted_phases = sum(
+        rate is not None
+        for task in tasks
+        for rate in task_rates[task].values()
+    )
+    manager_start_time = time.time()
+    last_progress_log_time = 0.0
+
+    def log_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_log_time
+        now = time.time()
+        if not force and now - last_progress_log_time < 60.0:
+            return
+        last_progress_log_time = now
+
+        clean_values = [
+            task_rates[task]["clean"]
+            for task in tasks
+            if task_rates[task]["clean"] is not None
+        ]
+        random_values = [
+            task_rates[task]["random"]
+            for task in tasks
+            if task_rates[task]["random"] is not None
+        ]
+        completed_phases = len(clean_values) + len(random_values)
+        failed_phases = len(failed_records)
+        accounted_phases = completed_phases + failed_phases
+        total_phases = 2 * len(tasks)
+        complete_tasks = sum(
+            task_rates[task]["clean"] is not None
+            and task_rates[task]["random"] is not None
+            for task in tasks
+        )
+
+        elapsed = max(now - manager_start_time, 0.0)
+        newly_accounted = max(accounted_phases - initial_accounted_phases, 0)
+        remaining = max(total_phases - accounted_phases, 0)
+        eta_seconds = (
+            elapsed * remaining / newly_accounted
+            if newly_accounted > 0
+            else None
+        )
+        clean_mean = _mean_or_none(clean_values)
+        random_mean = _mean_or_none(random_values)
+        clean_text = (
+            f"{clean_mean * 100:.2f}%({len(clean_values)})"
+            if clean_mean is not None
+            else "n/a(0)"
+        )
+        random_text = (
+            f"{random_mean * 100:.2f}%({len(random_values)})"
+            if random_mean is not None
+            else "n/a(0)"
+        )
+        log(
+            f"progress phases={accounted_phases}/{total_phases} "
+            f"tasks_complete={complete_tasks}/{len(tasks)} "
+            f"running={len(running_states)} pending={len(pending_phases)} "
+            f"failed={failed_phases} clean={clean_text} random={random_text} "
+            f"elapsed={_format_duration(elapsed)} eta={_format_duration(eta_seconds)}"
+        )
 
     log(
         f"manager start tasks={len(tasks)} gpu_ids={gpu_ids} "
@@ -350,6 +457,8 @@ def main(cfg: DictConfig):
         f"task_shard={task_shard_index}/{task_shard_count} "
         f"pending_phases={len(pending_phases)} output_dir={run_output_dir}"
     )
+    write_outputs()
+    log_progress(force=True)
 
     # Launch initial tasks for each GPU up to capacity.
     for gpu_id in gpu_ids:
@@ -389,6 +498,18 @@ def main(cfg: DictConfig):
                             "reason": "process_failed",
                         }
                     )
+                    if state.phase == "clean":
+                        failed_records.append(
+                            {
+                                "task_name": state.task_name,
+                                "phase": "random",
+                                "gpu_id": gpu_id,
+                                "return_code": return_code,
+                                "reason": "skipped_after_clean_failure",
+                            }
+                        )
+                    write_outputs()
+                    log_progress(force=True)
                     try_launch_pending(gpu_id)
                 continue
 
@@ -419,14 +540,28 @@ def main(cfg: DictConfig):
                             "reason": "result_parse_failed",
                         }
                     )
+                    if state.phase == "clean":
+                        failed_records.append(
+                            {
+                                "task_name": state.task_name,
+                                "phase": "random",
+                                "gpu_id": gpu_id,
+                                "return_code": return_code,
+                                "reason": "skipped_after_clean_failure",
+                            }
+                        )
+                    write_outputs()
+                    log_progress(force=True)
                     try_launch_pending(gpu_id)
                 continue
 
             task_rates[state.task_name][state.phase] = success_rate
+            write_outputs()
             log(
                 f"done task={state.task_name} phase={state.phase} gpu={gpu_id} "
                 f"success_rate={success_rate:.4f}"
             )
+            log_progress(force=True)
 
             if state.phase == "clean":
                 running_states.append(launch_phase(
@@ -439,6 +574,7 @@ def main(cfg: DictConfig):
             try_launch_pending(gpu_id)
 
         if not progressed:
+            log_progress()
             time.sleep(POLL_INTERVAL_SEC)
 
     write_outputs()
