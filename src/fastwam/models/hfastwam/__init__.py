@@ -27,7 +27,8 @@ Training phases::
 """
 
 from .hfastwam import HFastWAM
+from .hfastwam_idm import HFastWAMIDM
 from .language_expert import LanguageExpert
 from .qwen_language_expert import QwenLanguageExpert
 
-__all__ = ["HFastWAM", "LanguageExpert", "QwenLanguageExpert"]
+__all__ = ["HFastWAM", "HFastWAMIDM", "LanguageExpert", "QwenLanguageExpert"]

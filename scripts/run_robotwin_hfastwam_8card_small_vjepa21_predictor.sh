@@ -108,6 +108,8 @@ export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
 
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+TASK_CONFIG="${TASK_CONFIG:-robotwin_uncond_3cam_384_1e-4}"
+MODEL_CONFIG="${MODEL_CONFIG:-hfastwam_small_vjepa21_predictor}"
 WORLD_SIZE=$(( NPROC_PER_NODE * NNODES ))
 _BATCH_DENOM=$(( WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS ))
 if (( GLOBAL_BATCH_SIZE % _BATCH_DENOM != 0 )); then
@@ -187,9 +189,9 @@ CMD=(
     --num_processes "$(( NPROC_PER_NODE * NNODES ))"
     --deepspeed_multinode_launcher standard
     scripts/train.py
-      task=robotwin_uncond_3cam_384_1e-4
+      task="${TASK_CONFIG}"
     data="${ROBOTWIN_DATA_CONFIG}"
-      model=hfastwam_small_vjepa21_predictor
+      model="${MODEL_CONFIG}"
       output_dir="${LOG_DIR}"
       "${WANDB_OVERRIDES[@]}"
       batch_size="${BATCH_SIZE}"
@@ -221,7 +223,7 @@ CMD=(
       "${RESUME_OVERRIDES[@]}"
 )
 
-echo "[robotwin-small-vjepa21-predictor] model=hfastwam_small_vjepa21_predictor (V-JEPA 2.1 ViT-G/16 2B + random-init JEPA predictor, 1664-d L1 target)"
+echo "[robotwin-small-vjepa21-predictor] task=${TASK_CONFIG} model=${MODEL_CONFIG}"
 echo "[robotwin-small-vjepa21-predictor] global_batch=${GLOBAL_BATCH_SIZE} world_size=${WORLD_SIZE} batch_size=${BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
 echo "[robotwin-small-vjepa21-predictor] checkpoint=${VJEPA21_CHECKPOINT}"
 echo "[robotwin-small-vjepa21-predictor] master=${MASTER_ADDR}:${MASTER_PORT} log=${LOG_FILE}"

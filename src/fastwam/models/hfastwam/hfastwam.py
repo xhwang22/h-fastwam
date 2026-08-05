@@ -957,6 +957,23 @@ class HFastWAM(nn.Module):
         )
         return merged
 
+    def _prepare_jepa_training_video_pre(
+        self,
+        context_latents: torch.Tensor,
+        target_latents: torch.Tensor,
+        context: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor],
+    ) -> tuple[dict, dict, int]:
+        """Prepare JEPA tokens for MoT and retain the prediction branch metadata."""
+        del target_latents
+        prediction_pre = self.video_expert.pre_dit(
+            x=context_latents,
+            context=context if self.video_expert.use_text_context else None,
+            context_mask=context_mask if self.video_expert.use_text_context else None,
+        )
+        prediction_tokens = int(prediction_pre["tokens"].shape[1])
+        return prediction_pre, prediction_pre, prediction_tokens
+
     @staticmethod
     def _unmerge_segment_tokens(
         tokens: torch.Tensor,
@@ -1566,10 +1583,13 @@ class HFastWAM(nn.Module):
             action_context, action_context_mask = video_context, video_context_mask
 
         if self.is_jepa_predictor:
-            flat_video_pre = self.video_expert.pre_dit(
-                x=context_latents,
-                context=video_context if self.video_expert.use_text_context else None,
-                context_mask=video_context_mask if self.video_expert.use_text_context else None,
+            flat_video_pre, flat_video_prediction_pre, prediction_video_tokens_per_segment = (
+                self._prepare_jepa_training_video_pre(
+                    context_latents=context_latents,
+                    target_latents=target_video,
+                    context=video_context,
+                    context_mask=video_context_mask,
+                )
             )
         else:
             flat_video_pre = self.video_expert.pre_dit(
@@ -1580,6 +1600,8 @@ class HFastWAM(nn.Module):
                 action=None,
                 fuse_vae_embedding_in_latents=fuse_flag,
             )
+            flat_video_prediction_pre = flat_video_pre
+            prediction_video_tokens_per_segment = int(flat_video_pre["tokens"].shape[1])
         video_tokens_per_frame = int(flat_video_pre["meta"]["tokens_per_frame"])
         video_tokens_per_segment = int(flat_video_pre["tokens"].shape[1])
         video_context_payload = self._merge_segment_context_payload(
@@ -1657,7 +1679,11 @@ class HFastWAM(nn.Module):
         flat_video_tokens_out = self._unmerge_segment_tokens(
             tokens_out["video"], batch_size=B, num_segments=N, tokens_per_segment=video_tokens_per_segment,
         )
-        pred_video = self.video_expert.post_dit(flat_video_tokens_out, flat_video_pre)
+        flat_prediction_tokens_out = flat_video_tokens_out[:, :prediction_video_tokens_per_segment]
+        pred_video = self.video_expert.post_dit(
+            flat_prediction_tokens_out,
+            flat_video_prediction_pre,
+        )
         loss_video = self._compute_video_loss(
             pred_video=pred_video,
             target_video=target_video,
@@ -2016,6 +2042,51 @@ class HFastWAM(nn.Module):
             detach_kv_experts=detach_set,
         )
 
+    def _prepare_inference_action_video_pre(
+        self,
+        lang_pre: dict,
+        video_pre: dict,
+        task_len: int,
+        subtask_len: int,
+        video_tokens_per_frame: int,
+        video_context_payload: Optional[dict],
+        video_context: torch.Tensor,
+        video_context_mask: torch.Tensor,
+    ) -> dict:
+        """Prepare the video branch used by action denoising."""
+        del (
+            lang_pre,
+            task_len,
+            subtask_len,
+            video_tokens_per_frame,
+            video_context_payload,
+            video_context,
+            video_context_mask,
+        )
+        return video_pre
+
+    def _run_mot_action_inference(
+        self,
+        lang_pre: dict,
+        video_pre: dict,
+        action_pre: dict,
+        task_len: int,
+        subtask_len: int,
+        video_tokens_per_frame: int,
+        video_context_payload: Optional[dict] = None,
+        action_context_payload: Optional[dict] = None,
+    ) -> dict:
+        return self._run_mot_three_experts(
+            lang_pre=lang_pre,
+            video_pre=video_pre,
+            action_pre=action_pre,
+            task_len=task_len,
+            subtask_len=subtask_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            video_context_payload=video_context_payload,
+            action_context_payload=action_context_payload,
+        )
+
     def _run_mot_two_experts_lv(
         self,
         lang_pre: dict,
@@ -2320,6 +2391,23 @@ class HFastWAM(nn.Module):
             subtask_token_ids=subtask_ids_used,
         )
         seg = lang_pre["segments"]
+        action_video_pre = self._prepare_inference_action_video_pre(
+            lang_pre=lang_pre,
+            video_pre=video_pre_ff,
+            task_len=seg["task_len"],
+            subtask_len=seg["subtask_len"],
+            video_tokens_per_frame=video_tokens_per_frame,
+            video_context_payload=video_context_payload,
+            video_context=video_context,
+            video_context_mask=video_context_mask,
+        )
+        action_video_tokens_per_frame = int(
+            action_video_pre["meta"]["tokens_per_frame"]
+        )
+        action_video_context_payload = self._context_payload_from_pre_state(
+            action_video_pre,
+            has_proprio_context,
+        )
 
         # Noisy action init
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
@@ -2346,14 +2434,14 @@ class HFastWAM(nn.Module):
             )
             action_context_payload = self._context_payload_from_pre_state(action_pre, has_proprio_context)
 
-            tokens_out = self._run_mot_three_experts(
+            tokens_out = self._run_mot_action_inference(
                 lang_pre=lang_pre,
-                video_pre=video_pre_ff,
+                video_pre=action_video_pre,
                 action_pre=action_pre,
                 task_len=seg["task_len"],
                 subtask_len=seg["subtask_len"],
-                video_tokens_per_frame=video_tokens_per_frame,
-                video_context_payload=video_context_payload,
+                video_tokens_per_frame=action_video_tokens_per_frame,
+                video_context_payload=action_video_context_payload,
                 action_context_payload=action_context_payload,
             )
             pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
