@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -218,6 +219,28 @@ class QwenLanguageExpert(LanguageExpert):
 
     @staticmethod
     def _download_qwen3_vl_weight_files(model_id: str, local_files_only: bool) -> list[str]:
+        local_path = Path(model_id)
+        if local_path.is_dir():
+            index_path = local_path / "model.safetensors.index.json"
+            if index_path.is_file():
+                with index_path.open("r", encoding="utf-8") as f:
+                    weight_map = json.load(f).get("weight_map", {})
+                filenames = {
+                    filename
+                    for key, filename in weight_map.items()
+                    if key.startswith("model.language_model.") or key == "lm_head.weight"
+                }
+                if not filenames:
+                    raise ValueError(f"No Qwen3-VL language weights found in {index_path}.")
+                return [str(local_path / filename) for filename in sorted(filenames)]
+
+            weights_path = local_path / "model.safetensors"
+            if not weights_path.is_file():
+                raise FileNotFoundError(
+                    f"Qwen3-VL checkpoint directory has no safetensors weights: {local_path}"
+                )
+            return [str(weights_path)]
+
         try:
             from huggingface_hub import hf_hub_download
             from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
