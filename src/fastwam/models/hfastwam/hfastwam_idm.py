@@ -18,6 +18,22 @@ class HFastWAMIDM(HFastWAM):
     teacher-forcing future branch used only as the action condition.
     """
 
+    def _build_training_condition_latents(
+        self,
+        context_latents: torch.Tensor,
+        target_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        del context_latents
+        return target_latents
+
+    def _build_inference_condition_latents(
+        self,
+        first_frame_latents: torch.Tensor,
+        predicted_future_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        del first_frame_latents
+        return predicted_future_latents
+
     @staticmethod
     def _combine_idm_video_pre(
         prediction_pre: dict,
@@ -60,8 +76,12 @@ class HFastWAMIDM(HFastWAM):
             context=context,
             context_mask=context_mask,
         )
+        condition_latents = self._build_training_condition_latents(
+            context_latents=context_latents,
+            target_latents=target_latents,
+        )
         condition_pre = self.video_expert.pre_dit(
-            x=target_latents,
+            x=condition_latents,
             context=context if self.video_expert.use_text_context else None,
             context_mask=context_mask if self.video_expert.use_text_context else None,
         )
@@ -341,8 +361,12 @@ class HFastWAMIDM(HFastWAM):
             rollout_context = torch.cat([rollout_context, next_latent], dim=2)
 
         predicted_future = torch.cat(predicted_future_latents, dim=2)
+        condition_latents = self._build_inference_condition_latents(
+            first_frame_latents=first_frame_latents,
+            predicted_future_latents=predicted_future,
+        )
         condition_pre = self.video_expert.pre_dit(
-            x=predicted_future,
+            x=condition_latents,
             context=video_context if self.video_expert.use_text_context else None,
             context_mask=video_context_mask if self.video_expert.use_text_context else None,
         )
@@ -391,3 +415,21 @@ class HFastWAMIDM(HFastWAM):
                 "data=robotwin_interleaved_webdataset."
             )
         return super().training_loss(sample, tiled=tiled)
+
+
+class HFastWAMFullConditionIDM(HFastWAMIDM):
+    """FastWAM-style IDM whose action condition is ``[z0, z1, ..., zT]``."""
+
+    def _build_training_condition_latents(
+            self,
+            context_latents: torch.Tensor,
+            target_latents: torch.Tensor,
+    ) -> torch.Tensor:
+            return torch.cat([context_latents[:, :, :1], target_latents], dim=2)
+
+    def _build_inference_condition_latents(
+            self,
+            first_frame_latents: torch.Tensor,
+            predicted_future_latents: torch.Tensor,
+    ) -> torch.Tensor:
+            return torch.cat([first_frame_latents, predicted_future_latents], dim=2)
