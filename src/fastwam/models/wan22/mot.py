@@ -635,6 +635,314 @@ class MoT(nn.Module):
             )
         return x
 
+    def prefill_fixed_expert_cache(
+        self,
+        embeds_all: Dict[str, torch.Tensor],
+        attention_mask: torch.Tensor,
+        freqs_all: Dict[str, torch.Tensor],
+        context_all: Dict[str, Optional[dict]],
+        t_mod_all: Dict[str, torch.Tensor],
+        fixed_expert_order: tuple[str, ...],
+    ) -> dict:
+        """Run fixed prefix experts once and cache their overlap-layer K/V."""
+        fixed_order = list(fixed_expert_order)
+        if not fixed_order:
+            raise ValueError("`fixed_expert_order` cannot be empty.")
+        if self.expert_order[:len(fixed_order)] != fixed_order:
+            raise ValueError(
+                "`fixed_expert_order` must be a prefix of the registered expert order: "
+                f"got {fixed_order}, registered={self.expert_order}."
+            )
+
+        missing = [
+            name
+            for name in fixed_order
+            if name not in embeds_all or name not in freqs_all or name not in t_mod_all
+        ]
+        if missing:
+            raise ValueError(f"Missing fixed-expert inputs for: {missing}")
+
+        tokens_all = {name: embeds_all[name] for name in fixed_order}
+        seq_lens = [int(tokens_all[name].shape[1]) for name in fixed_order]
+        fixed_seq_len = int(sum(seq_lens))
+        if attention_mask.shape != (fixed_seq_len, fixed_seq_len):
+            raise ValueError(
+                "Fixed-expert attention mask shape mismatch: "
+                f"got {tuple(attention_mask.shape)}, expected {(fixed_seq_len, fixed_seq_len)}."
+            )
+
+        seq_offsets = {}
+        start = 0
+        for name, seq_len in zip(fixed_order, seq_lens):
+            seq_offsets[name] = (start, start + seq_len)
+            start += seq_len
+
+        if not self.strict_expert_compat and self.layer_alignment_mode == "tail_overlap":
+            for name in fixed_order:
+                prefix_layers = int(self.layer_start_indices[name])
+                if prefix_layers <= 0:
+                    continue
+                expert = self.mixtures[name]
+                x = tokens_all[name]
+                row_start, row_end = seq_offsets[name]
+                self_mask = attention_mask[row_start:row_end, row_start:row_end]
+                for layer_idx in range(prefix_layers):
+                    block = expert.blocks[layer_idx]
+                    (
+                        q,
+                        k,
+                        v,
+                        residual_x,
+                        gate_msa,
+                        shift_mlp,
+                        scale_mlp,
+                        gate_mlp,
+                        use_gradient_checkpointing,
+                    ) = self._build_expert_attention_io(
+                        name=name,
+                        layer_idx=layer_idx,
+                        expert=expert,
+                        block=block,
+                        x=x,
+                        freqs=freqs_all[name],
+                        t_mod=t_mod_all[name],
+                    )
+                    mixed = self._attention_with_num_heads(
+                        q_cat=q,
+                        k_cat=k,
+                        v_cat=v,
+                        attention_mask=self_mask,
+                        num_heads=block.num_heads,
+                    )
+                    x = self._apply_post_with_optional_checkpoint(
+                        block=block,
+                        residual_x=residual_x,
+                        gate_msa=gate_msa,
+                        shift_mlp=shift_mlp,
+                        scale_mlp=scale_mlp,
+                        gate_mlp=gate_mlp,
+                        use_gradient_checkpointing=use_gradient_checkpointing,
+                        mixed_slice=mixed,
+                        context_payload=context_all.get(name),
+                    )
+                tokens_all[name] = x
+
+        layer_cache = []
+        for overlap_idx in range(self.overlap_num_layers):
+            q_chunks = []
+            k_chunks = []
+            v_chunks = []
+            post_states = {}
+            current_seq_lens = []
+
+            for name in fixed_order:
+                expert = self.mixtures[name]
+                layer_idx = self._expert_layer_idx(name, overlap_idx)
+                block = expert.blocks[layer_idx]
+                (
+                    q,
+                    k,
+                    v,
+                    residual_x,
+                    gate_msa,
+                    shift_mlp,
+                    scale_mlp,
+                    gate_mlp,
+                    use_gradient_checkpointing,
+                ) = self._build_expert_attention_io(
+                    name=name,
+                    layer_idx=layer_idx,
+                    expert=expert,
+                    block=block,
+                    x=tokens_all[name],
+                    freqs=freqs_all[name],
+                    t_mod=t_mod_all[name],
+                )
+                q_chunks.append(q)
+                k_chunks.append(k)
+                v_chunks.append(v)
+                current_seq_lens.append(int(tokens_all[name].shape[1]))
+                post_states[name] = {
+                    "block": block,
+                    "layer_idx": layer_idx,
+                    "residual_x": residual_x,
+                    "gate_msa": gate_msa,
+                    "shift_mlp": shift_mlp,
+                    "scale_mlp": scale_mlp,
+                    "gate_mlp": gate_mlp,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
+                }
+
+            q_cat = torch.cat(q_chunks, dim=1)
+            k_cat = torch.cat(k_chunks, dim=1)
+            v_cat = torch.cat(v_chunks, dim=1)
+            mixed = self._mixed_attention(
+                q_cat=q_cat,
+                k_cat=k_cat,
+                v_cat=v_cat,
+                attention_mask=attention_mask,
+            )
+            layer_cache.append({"k": k_cat, "v": v_cat})
+
+            start = 0
+            for name, seq_len in zip(fixed_order, current_seq_lens):
+                end = start + seq_len
+                state = post_states[name]
+                mixed_slice = self._project_mixed_from_shared(
+                    name=name,
+                    layer_idx=state["layer_idx"],
+                    mixed=mixed[:, start:end],
+                )
+                tokens_all[name] = self._apply_post_with_optional_checkpoint(
+                    block=state["block"],
+                    residual_x=state["residual_x"],
+                    gate_msa=state["gate_msa"],
+                    shift_mlp=state["shift_mlp"],
+                    scale_mlp=state["scale_mlp"],
+                    gate_mlp=state["gate_mlp"],
+                    use_gradient_checkpointing=state["use_gradient_checkpointing"],
+                    mixed_slice=mixed_slice,
+                    context_payload=context_all.get(name),
+                )
+                start = end
+
+        return {
+            "layers": layer_cache,
+            "fixed_expert_order": tuple(fixed_order),
+            "fixed_seq_len": fixed_seq_len,
+        }
+
+    def forward_target_with_fixed_cache(
+        self,
+        target_name: str,
+        target_tokens: torch.Tensor,
+        target_freqs: torch.Tensor,
+        target_t_mod: torch.Tensor,
+        target_context_payload: Optional[dict],
+        fixed_cache: dict,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one target expert while reusing fixed-expert K/V."""
+        fixed_order = list(fixed_cache.get("fixed_expert_order", ()))
+        if self.expert_order != fixed_order + [target_name]:
+            raise ValueError(
+                "Cached target inference requires registered order "
+                f"{fixed_order + [target_name]}, got {self.expert_order}."
+            )
+        layers = fixed_cache.get("layers")
+        if not isinstance(layers, list) or len(layers) != self.overlap_num_layers:
+            raise ValueError(
+                "Fixed cache layer count mismatch: "
+                f"got {0 if not isinstance(layers, list) else len(layers)}, "
+                f"expected {self.overlap_num_layers}."
+            )
+
+        fixed_seq_len = int(fixed_cache.get("fixed_seq_len", 0))
+        target_seq_len = int(target_tokens.shape[1])
+        total_seq_len = fixed_seq_len + target_seq_len
+        if attention_mask.shape != (total_seq_len, total_seq_len):
+            raise ValueError(
+                "Cached target attention mask shape mismatch: "
+                f"got {tuple(attention_mask.shape)}, expected {(total_seq_len, total_seq_len)}."
+            )
+
+        expert = self.mixtures[target_name]
+        x = target_tokens
+        target_self_mask = attention_mask[fixed_seq_len:, fixed_seq_len:]
+        if not self.strict_expert_compat and self.layer_alignment_mode == "tail_overlap":
+            for layer_idx in range(int(self.layer_start_indices[target_name])):
+                block = expert.blocks[layer_idx]
+                (
+                    q,
+                    k,
+                    v,
+                    residual_x,
+                    gate_msa,
+                    shift_mlp,
+                    scale_mlp,
+                    gate_mlp,
+                    use_gradient_checkpointing,
+                ) = self._build_expert_attention_io(
+                    name=target_name,
+                    layer_idx=layer_idx,
+                    expert=expert,
+                    block=block,
+                    x=x,
+                    freqs=target_freqs,
+                    t_mod=target_t_mod,
+                )
+                mixed = self._attention_with_num_heads(
+                    q_cat=q,
+                    k_cat=k,
+                    v_cat=v,
+                    attention_mask=target_self_mask,
+                    num_heads=block.num_heads,
+                )
+                x = self._apply_post_with_optional_checkpoint(
+                    block=block,
+                    residual_x=residual_x,
+                    gate_msa=gate_msa,
+                    shift_mlp=shift_mlp,
+                    scale_mlp=scale_mlp,
+                    gate_mlp=gate_mlp,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    mixed_slice=mixed,
+                    context_payload=target_context_payload,
+                )
+
+        target_attention_mask = attention_mask[fixed_seq_len:, :]
+        for overlap_idx, layer_fixed_cache in enumerate(layers):
+            layer_idx = self._expert_layer_idx(target_name, overlap_idx)
+            block = expert.blocks[layer_idx]
+            (
+                q_target,
+                k_target,
+                v_target,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
+                name=target_name,
+                layer_idx=layer_idx,
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=target_freqs,
+                t_mod=target_t_mod,
+            )
+            k_fixed = layer_fixed_cache["k"]
+            v_fixed = layer_fixed_cache["v"]
+            if k_fixed.shape[1] != fixed_seq_len or v_fixed.shape[1] != fixed_seq_len:
+                raise ValueError(
+                    f"Fixed cache seq length mismatch at overlap layer {overlap_idx}."
+                )
+            mixed = self._mixed_attention(
+                q_cat=q_target,
+                k_cat=torch.cat([k_fixed, k_target], dim=1),
+                v_cat=torch.cat([v_fixed, v_target], dim=1),
+                attention_mask=target_attention_mask,
+            )
+            mixed = self._project_mixed_from_shared(
+                name=target_name,
+                layer_idx=layer_idx,
+                mixed=mixed,
+            )
+            x = self._apply_post_with_optional_checkpoint(
+                block=block,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                mixed_slice=mixed,
+                context_payload=target_context_payload,
+            )
+        return x
+
     def forward(
         self,
         embeds_all: Dict[str, torch.Tensor],

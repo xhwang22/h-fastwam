@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
 
+from fastwam.utils.logging_config import get_logger
+
 from .hfastwam import HFastWAM
 from .language_expert import LanguageExpert
+
+logger = get_logger(__name__)
 
 
 class HFastWAMIDM(HFastWAM):
@@ -382,7 +387,20 @@ class HFastWAMIDM(HFastWAM):
         video_tokens_per_frame: int,
         video_context_payload: Optional[dict] = None,
         action_context_payload: Optional[dict] = None,
+        action_inference_cache: Optional[dict] = None,
     ) -> dict:
+        if action_inference_cache is not None:
+            action_tokens = self.mot.forward_target_with_fixed_cache(
+                target_name="action",
+                target_tokens=action_pre["tokens"],
+                target_freqs=action_pre["freqs"],
+                target_t_mod=action_pre["t_mod"],
+                target_context_payload=action_context_payload,
+                fixed_cache=action_inference_cache["fixed_cache"],
+                attention_mask=action_inference_cache["attention_mask"],
+            )
+            return {"action": action_tokens}
+
         return self._run_mot_interleaved_segments(
             lang_pre=lang_pre,
             video_pre=video_pre,
@@ -394,6 +412,76 @@ class HFastWAMIDM(HFastWAM):
             video_context_payload=video_context_payload,
             action_context_payload=action_context_payload,
         )
+
+    def _prepare_action_inference_cache(
+        self,
+        lang_pre: dict,
+        video_pre: dict,
+        task_len: int,
+        subtask_len: int,
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        video_context_payload: Optional[dict],
+    ) -> Optional[dict]:
+        enabled = os.environ.get(
+            "FASTWAM_IDM_INFERENCE_KV_CACHE",
+            "1",
+        ).strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return None
+
+        prediction_tokens = int(video_pre.get("_idm_prediction_tokens", 0))
+        condition_tokens = int(video_pre.get("_idm_condition_tokens", 0))
+        if prediction_tokens <= 0 or condition_tokens <= 0:
+            raise ValueError(
+                "IDM inference cache requires prediction and condition token metadata."
+            )
+
+        attention_mask = self._build_interleaved_idm_attention_mask(
+            task_len=task_len,
+            subtask_len=subtask_len,
+            prediction_video_seq_len=prediction_tokens,
+            condition_video_seq_len=condition_tokens,
+            action_seq_len=action_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            num_segments=1,
+            device=video_pre["tokens"].device,
+        )
+        fixed_seq_len = int(lang_pre["tokens"].shape[1]) + int(
+            video_pre["tokens"].shape[1]
+        )
+        fixed_cache = self.mot.prefill_fixed_expert_cache(
+            embeds_all={
+                "language": lang_pre["tokens"],
+                "video": video_pre["tokens"],
+            },
+            attention_mask=attention_mask[:fixed_seq_len, :fixed_seq_len],
+            freqs_all={
+                "language": lang_pre["freqs"],
+                "video": video_pre["freqs"],
+            },
+            context_all={
+                "language": None,
+                "video": video_context_payload,
+            },
+            t_mod_all={
+                "language": lang_pre["t_mod"],
+                "video": video_pre["t_mod"],
+            },
+            fixed_expert_order=("language", "video"),
+        )
+        if not getattr(self, "_logged_idm_inference_kv_cache", False):
+            logger.info(
+                "Enabled IDM inference KV cache: fixed_tokens=%d layers=%d; "
+                "action denoising will reuse language/video K/V.",
+                fixed_seq_len,
+                len(fixed_cache["layers"]),
+            )
+            self._logged_idm_inference_kv_cache = True
+        return {
+            "fixed_cache": fixed_cache,
+            "attention_mask": attention_mask,
+        }
 
     def training_loss(
         self,

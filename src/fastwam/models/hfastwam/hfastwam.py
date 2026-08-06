@@ -2069,6 +2069,27 @@ class HFastWAM(nn.Module):
         )
         return video_pre
 
+    def _prepare_action_inference_cache(
+        self,
+        lang_pre: dict,
+        video_pre: dict,
+        task_len: int,
+        subtask_len: int,
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        video_context_payload: Optional[dict],
+    ) -> Optional[dict]:
+        del (
+            lang_pre,
+            video_pre,
+            task_len,
+            subtask_len,
+            action_seq_len,
+            video_tokens_per_frame,
+            video_context_payload,
+        )
+        return None
+
     def _run_mot_action_inference(
         self,
         lang_pre: dict,
@@ -2079,7 +2100,9 @@ class HFastWAM(nn.Module):
         video_tokens_per_frame: int,
         video_context_payload: Optional[dict] = None,
         action_context_payload: Optional[dict] = None,
+        action_inference_cache: Optional[dict] = None,
     ) -> dict:
+        del action_inference_cache
         return self._run_mot_three_experts(
             lang_pre=lang_pre,
             video_pre=video_pre,
@@ -2422,6 +2445,15 @@ class HFastWAM(nn.Module):
             (1, action_horizon, self.action_expert.action_dim),
             generator=generator, device=rand_device, dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+        action_inference_cache = self._prepare_action_inference_cache(
+            lang_pre=lang_pre,
+            video_pre=action_video_pre,
+            task_len=seg["task_len"],
+            subtask_len=seg["subtask_len"],
+            action_seq_len=int(latents_action.shape[1]),
+            video_tokens_per_frame=action_video_tokens_per_frame,
+            video_context_payload=action_video_context_payload,
+        )
 
         infer_timesteps, infer_deltas = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -2450,6 +2482,7 @@ class HFastWAM(nn.Module):
                 video_tokens_per_frame=action_video_tokens_per_frame,
                 video_context_payload=action_video_context_payload,
                 action_context_payload=action_context_payload,
+                action_inference_cache=action_inference_cache,
             )
             pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
             latents_action = self.infer_action_scheduler.step(
