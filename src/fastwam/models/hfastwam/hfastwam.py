@@ -2052,6 +2052,8 @@ class HFastWAM(nn.Module):
         video_context_payload: Optional[dict],
         video_context: torch.Tensor,
         video_context_mask: torch.Tensor,
+        first_frame_latents: torch.Tensor,
+        num_video_frames: Optional[int],
     ) -> dict:
         """Prepare the video branch used by action denoising."""
         del (
@@ -2062,6 +2064,8 @@ class HFastWAM(nn.Module):
             video_context_payload,
             video_context,
             video_context_mask,
+            first_frame_latents,
+            num_video_frames,
         )
         return video_pre
 
@@ -2257,6 +2261,7 @@ class HFastWAM(nn.Module):
         context_mask: Optional[torch.Tensor] = None,
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
+        num_video_frames: Optional[int] = None,
         **kwargs,
     ) -> dict:
         """Inference: language AR-generates subtask, then 1-shot video + action denoising.
@@ -2400,6 +2405,8 @@ class HFastWAM(nn.Module):
             video_context_payload=video_context_payload,
             video_context=video_context,
             video_context_mask=video_context_mask,
+            first_frame_latents=first_frame_latents,
+            num_video_frames=num_video_frames,
         )
         action_video_tokens_per_frame = int(
             action_video_pre["meta"]["tokens_per_frame"]
@@ -2968,6 +2975,7 @@ class HFastWAM(nn.Module):
                 rand_device=rand_device,
                 tiled=tiled,
                 generate_subtask=generate_subtask,
+                num_video_frames=num_frames,
                 **kwargs,
             )
 

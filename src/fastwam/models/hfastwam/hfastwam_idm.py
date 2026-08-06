@@ -287,25 +287,66 @@ class HFastWAMIDM(HFastWAM):
         video_context_payload: Optional[dict],
         video_context: torch.Tensor,
         video_context_mask: torch.Tensor,
+        first_frame_latents: torch.Tensor,
+        num_video_frames: Optional[int],
     ) -> dict:
-        prediction_out = self._run_mot_two_experts_lv(
-            lang_pre=lang_pre,
-            video_pre=video_pre,
-            task_len=task_len,
-            subtask_len=subtask_len,
-            video_tokens_per_frame=video_tokens_per_frame,
-            video_context_payload=video_context_payload,
+        temporal_factor = int(
+            getattr(self.visual_encoder, "temporal_downsample_factor", 1)
         )
-        predicted_future = self.video_expert.post_dit(
-            prediction_out["video"],
-            video_pre,
-        )
+        if num_video_frames is None:
+            num_future_latents = 1
+        else:
+            num_video_frames = int(num_video_frames)
+            if num_video_frames <= 1:
+                raise ValueError(
+                    f"`num_video_frames` must be greater than 1, got {num_video_frames}."
+                )
+            num_latents = (num_video_frames - 1) // temporal_factor + 1
+            num_future_latents = num_latents - 1
+        if num_future_latents <= 0:
+            raise ValueError(
+                "IDM inference requires at least one future latent; "
+                f"got num_video_frames={num_video_frames}, temporal_factor={temporal_factor}."
+            )
+
+        rollout_context = first_frame_latents
+        predicted_future_latents = []
+        prediction_pre = video_pre
+        for _ in range(num_future_latents):
+            prediction_pre = self.video_expert.pre_dit(
+                x=rollout_context,
+                context=video_context if self.video_expert.use_text_context else None,
+                context_mask=video_context_mask if self.video_expert.use_text_context else None,
+            )
+            prediction_context_payload = self._context_payload_from_pre_state(
+                prediction_pre,
+                video_context_payload is not None,
+            )
+            prediction_out = self._run_mot_two_experts_lv(
+                lang_pre=lang_pre,
+                video_pre=prediction_pre,
+                task_len=task_len,
+                subtask_len=subtask_len,
+                video_tokens_per_frame=int(
+                    prediction_pre["meta"]["tokens_per_frame"]
+                ),
+                video_context_payload=prediction_context_payload,
+            )
+            predicted_sequence = self.video_expert.post_dit(
+                prediction_out["video"],
+                prediction_pre,
+            )
+            next_latent = predicted_sequence[:, :, -1:]
+            predicted_future_latents.append(next_latent)
+            rollout_context = torch.cat([rollout_context, next_latent], dim=2)
+
+        predicted_future = torch.cat(predicted_future_latents, dim=2)
         condition_pre = self.video_expert.pre_dit(
             x=predicted_future,
             context=video_context if self.video_expert.use_text_context else None,
             context_mask=video_context_mask if self.video_expert.use_text_context else None,
         )
-        return self._combine_idm_video_pre(video_pre, condition_pre)
+        return self._combine_idm_video_pre(prediction_pre, condition_pre)
 
     def _run_mot_action_inference(
         self,
