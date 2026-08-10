@@ -990,6 +990,23 @@ class HFastWAM(nn.Module):
         return tokens.reshape(batch_size, num_segments, tokens_per_segment, tokens.shape[-1]).flatten(0, 1)
 
     @staticmethod
+    def _zero_padded_action_dims(
+        action: torch.Tensor,
+        action_dim_is_pad: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if action_dim_is_pad is None:
+            return action
+        mask = action_dim_is_pad.to(device=action.device, dtype=torch.bool)
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+        if mask.shape != (action.shape[0], action.shape[-1]):
+            raise ValueError(
+                "`action_dim_is_pad` shape mismatch: "
+                f"got {tuple(mask.shape)}, expected {(action.shape[0], action.shape[-1])}."
+            )
+        return action.masked_fill(mask.unsqueeze(1), 0.0)
+
+    @staticmethod
     def _flatten_segment_prompts(prompts: Any, batch_size: int, num_segments: int) -> list[str]:
         if isinstance(prompts, str):
             if batch_size != 1 or num_segments != 1:
@@ -1626,7 +1643,20 @@ class HFastWAM(nn.Module):
             flat_action = action.reshape(B * N, action.shape[2], action.shape[3]).to(
                 device=self.device, dtype=self.torch_dtype,
             )
-            noise_action = torch.randn_like(flat_action)
+            action_dim_is_pad = segments.get("action_dim_is_pad")
+            flat_action_dim_is_pad = (
+                None
+                if action_dim_is_pad is None
+                else action_dim_is_pad.reshape(B * N, action_dim_is_pad.shape[-1])
+            )
+            flat_action = self._zero_padded_action_dims(
+                flat_action,
+                flat_action_dim_is_pad,
+            )
+            noise_action = self._zero_padded_action_dims(
+                torch.randn_like(flat_action),
+                flat_action_dim_is_pad,
+            )
             timestep_action = self.train_action_scheduler.sample_training_t(
                 batch_size=B * N, device=self.device, dtype=flat_action.dtype,
             )
@@ -1734,6 +1764,9 @@ class HFastWAM(nn.Module):
                 target_action=target_action,
                 timestep_action=timestep_action,
                 action_is_pad=flat_action_is_pad,
+                action_dim_is_pad=(
+                    flat_action_dim_is_pad
+                ),
             )
             total_loss = total_loss + self.loss_lambda_action * loss_action
             loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action.detach().item())
@@ -1884,7 +1917,12 @@ class HFastWAM(nn.Module):
                 raise ValueError(
                     f"Batch mismatch across modalities: action batch={action.shape[0]} vs expected {batch_size}"
                 )
-            noise_action = torch.randn_like(action)
+            action_dim_is_pad = sample.get("action_dim_is_pad", None)
+            action = self._zero_padded_action_dims(action, action_dim_is_pad)
+            noise_action = self._zero_padded_action_dims(
+                torch.randn_like(action),
+                action_dim_is_pad,
+            )
             timestep_action = self.train_action_scheduler.sample_training_t(
                 batch_size=batch_size, device=self.device, dtype=action.dtype,
             )
@@ -1985,6 +2023,7 @@ class HFastWAM(nn.Module):
                 target_action=target_action,
                 timestep_action=timestep_action,
                 action_is_pad=action_is_pad,
+                action_dim_is_pad=sample.get("action_dim_is_pad", None),
             )
             total_loss = total_loss + self.loss_lambda_action * loss_action
             loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action.detach().item())
@@ -2215,19 +2254,34 @@ class HFastWAM(nn.Module):
         target_action: torch.Tensor,
         timestep_action: torch.Tensor,
         action_is_pad: Optional[torch.Tensor],
+        action_dim_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        element_loss = F.mse_loss(
+            pred_action.float(),
+            target_action.float(),
+            reduction="none",
+        )
+        valid = torch.ones_like(element_loss, dtype=torch.bool)
         if action_is_pad is not None:
-            action_is_pad = action_is_pad.to(self.device)
-            token_loss = F.mse_loss(
-                pred_action.float(), target_action.float(), reduction="none",
-            ).mean(dim=-1)  # [B, T]
-            valid = (~action_is_pad).to(dtype=torch.float32)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            per_sample = (token_loss * valid).sum(dim=1) / valid_sum
-        else:
-            per_sample = F.mse_loss(
-                pred_action.float(), target_action.float(), reduction="none",
-            ).mean(dim=(1, 2))
+            action_is_pad = action_is_pad.to(self.device, dtype=torch.bool)
+            valid &= ~action_is_pad.unsqueeze(-1)
+        if action_dim_is_pad is not None:
+            action_dim_is_pad = action_dim_is_pad.to(self.device, dtype=torch.bool)
+            if action_dim_is_pad.ndim == 1:
+                action_dim_is_pad = action_dim_is_pad.unsqueeze(0)
+            if action_dim_is_pad.shape != (
+                element_loss.shape[0],
+                element_loss.shape[2],
+            ):
+                raise ValueError(
+                    "`action_dim_is_pad` shape mismatch: "
+                    f"got {tuple(action_dim_is_pad.shape)}, expected "
+                    f"{(element_loss.shape[0], element_loss.shape[2])}."
+                )
+            valid &= ~action_dim_is_pad.unsqueeze(1)
+        valid_float = valid.to(dtype=element_loss.dtype)
+        valid_count = valid_float.sum(dim=(1, 2)).clamp(min=1.0)
+        per_sample = (element_loss * valid_float).sum(dim=(1, 2)) / valid_count
         w = self.train_action_scheduler.training_weight(timestep_action).to(
             device=per_sample.device, dtype=per_sample.dtype,
         )

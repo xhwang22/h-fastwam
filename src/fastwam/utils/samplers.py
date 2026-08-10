@@ -1,4 +1,5 @@
 from typing import Iterator, Sized
+from itertools import islice
 
 import torch
 from torch.utils.data import Sampler
@@ -27,12 +28,17 @@ class ResumableEpochSampler(Sampler[int]):
         self.resume_batch_offset = 0
 
     def __iter__(self) -> Iterator[int]:
-        g = torch.Generator(device="cpu")
-        g.manual_seed(self.seed + self.epoch + self.epoch_offset)
-        indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        epoch_seed = self.seed + self.epoch + self.epoch_offset
+        custom_iterator = getattr(self.dataset, "iter_epoch_indices", None)
+        if callable(custom_iterator):
+            indices = custom_iterator(epoch_seed)
+        else:
+            g = torch.Generator(device="cpu")
+            g.manual_seed(epoch_seed)
+            indices = iter(torch.randperm(len(self.dataset), generator=g).tolist())
         if self.epoch == 0 and self.resume_batch_offset > 0:
             sample_offset = self.resume_batch_offset * self.batch_size * self.num_processes
-            indices = indices[sample_offset:]
+            indices = islice(indices, sample_offset, None)
         return iter(indices)
 
     def __len__(self) -> int:

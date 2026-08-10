@@ -109,7 +109,10 @@ export DIFFSYNTH_MODEL_BASE_PATH="${REPO_ROOT}/checkpoints/"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-128}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 TASK_CONFIG="${TASK_CONFIG:-robotwin_uncond_3cam_384_1e-4}"
+DATA_CONFIG="${DATA_CONFIG:-${ROBOTWIN_DATA_CONFIG}}"
 MODEL_CONFIG="${MODEL_CONFIG:-hfastwam_small_vjepa21_predictor}"
+NUM_EPOCHS="${NUM_EPOCHS:-5}"
+MAX_STEPS="${MAX_STEPS:-null}"
 WORLD_SIZE=$(( NPROC_PER_NODE * NNODES ))
 _BATCH_DENOM=$(( WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS ))
 if (( GLOBAL_BATCH_SIZE % _BATCH_DENOM != 0 )); then
@@ -156,6 +159,17 @@ if [[ "${NO_CKPT:-0}" == "1" ]]; then
   )
 fi
 
+PRETRAIN_OVERRIDES=()
+if [[ -n "${FASTWAM_CHECKPOINT:-}" ]]; then
+  if [[ ! -f "${FASTWAM_CHECKPOINT}" ]]; then
+    echo "[8card-small-vjepa-predictor] ERROR: FASTWAM_CHECKPOINT not found: ${FASTWAM_CHECKPOINT}" >&2
+    exit 1
+  fi
+  PRETRAIN_OVERRIDES=(
+    "model.fastwam_checkpoint=${FASTWAM_CHECKPOINT}"
+  )
+fi
+
 STANDARDISE_OVERRIDES=()
 if [[ -n "${STANDARDISE_OUTPUT:-}" ]]; then
   STANDARDISE_OVERRIDES=(
@@ -179,6 +193,19 @@ if [[ -n "${TEMPORAL_DOWNSAMPLE:-}" ]]; then
   )
 fi
 
+DATA_SOURCE_OVERRIDES=()
+if [[ "${USE_ROBOTWIN_DATA_OVERRIDES:-1}" == "1" ]]; then
+  DATA_SOURCE_OVERRIDES=("${ROBOTWIN_DATA_OVERRIDES[@]}")
+fi
+
+SEGMENT_OVERRIDES=()
+if [[ "${SET_NUM_SEGMENTS:-1}" == "1" ]]; then
+  SEGMENT_OVERRIDES=(
+    "data.train.num_segments=1"
+    "data.val.num_segments=1"
+  )
+fi
+
 CMD=(
   accelerate launch
     --config_file "${ACCEL_CONFIG}"
@@ -190,7 +217,7 @@ CMD=(
     --deepspeed_multinode_launcher standard
     scripts/train.py
       task="${TASK_CONFIG}"
-    data="${ROBOTWIN_DATA_CONFIG}"
+    data="${DATA_CONFIG}"
       model="${MODEL_CONFIG}"
       output_dir="${LOG_DIR}"
       "${WANDB_OVERRIDES[@]}"
@@ -201,11 +228,10 @@ CMD=(
       dataloader_prefetch_factor="${DATALOADER_PREFETCH_FACTOR:-4}"
       dataloader_persistent_workers="${DATALOADER_PERSISTENT_WORKERS:-true}"
       dataloader_timeout=0
-      data.train.num_segments=1
-      data.val.num_segments=1
-      "${ROBOTWIN_DATA_OVERRIDES[@]}"
-      num_epochs=5
-      max_steps=null
+      "${SEGMENT_OVERRIDES[@]}"
+      "${DATA_SOURCE_OVERRIDES[@]}"
+      num_epochs="${NUM_EPOCHS}"
+      max_steps="${MAX_STEPS}"
       save_every="${SAVE_EVERY}"
       model.knowledge_insulation=false
       model.freeze_language_expert=true
@@ -215,6 +241,7 @@ CMD=(
       "model.action_loss_detach_video_expert=${DETACH_VIDEO:-false}"
       model.visual_encoder_config.checkpoint_path="${VJEPA21_CHECKPOINT}"
       model.visual_encoder_config.repo_path="${VJEPA21_REPO}"
+      "${PRETRAIN_OVERRIDES[@]}"
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
       "${GAP_OVERRIDES[@]}"

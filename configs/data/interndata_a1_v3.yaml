@@ -1,0 +1,23 @@
+train:
+  _target_: fastwam.datasets.lerobot.intern_a1_v3_dataset.InternDataA1V3Dataset
+  root: ${oc.env:INTERN_A1_ROOT}
+  manifest_dir: ${oc.env:INTERN_A1_MANIFEST_DIR}
+  samples_per_epoch: 2000000
+  is_training_set: true
+  val_set_proportion: 0.01
+  seed: ${seed}
+  num_frames: 33
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  clips_per_episode: 8
+  locality_stride: 4
+  max_open_parquet_shards: 2
+  max_open_video_shards: 6
+  video_decode_threads: 2
+  max_retries: 3
+  # HFastWAM model configs read these dimensions through data.train.processor.
+  processor:
+    action_output_dim: 20
+    proprio_output_dim: 20
+
+val: null
