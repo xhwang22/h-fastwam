@@ -9,8 +9,8 @@ model:
 lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
 num_epochs: 1
-max_steps: 100000
-log_every: 10
+max_steps: null
+log_every: 1
 save_every: 2000
 eval_every: 0
 

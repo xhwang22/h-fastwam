@@ -2,7 +2,11 @@ train:
   _target_: fastwam.datasets.lerobot.intern_a1_v3_dataset.InternDataA1V3Dataset
   root: ${oc.env:INTERN_A1_ROOT}
   manifest_dir: ${oc.env:INTERN_A1_MANIFEST_DIR}
-  samples_per_epoch: 2000000
+  # null enumerates each valid clip at most once, dropping only the final
+  # incomplete distributed batch selected by epoch_size_multiple.
+  samples_per_epoch: null
+  # 16 ranks x per-rank batch 48; avoids Accelerate duplicating a tail batch.
+  epoch_size_multiple: 768
   is_training_set: true
   val_set_proportion: 0.01
   seed: ${seed}

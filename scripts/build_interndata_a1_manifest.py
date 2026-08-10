@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import fcntl
 import json
 import os
@@ -14,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 MIN_EPISODE_FRAMES = 33
 
 
@@ -152,6 +153,45 @@ def _read_episode_rows(dataset_root: Path, camera_keys: dict) -> list[dict]:
     return rows
 
 
+def _data_file_intervals(dataset_root: Path) -> tuple[list[int], list[tuple[int, int, int, int]]]:
+    import pyarrow.parquet as pq
+
+    intervals = []
+    cumulative_start = 0
+    data_paths = sorted((dataset_root / "data").glob("chunk-*/file-*.parquet"))
+    if not data_paths:
+        raise FileNotFoundError(f"No data parquet files under {dataset_root}.")
+    for path in data_paths:
+        chunk = int(path.parent.name.removeprefix("chunk-"))
+        file_index = int(path.stem.removeprefix("file-"))
+        row_count = int(pq.ParquetFile(path).metadata.num_rows)
+        cumulative_end = cumulative_start + row_count
+        intervals.append((cumulative_start, cumulative_end, chunk, file_index))
+        cumulative_start = cumulative_end
+    return [interval[1] for interval in intervals], intervals
+
+
+def _resolve_data_file(
+    dataset_from_index: int,
+    episode_length: int,
+    file_ends: list[int],
+    intervals: list[tuple[int, int, int, int]],
+) -> tuple[int, int, int]:
+    interval_index = bisect.bisect_right(file_ends, int(dataset_from_index))
+    if interval_index >= len(intervals):
+        raise ValueError(
+            f"dataset_from_index={dataset_from_index} is outside the parquet file ranges."
+        )
+    file_start, file_end, chunk, file_index = intervals[interval_index]
+    if int(dataset_from_index) + int(episode_length) > file_end:
+        raise ValueError(
+            "InternData episode crosses a parquet file boundary: "
+            f"start={dataset_from_index}, length={episode_length}, "
+            f"file_range=[{file_start}, {file_end})."
+        )
+    return chunk, file_index, file_start
+
+
 def _write_array(output_dir: Path, name: str, values, dtype) -> None:
     np.save(output_dir / f"{name}.npy", np.asarray(values, dtype=dtype))
 
@@ -214,11 +254,7 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
                 continue
 
             episode_rows = _read_episode_rows(source_root, schema["camera_keys"])
-            file_starts: dict[tuple[int, int], int] = {}
-            for row in episode_rows:
-                file_key = (int(row["data/chunk_index"]), int(row["data/file_index"]))
-                row_start = int(row["dataset_from_index"])
-                file_starts[file_key] = min(file_starts.get(file_key, row_start), row_start)
+            file_ends, data_intervals = _data_file_intervals(source_root)
 
             valid_episodes = 0
             for row in episode_rows:
@@ -244,8 +280,12 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
                         float(row[f"videos/{camera_key}/from_timestamp"]),
                     )
 
-                data_chunk = int(row["data/chunk_index"])
-                data_file = int(row["data/file_index"])
+                data_chunk, data_file, data_file_from = _resolve_data_file(
+                    dataset_from_index=int(row["dataset_from_index"]),
+                    episode_length=length,
+                    file_ends=file_ends,
+                    intervals=data_intervals,
+                )
                 shard_key = (
                     dataset_id,
                     data_chunk,
@@ -262,7 +302,7 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
                 arrays["data_chunk"].append(data_chunk)
                 arrays["data_file"].append(data_file)
                 arrays["data_from"].append(int(row["dataset_from_index"]))
-                arrays["data_file_from"].append(file_starts[(data_chunk, data_file)])
+                arrays["data_file_from"].append(data_file_from)
                 arrays["task_id"].append(task_id)
                 arrays["shard_id"].append(shard_id)
                 for role in ("head", "left", "right"):
@@ -344,7 +384,7 @@ def main() -> None:
     output = (
         Path(args.output)
         if args.output is not None
-        else root / ".fastwam_intern_a1" / "manifest_v1"
+        else root / ".fastwam_intern_a1" / "manifest_v2"
     )
     build_manifest(root=root, output_dir=output, force=args.force)
 

@@ -248,6 +248,7 @@ CMD=(
       "${TEMPORAL_OVERRIDES[@]}"
       "${VIDEO_LATENT_CACHE_OVERRIDES[@]}"
       "${RESUME_OVERRIDES[@]}"
+      "$@"
 )
 
 echo "[robotwin-small-vjepa21-predictor] task=${TASK_CONFIG} model=${MODEL_CONFIG}"

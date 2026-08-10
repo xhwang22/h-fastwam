@@ -183,7 +183,8 @@ class InternDataA1V3Dataset(Dataset):
         self,
         root: str,
         manifest_dir: Optional[str] = None,
-        samples_per_epoch: int = 2_000_000,
+        samples_per_epoch: Optional[int] = None,
+        epoch_size_multiple: int = 1,
         is_training_set: bool = True,
         val_set_proportion: float = 0.01,
         seed: int = 42,
@@ -203,7 +204,7 @@ class InternDataA1V3Dataset(Dataset):
         self.manifest_dir = (
             Path(manifest_dir).expanduser().resolve()
             if manifest_dir is not None
-            else self.root / ".fastwam_intern_a1" / "manifest_v1"
+            else self.root / ".fastwam_intern_a1" / "manifest_v2"
         )
         done_path = self.manifest_dir / "done.json"
         if not done_path.is_file():
@@ -252,7 +253,9 @@ class InternDataA1V3Dataset(Dataset):
         if tuple(video_size) != (384, 320):
             raise ValueError("InternData pretraining uses the RoboTwin 384x320 canvas.")
 
-        self.samples_per_epoch = int(samples_per_epoch)
+        self.enumerate_full_epoch = samples_per_epoch is None
+        self.samples_per_epoch = None if self.enumerate_full_epoch else int(samples_per_epoch)
+        self.epoch_size_multiple = max(int(epoch_size_multiple), 1)
         self.is_training_set = bool(is_training_set)
         self.val_set_proportion = float(val_set_proportion)
         self.seed = int(seed)
@@ -273,6 +276,21 @@ class InternDataA1V3Dataset(Dataset):
         self.episode_rows = np.flatnonzero(split_mask).astype(np.int64)
         if self.episode_rows.size == 0:
             raise ValueError("InternData split contains no episodes.")
+        self.full_epoch_clip_count = int(
+            np.maximum(
+                self.arrays["length"][self.episode_rows].astype(np.int64) - 32,
+                0,
+            ).sum()
+        )
+        if self.samples_per_epoch is None:
+            self.samples_per_epoch = (
+                self.full_epoch_clip_count // self.epoch_size_multiple
+            ) * self.epoch_size_multiple
+            if self.samples_per_epoch <= 0:
+                raise ValueError(
+                    "InternData split has fewer clips than epoch_size_multiple="
+                    f"{self.epoch_size_multiple}."
+                )
 
         shard_values = self.arrays["shard_id"][self.episode_rows]
         boundaries = np.flatnonzero(
@@ -310,6 +328,30 @@ class InternDataA1V3Dataset(Dataset):
 
     def iter_epoch_indices(self, epoch_seed: int) -> Iterator[int]:
         rng = np.random.default_rng(int(epoch_seed))
+        if self.enumerate_full_epoch:
+            yielded = 0
+            group_order = rng.permutation(len(self.group_starts))
+            for group_index in group_order:
+                start_index = int(self.group_starts[group_index])
+                end_index = int(self.group_ends[group_index])
+                rows = self.episode_rows[start_index:end_index].copy()
+                rng.shuffle(rows)
+                for episode_row in rows:
+                    clip_count = int(self.arrays["length"][episode_row]) - 32
+                    if clip_count <= 0:
+                        continue
+                    base_start = int(rng.integers(clip_count))
+                    direction = -1 if bool(rng.integers(2)) else 1
+                    for local_index in range(clip_count):
+                        clip_start = (
+                            base_start + direction * local_index
+                        ) % clip_count
+                        yield self._encode_index(int(episode_row), clip_start)
+                        yielded += 1
+                        if yielded >= self.samples_per_epoch:
+                            return
+            return
+
         yielded = 0
         while yielded < self.samples_per_epoch:
             group_order = rng.permutation(len(self.group_starts))
@@ -580,6 +622,14 @@ class InternDataA1V3Dataset(Dataset):
                 return self._get_encoded(episode_row, clip_start, int(index))
             except Exception as exc:
                 last_error = exc
+                if self.enumerate_full_epoch:
+                    logger.warning(
+                        "InternData exact-epoch sample failed (attempt %d/%d): %s",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        exc,
+                    )
+                    continue
                 digest = hashlib.sha256(
                     f"{index}:{attempt}:{self.seed}".encode("utf-8")
                 ).digest()
