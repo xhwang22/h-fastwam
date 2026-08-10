@@ -879,41 +879,46 @@ class XR1VisualEncoder(Qwen3VLVisualEncoder):
         state_dict: dict[str, torch.Tensor] = {}
 
         if checkpoint_path.is_dir():
-            try:
-                from safetensors import safe_open
-            except Exception as exc:  # pragma: no cover
-                raise ImportError("XR-1 safetensors loading requires `safetensors`.") from exc
-
-            index_path = checkpoint_path / "model.safetensors.index.json"
-            if index_path.is_file():
-                with index_path.open("r", encoding="utf-8") as handle:
-                    weight_map = json.load(handle).get("weight_map", {})
-                filenames = {
-                    filename
-                    for key, filename in weight_map.items()
-                    if cls._relative_visual_key(key) is not None
-                }
-                if not filenames:
-                    raise ValueError(f"No XR-1 visual weights found in {index_path}.")
-                weight_files = [checkpoint_path / name for name in sorted(filenames)]
+            model_states_path = checkpoint_path / "model_states.pt"
+            if model_states_path.is_file():
+                checkpoint_path = model_states_path
             else:
-                single_file = checkpoint_path / "model.safetensors"
-                if not single_file.is_file():
-                    raise FileNotFoundError(
-                        "XR-1 model directory must contain model.safetensors or "
-                        f"model.safetensors.index.json: {checkpoint_path}"
-                    )
-                weight_files = [single_file]
+                try:
+                    from safetensors import safe_open
+                except Exception as exc:  # pragma: no cover
+                    raise ImportError("XR-1 safetensors loading requires `safetensors`.") from exc
 
-            for weight_file in weight_files:
-                if not weight_file.is_file():
-                    raise FileNotFoundError(f"Missing XR-1 weight shard: {weight_file}")
-                with safe_open(str(weight_file), framework="pt", device="cpu") as handle:
-                    for key in handle.keys():
-                        relative_key = cls._relative_visual_key(key)
-                        if relative_key is not None:
-                            state_dict[relative_key] = handle.get_tensor(key)
-            return state_dict
+                index_path = checkpoint_path / "model.safetensors.index.json"
+                if index_path.is_file():
+                    with index_path.open("r", encoding="utf-8") as handle:
+                        weight_map = json.load(handle).get("weight_map", {})
+                    filenames = {
+                        filename
+                        for key, filename in weight_map.items()
+                        if cls._relative_visual_key(key) is not None
+                    }
+                    if not filenames:
+                        raise ValueError(f"No XR-1 visual weights found in {index_path}.")
+                    weight_files = [checkpoint_path / name for name in sorted(filenames)]
+                else:
+                    single_file = checkpoint_path / "model.safetensors"
+                    if not single_file.is_file():
+                        raise FileNotFoundError(
+                            "XR-1 model directory must contain model_states.pt, "
+                            "model.safetensors, or model.safetensors.index.json: "
+                            f"{checkpoint_path}"
+                        )
+                    weight_files = [single_file]
+
+                for weight_file in weight_files:
+                    if not weight_file.is_file():
+                        raise FileNotFoundError(f"Missing XR-1 weight shard: {weight_file}")
+                    with safe_open(str(weight_file), framework="pt", device="cpu") as handle:
+                        for key in handle.keys():
+                            relative_key = cls._relative_visual_key(key)
+                            if relative_key is not None:
+                                state_dict[relative_key] = handle.get_tensor(key)
+                return state_dict
 
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"XR-1 checkpoint not found: {checkpoint_path}")
