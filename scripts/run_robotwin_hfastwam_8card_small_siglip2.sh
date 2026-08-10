@@ -157,6 +157,22 @@ if [[ -n "${TEMPORAL_DOWNSAMPLE:-}" ]]; then
   )
 fi
 
+XR1_OVERRIDES=()
+if [[ -n "${XR1_CHECKPOINT:-}" ]]; then
+  if [[ ! -e "${XR1_CHECKPOINT}" ]]; then
+    echo "[${LAUNCH_LABEL}] ERROR: XR-1 checkpoint not found: ${XR1_CHECKPOINT}" >&2
+    exit 1
+  fi
+  XR1_OVERRIDES+=(
+    "model.visual_encoder_config.checkpoint_path=${XR1_CHECKPOINT}"
+  )
+fi
+if [[ -n "${XR1_CONFIG_MODEL:-}" ]]; then
+  XR1_OVERRIDES+=(
+    "model.visual_encoder_config.model_name=${XR1_CONFIG_MODEL}"
+  )
+fi
+
 CAUSAL_TUBELET_OVERRIDES=()
 if [[ -n "${CAUSAL_TUBELET_ENCODING:-}" ]]; then
   CAUSAL_TUBELET_OVERRIDES=(
@@ -201,12 +217,14 @@ CMD=(
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
       "${TEMPORAL_OVERRIDES[@]}"
+      "${XR1_OVERRIDES[@]}"
       "${CAUSAL_TUBELET_OVERRIDES[@]}"
       "${VIDEO_LATENT_CACHE_OVERRIDES[@]}"
       "${RESUME_OVERRIDES[@]}"
 )
 
-echo "[${LAUNCH_LABEL}] model=${MODEL_CONFIG} (Qwen3-VL-2B visual tower, raw 1024-d features + Wan DiT)"
+VISUAL_ENCODER_DESCRIPTION="${VISUAL_ENCODER_DESCRIPTION:-Qwen3-VL-2B visual tower, raw 1024-d features + Wan DiT}"
+echo "[${LAUNCH_LABEL}] model=${MODEL_CONFIG} (${VISUAL_ENCODER_DESCRIPTION})"
 echo "[${LAUNCH_LABEL}] global_batch=${GLOBAL_BATCH_SIZE} world_size=${WORLD_SIZE} batch_size=${BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
 echo "[${LAUNCH_LABEL}] master=${MASTER_ADDR}:${MASTER_PORT} log=${LOG_FILE}"
 "${CMD[@]}" 2>&1 | tee "${LOG_FILE}"

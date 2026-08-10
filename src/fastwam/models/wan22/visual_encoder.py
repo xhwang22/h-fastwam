@@ -4,6 +4,7 @@ Supported backends:
 
 * **DINOv3 / DINOv2** — frozen image ViT, per-frame encoding + temporal stride.
 * **Qwen3-VL vision** — frozen SigLIP2-initialized video ViT.
+* **Xiaomi Robotics-1 vision** — XR-1-tuned Qwen3-VL-4B vision tower.
 * **V-JEPA 2** — frozen video ViT, native spatiotemporal encoding.
 * **V-JEPA 2.1** — frozen dense-feature video ViT.
 
@@ -522,10 +523,12 @@ class Qwen3VLVisualEncoder(BaseVisualEncoder):
         causal_tubelet_encoding: bool = False,
         causal_prefix_encoding: bool = False,
         local_files_only: bool = True,
+        checkpoint_path: Optional[str] = None,
         torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         self.model_name = model_name
+        self.checkpoint_path = checkpoint_path
         self.standardise_output = standardise_output
         self.skip_projection = skip_projection
         self._freeze_backbone = freeze_backbone
@@ -537,6 +540,7 @@ class Qwen3VLVisualEncoder(BaseVisualEncoder):
             model_name=model_name,
             dtype=torch_dtype,
             local_files_only=local_files_only,
+            checkpoint_path=checkpoint_path,
         )
         config = self.backbone.config
         self._hidden_dim = int(config.hidden_size)
@@ -550,8 +554,9 @@ class Qwen3VLVisualEncoder(BaseVisualEncoder):
         self.temporal_downsample_factor = temporal_downsample
 
         logger.info(
-            "Qwen3VLVisualEncoder: model=%s hidden_dim=%d patch=%d temporal_patch=%d "
+            "%s: model=%s hidden_dim=%d patch=%d temporal_patch=%d "
             "output_dim=%d skip_projection=%s freeze=%s",
+            self.__class__.__name__,
             model_name,
             self._hidden_dim,
             self._patch_size,
@@ -653,7 +658,9 @@ class Qwen3VLVisualEncoder(BaseVisualEncoder):
         model_name: str,
         dtype: torch.dtype,
         local_files_only: bool,
+        checkpoint_path: Optional[str] = None,
     ) -> nn.Module:
+        del checkpoint_path
         try:
             from accelerate import init_empty_weights
             from safetensors import safe_open
@@ -836,6 +843,151 @@ class Qwen3VLVisualEncoder(BaseVisualEncoder):
 
 _ENCODER_REGISTRY["qwen3_vl_vision"] = Qwen3VLVisualEncoder
 _ENCODER_REGISTRY["siglip2_qwen3vl"] = Qwen3VLVisualEncoder
+
+
+# ========================================================================== #
+# Xiaomi Robotics-1 vision tower
+# ========================================================================== #
+
+class XR1VisualEncoder(Qwen3VLVisualEncoder):
+    """Frozen XR-1-tuned Qwen3-VL vision tower with raw 1024-d tokens."""
+
+    _VISUAL_PREFIXES = (
+        "module.model.vlm.model.visual.",
+        "model.vlm.model.visual.",
+        "vlm.model.visual.",
+    )
+    _EXCLUDED_PREFIXES = ("merger.", "deepstack_merger_list.")
+
+    @classmethod
+    def _relative_visual_key(cls, key: str) -> Optional[str]:
+        relative_key = None
+        for prefix in cls._VISUAL_PREFIXES:
+            if key.startswith(prefix):
+                relative_key = key.removeprefix(prefix)
+                break
+        if relative_key is None:
+            return None
+        if relative_key.startswith("merger.norm."):
+            return "final_norm." + relative_key.removeprefix("merger.norm.")
+        if relative_key.startswith(cls._EXCLUDED_PREFIXES):
+            return None
+        return relative_key
+
+    @classmethod
+    def _load_xr1_visual_state_dict(cls, checkpoint_path: Path) -> dict[str, torch.Tensor]:
+        state_dict: dict[str, torch.Tensor] = {}
+
+        if checkpoint_path.is_dir():
+            try:
+                from safetensors import safe_open
+            except Exception as exc:  # pragma: no cover
+                raise ImportError("XR-1 safetensors loading requires `safetensors`.") from exc
+
+            index_path = checkpoint_path / "model.safetensors.index.json"
+            if index_path.is_file():
+                with index_path.open("r", encoding="utf-8") as handle:
+                    weight_map = json.load(handle).get("weight_map", {})
+                filenames = {
+                    filename
+                    for key, filename in weight_map.items()
+                    if cls._relative_visual_key(key) is not None
+                }
+                if not filenames:
+                    raise ValueError(f"No XR-1 visual weights found in {index_path}.")
+                weight_files = [checkpoint_path / name for name in sorted(filenames)]
+            else:
+                single_file = checkpoint_path / "model.safetensors"
+                if not single_file.is_file():
+                    raise FileNotFoundError(
+                        "XR-1 model directory must contain model.safetensors or "
+                        f"model.safetensors.index.json: {checkpoint_path}"
+                    )
+                weight_files = [single_file]
+
+            for weight_file in weight_files:
+                if not weight_file.is_file():
+                    raise FileNotFoundError(f"Missing XR-1 weight shard: {weight_file}")
+                with safe_open(str(weight_file), framework="pt", device="cpu") as handle:
+                    for key in handle.keys():
+                        relative_key = cls._relative_visual_key(key)
+                        if relative_key is not None:
+                            state_dict[relative_key] = handle.get_tensor(key)
+            return state_dict
+
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"XR-1 checkpoint not found: {checkpoint_path}")
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
+        )
+        source_state = checkpoint.get("module", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        if not isinstance(source_state, dict):
+            raise TypeError(
+                "XR-1 checkpoint must be a state dict or contain a `module` state dict."
+            )
+        for key, tensor in source_state.items():
+            relative_key = cls._relative_visual_key(str(key))
+            if relative_key is not None:
+                state_dict[relative_key] = tensor
+        return state_dict
+
+    @classmethod
+    def _load_vision_backbone(
+        cls,
+        model_name: str,
+        dtype: torch.dtype,
+        local_files_only: bool,
+        checkpoint_path: Optional[str] = None,
+    ) -> nn.Module:
+        if checkpoint_path is None:
+            raise ValueError("XR1VisualEncoder requires `checkpoint_path`.")
+
+        try:
+            from accelerate import init_empty_weights
+            from transformers import AutoConfig
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+        except Exception as exc:  # pragma: no cover
+            raise ImportError(
+                "XR-1 visual loading requires transformers>=4.57 and accelerate."
+            ) from exc
+
+        full_config = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
+        )
+        vision_config = getattr(full_config, "vision_config", None)
+        if vision_config is None:
+            raise ValueError(f"{model_name} has no Qwen3-VL `vision_config`.")
+
+        with init_empty_weights():
+            backbone = Qwen3VLVisionModel(vision_config)
+        backbone.final_norm = backbone.merger.norm
+        backbone.merger = nn.Identity()
+        backbone.deepstack_merger_list = nn.ModuleList()
+        backbone.deepstack_visual_indexes = []
+
+        state_dict = cls._load_xr1_visual_state_dict(
+            Path(checkpoint_path).expanduser().resolve()
+        )
+        if not state_dict:
+            raise ValueError(f"No usable XR-1 visual weights found in {checkpoint_path}.")
+
+        incompatible = backbone.load_state_dict(state_dict, strict=True, assign=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise ValueError(
+                "Failed to load XR-1 visual backbone cleanly: "
+                f"missing={incompatible.missing_keys[:8]} "
+                f"unexpected={incompatible.unexpected_keys[:8]}"
+            )
+        return backbone.to(dtype=dtype)
+
+
+_ENCODER_REGISTRY["xr1_vision"] = XR1VisualEncoder
 
 
 # ========================================================================== #
