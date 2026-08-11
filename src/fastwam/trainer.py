@@ -1506,13 +1506,16 @@ class Wan22Trainer:
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+        data_wait_accum = 0.0
 
         while self.global_step < self.max_steps:
             is_first_step = self.global_step == self.run_start_step and self.batch_in_epoch == 0
             try:
                 if is_first_step and self.accelerator.is_main_process:
                     logger.info("Fetching first training batch from dataloader...")
+                data_wait_start = time.perf_counter()
                 sample = next(data_iter)
+                data_wait_accum += time.perf_counter() - data_wait_start
                 self.batch_in_epoch += 1
                 if is_first_step and self.accelerator.is_main_process:
                     logger.info("Fetched first training batch; running first training_loss forward.")
@@ -1641,6 +1644,15 @@ class Wan22Trainer:
                         )
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    data_wait_tensor = torch.tensor(
+                        data_wait_accum,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    ).reshape(1)
+                    global_data_wait = float(
+                        self.accelerator.gather(data_wait_tensor).max().item()
+                    )
+                    data_wait_accum = 0.0
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
@@ -1655,10 +1667,11 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
+                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s data_wait=%.3fs eta=%s" % (
                             current_lr,
                             steps_per_sec,
                             steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            global_data_wait,
                             eta_str,
                         )
                         logger.info(description)
@@ -1669,6 +1682,7 @@ class Wan22Trainer:
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            "performance/data_wait_s": global_data_wait,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value

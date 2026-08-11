@@ -18,6 +18,13 @@ train:
   max_open_parquet_shards: 2
   max_open_video_shards: 6
   video_decode_threads: 2
+  # One worker processes a full batch of nearby clips. Cache one episode's
+  # three camera windows and decode ahead for batch-level reuse.
+  video_frame_cache_entries: 3
+  video_prefetch_frames: 24
+  # Adjacent clips share most video frames after every four start offsets.
+  resized_frame_cache_entries: 3
+  resized_frames_per_entry: 128
   max_retries: 3
   # HFastWAM model configs read these dimensions through data.train.processor.
   processor:

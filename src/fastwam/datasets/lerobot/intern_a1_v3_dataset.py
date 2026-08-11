@@ -94,10 +94,19 @@ class _ParquetShardCache:
 
 
 class _PyAVShardDecoder:
-    def __init__(self, max_open_videos: int, decode_threads: int):
+    def __init__(
+        self,
+        max_open_videos: int,
+        decode_threads: int,
+        max_frame_caches: int,
+        prefetch_frames: int,
+    ):
         self.max_open_videos = max(int(max_open_videos), 1)
         self.decode_threads = max(int(decode_threads), 1)
+        self.max_frame_caches = max(int(max_frame_caches), 0)
+        self.prefetch_frames = max(int(prefetch_frames), 0)
         self._cache: OrderedDict[str, tuple] = OrderedDict()
+        self._frame_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = OrderedDict()
 
     def _open(self, path: Path):
         import av
@@ -119,9 +128,43 @@ class _PyAVShardDecoder:
             old_container.close()
         return value
 
+    @staticmethod
+    def _select_cached_frames(
+        cached_times: np.ndarray,
+        cached_frames: np.ndarray,
+        timestamps: list[float],
+        tolerance: float,
+    ) -> Optional[torch.Tensor]:
+        if cached_times.size == 0:
+            return None
+        query = np.asarray(timestamps, dtype=np.float64)
+        if (
+            query.min() < cached_times[0] - tolerance
+            or query.max() > cached_times[-1] + tolerance
+        ):
+            return None
+        distances = np.abs(query[:, None] - cached_times[None, :])
+        indices = distances.argmin(axis=1)
+        if np.any(distances[np.arange(query.size), indices] > tolerance):
+            return None
+        return torch.from_numpy(cached_frames[indices].copy())
+
     def decode(self, path: Path, timestamps: list[float], fps: float) -> torch.Tensor:
         timestamps = [float(value) for value in timestamps]
         tolerance = 0.5 / float(fps) + 0.002
+        cache_key = str(path)
+        cached_frames = self._frame_cache.pop(cache_key, None)
+        if cached_frames is not None:
+            selected = self._select_cached_frames(
+                cached_times=cached_frames[0],
+                cached_frames=cached_frames[1],
+                timestamps=timestamps,
+                tolerance=tolerance,
+            )
+            self._frame_cache[cache_key] = cached_frames
+            if selected is not None:
+                return selected
+
         last_error = None
         for attempt in range(2):
             try:
@@ -137,7 +180,10 @@ class _PyAVShardDecoder:
 
                 loaded_frames = []
                 loaded_times = []
-                stop_time = max(timestamps) + 2.0 / float(fps)
+                stop_time = (
+                    max(timestamps)
+                    + (self.prefetch_frames + 2) / float(fps)
+                )
                 for frame in container.decode(stream):
                     if frame.pts is None:
                         continue
@@ -152,25 +198,35 @@ class _PyAVShardDecoder:
                     raise RuntimeError(f"No frames decoded from {path}.")
 
                 loaded_times_np = np.asarray(loaded_times, dtype=np.float64)
-                selected = []
-                for timestamp in timestamps:
-                    index = int(np.argmin(np.abs(loaded_times_np - timestamp)))
-                    error = abs(float(loaded_times_np[index]) - timestamp)
-                    if error > tolerance:
-                        raise RuntimeError(
-                            f"Video timestamp error {error:.6f}s exceeds {tolerance:.6f}s "
-                            f"for {path}."
-                        )
-                    selected.append(loaded_frames[index])
-                return torch.from_numpy(np.stack(selected, axis=0))
+                loaded_frames_np = np.stack(loaded_frames, axis=0)
+                selected = self._select_cached_frames(
+                    cached_times=loaded_times_np,
+                    cached_frames=loaded_frames_np,
+                    timestamps=timestamps,
+                    tolerance=tolerance,
+                )
+                if selected is None:
+                    raise RuntimeError(
+                        f"Decoded frames do not cover requested timestamps for {path}."
+                    )
+                if self.max_frame_caches > 0:
+                    self._frame_cache[cache_key] = (
+                        loaded_times_np,
+                        loaded_frames_np,
+                    )
+                    while len(self._frame_cache) > self.max_frame_caches:
+                        self._frame_cache.popitem(last=False)
+                return selected
             except Exception as exc:
                 last_error = exc
                 cached = self._cache.pop(str(path), None)
                 if cached is not None:
                     cached[0].close()
+                self._frame_cache.pop(str(path), None)
         raise RuntimeError(f"Failed to decode {path}: {last_error}") from last_error
 
     def close(self):
+        self._frame_cache.clear()
         while self._cache:
             _, (container, _) = self._cache.popitem(last=False)
             container.close()
@@ -196,6 +252,10 @@ class InternDataA1V3Dataset(Dataset):
         max_open_parquet_shards: int = 2,
         max_open_video_shards: int = 6,
         video_decode_threads: int = 2,
+        video_frame_cache_entries: int = 3,
+        video_prefetch_frames: int = 24,
+        resized_frame_cache_entries: int = 3,
+        resized_frames_per_entry: int = 128,
         max_retries: int = 3,
         processor=None,
     ):
@@ -303,7 +363,15 @@ class InternDataA1V3Dataset(Dataset):
         self._video_decoder = _PyAVShardDecoder(
             max_open_videos=max_open_video_shards,
             decode_threads=video_decode_threads,
+            max_frame_caches=video_frame_cache_entries,
+            prefetch_frames=video_prefetch_frames,
         )
+        self.max_resized_frame_caches = max(int(resized_frame_cache_entries), 0)
+        self.resized_frames_per_entry = max(int(resized_frames_per_entry), 1)
+        self._resized_frame_cache: OrderedDict[
+            tuple[str, int, int],
+            OrderedDict[int, torch.Tensor],
+        ] = OrderedDict()
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -340,12 +408,7 @@ class InternDataA1V3Dataset(Dataset):
                     clip_count = int(self.arrays["length"][episode_row]) - 32
                     if clip_count <= 0:
                         continue
-                    base_start = int(rng.integers(clip_count))
-                    direction = -1 if bool(rng.integers(2)) else 1
-                    for local_index in range(clip_count):
-                        clip_start = (
-                            base_start + direction * local_index
-                        ) % clip_count
+                    for clip_start in range(clip_count):
                         yield self._encode_index(int(episode_row), clip_start)
                         yielded += 1
                         if yielded >= self.samples_per_epoch:
@@ -525,6 +588,7 @@ class InternDataA1V3Dataset(Dataset):
         camera_key: Optional[str],
         dataset_root: Path,
         fps: int,
+        output_size: tuple[int, int],
     ) -> Optional[torch.Tensor]:
         file_index = int(self.arrays[f"{role}_file"][episode_row])
         if camera_key is None or file_index < 0:
@@ -534,12 +598,64 @@ class InternDataA1V3Dataset(Dataset):
         timestamps = (
             from_timestamp + (clip_start + self.video_indices) / float(fps)
         ).tolist()
-        frames = self._video_decoder.decode(
-            self._video_path(dataset_root, camera_key, chunk, file_index),
-            timestamps=timestamps,
-            fps=fps,
+        video_path = self._video_path(
+            dataset_root,
+            camera_key,
+            chunk,
+            file_index,
         )
-        return frames.permute(0, 3, 1, 2).contiguous()
+        frame_indices = [int(round(timestamp * fps)) for timestamp in timestamps]
+        height, width = map(int, output_size)
+        cache_key = (str(video_path), height, width)
+        frame_cache = self._resized_frame_cache.pop(cache_key, None)
+        if frame_cache is None:
+            frame_cache = OrderedDict()
+        self._resized_frame_cache[cache_key] = frame_cache
+        while len(self._resized_frame_cache) > self.max_resized_frame_caches:
+            self._resized_frame_cache.popitem(last=False)
+
+        for frame_index in frame_indices:
+            if frame_index in frame_cache:
+                frame_cache.move_to_end(frame_index)
+        missing_positions = [
+            position
+            for position, frame_index in enumerate(frame_indices)
+            if frame_index not in frame_cache
+        ]
+        if missing_positions:
+            missing_timestamps = [timestamps[position] for position in missing_positions]
+            missing_frames = self._video_decoder.decode(
+                video_path,
+                timestamps=missing_timestamps,
+                fps=fps,
+            ).permute(0, 3, 1, 2).contiguous()
+            missing_frames = transforms_F.resize(
+                missing_frames,
+                size=[height, width],
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            for position, frame in zip(
+                missing_positions,
+                missing_frames,
+                strict=True,
+            ):
+                frame_index = frame_indices[position]
+                frame_cache[frame_index] = frame
+                frame_cache.move_to_end(frame_index)
+            while len(frame_cache) > self.resized_frames_per_entry:
+                frame_cache.popitem(last=False)
+
+        frames = []
+        for frame_index in frame_indices:
+            frame = frame_cache.get(frame_index)
+            if frame is None:
+                raise RuntimeError(
+                    f"Resized frame cache lost required frame {frame_index} for {video_path}."
+                )
+            frame_cache.move_to_end(frame_index)
+            frames.append(frame)
+        return torch.stack(frames, dim=0)
 
     def _load_video(
         self,
@@ -551,41 +667,39 @@ class InternDataA1V3Dataset(Dataset):
         camera_keys = metadata["camera_keys"]
         fps = int(metadata["fps"])
         head = self._decode_camera(
-            episode_row, clip_start, "head", camera_keys["head"], dataset_root, fps
+            episode_row,
+            clip_start,
+            "head",
+            camera_keys["head"],
+            dataset_root,
+            fps,
+            (256, 320),
         )
         left = self._decode_camera(
-            episode_row, clip_start, "left", camera_keys["left"], dataset_root, fps
+            episode_row,
+            clip_start,
+            "left",
+            camera_keys["left"],
+            dataset_root,
+            fps,
+            (128, 160),
         )
         right = self._decode_camera(
-            episode_row, clip_start, "right", camera_keys["right"], dataset_root, fps
+            episode_row,
+            clip_start,
+            "right",
+            camera_keys["right"],
+            dataset_root,
+            fps,
+            (128, 160),
         )
         if head is None:
             raise ValueError("InternData sample has no head camera.")
 
-        head = transforms_F.resize(
-            head,
-            size=[256, 320],
-            interpolation=transforms_F.InterpolationMode.BILINEAR,
-            antialias=True,
-        )
         if left is None:
             left = torch.zeros((9, 3, 128, 160), dtype=torch.uint8)
-        else:
-            left = transforms_F.resize(
-                left,
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )
         if right is None:
             right = torch.zeros((9, 3, 128, 160), dtype=torch.uint8)
-        else:
-            right = transforms_F.resize(
-                right,
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )
         bottom = torch.cat([left, right], dim=-1)
         canvas = torch.cat([head, bottom], dim=-2)
         return (canvas.float() * (2.0 / 255.0) - 1.0).permute(1, 0, 2, 3)
@@ -653,3 +767,6 @@ class InternDataA1V3Dataset(Dataset):
         decoder = getattr(self, "_video_decoder", None)
         if decoder is not None:
             decoder.close()
+        resized_cache = getattr(self, "_resized_frame_cache", None)
+        if resized_cache is not None:
+            resized_cache.clear()
