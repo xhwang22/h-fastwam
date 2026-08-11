@@ -1658,6 +1658,15 @@ class Wan22Trainer:
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()
+                        effective_samples_per_step = (
+                            self.batch_size
+                            * self.accelerator.num_processes
+                            * self.gradient_accumulation_steps
+                        )
+                        samples_per_sec = steps_per_sec * effective_samples_per_step
+                        data_wait_per_micro_step = (
+                            global_data_wait / self.gradient_accumulation_steps
+                        )
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,
                             self.global_step,
@@ -1667,11 +1676,11 @@ class Wan22Trainer:
                         if global_loss_metrics:
                             detail_str = " ".join([f"{k}={v:.4f}" for k, v in sorted(global_loss_metrics.items())])
                             description += detail_str + " "
-                        description += "lr=%.2e speed=%.2f step/s, %.2f samples/s data_wait=%.3fs eta=%s" % (
+                        description += "lr=%.2e speed=%.2f opt_step/s, %.2f samples/s data_wait=%.3fs/micro eta=%s" % (
                             current_lr,
                             steps_per_sec,
-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
-                            global_data_wait,
+                            samples_per_sec,
+                            data_wait_per_micro_step,
                             eta_str,
                         )
                         logger.info(description)
@@ -1681,8 +1690,9 @@ class Wan22Trainer:
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
-                            "performance/data_wait_s": global_data_wait,
+                            "performance/samples_per_sec": samples_per_sec,
+                            "performance/data_wait_s": data_wait_per_micro_step,
+                            "performance/data_wait_per_optimizer_step_s": global_data_wait,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
