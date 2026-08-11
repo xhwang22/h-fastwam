@@ -5,15 +5,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+CURRENT_USER="${USER:-$(id -un)}"
 
 if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
   if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
     FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
   else
-    FASTWAM_EVAL_ENV="/fsx/${USER}/conda-envs/fastwam-eval"
+    FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
   fi
 fi
-CONDA_SH="${CONDA_SH:-/fsx/${USER}/miniforge3/etc/profile.d/conda.sh}"
+CONDA_SH="${CONDA_SH:-/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh}"
 if [[ ! -f "${CONDA_SH}" ]]; then
   echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
   exit 1
@@ -93,9 +94,9 @@ export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 export FASTWAM_IDM_INFERENCE_KV_CACHE=0
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
-export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/fastwam_torch_extensions_${USER}}"
-export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${USER}}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${USER}}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/fastwam_torch_extensions_${CURRENT_USER}}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${CURRENT_USER}}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${CURRENT_USER}}"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
 mkdir -p "${TORCH_EXTENSIONS_DIR}" "${WARP_CACHE_PATH}" "${XDG_CACHE_HOME}"
 

@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+CURRENT_USER="${USER:-$(id -un)}"
 
 MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
@@ -39,10 +40,10 @@ if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
   if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
     FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
   else
-    FASTWAM_EVAL_ENV="/fsx/${USER}/conda-envs/fastwam-eval"
+    FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
   fi
 fi
-CONDA_SH="${CONDA_SH:-/fsx/${USER}/miniforge3/etc/profile.d/conda.sh}"
+CONDA_SH="${CONDA_SH:-/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh}"
 
 # Prepare shared config/policy exactly once before remote managers start.
 MODEL_KIND="${MODEL_KIND}" \
