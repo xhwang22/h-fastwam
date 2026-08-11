@@ -42,5 +42,9 @@ export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA=1
 export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_v2_16gpu_b48}"
+export WANDB="${WANDB:-1}"
+export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-interndata-a1}"
+export WANDB_GROUP="${WANDB_GROUP:-vjepa21-predictor-pretrain}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" "$@"
