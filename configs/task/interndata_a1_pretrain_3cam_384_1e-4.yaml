@@ -14,6 +14,6 @@ log_every: 1
 save_every: 2000
 eval_every: 0
 
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 1
 weight_decay: 1.0e-2
 resume: null

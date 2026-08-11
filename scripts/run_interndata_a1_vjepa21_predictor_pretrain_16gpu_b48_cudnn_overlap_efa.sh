@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# InternData-A1 native LeRobot v3 pretraining: 2 nodes x 8 GPUs, global batch 1536.
+# InternData-A1 native LeRobot v3 pretraining: 2 nodes x 8 GPUs, global batch 768.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,8 +24,8 @@ python scripts/build_interndata_a1_manifest.py \
   --output "${INTERN_A1_MANIFEST_DIR}"
 
 export FASTWAM_EXPECTED_WORLD_SIZE=16
-export GLOBAL_BATCH_SIZE=$(( 48 * FASTWAM_EXPECTED_WORLD_SIZE * 2 ))
-export GRADIENT_ACCUMULATION_STEPS=2
+export GLOBAL_BATCH_SIZE=$(( 48 * FASTWAM_EXPECTED_WORLD_SIZE ))
+export GRADIENT_ACCUMULATION_STEPS=1
 export TASK_CONFIG=interndata_a1_pretrain_3cam_384_1e-4
 export DATA_CONFIG=interndata_a1_v3
 export MODEL_CONFIG="${MODEL_CONFIG:-hfastwam_small_vjepa21_predictor}"
@@ -41,6 +41,6 @@ export LOG_EVERY=1
 export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA=1
-export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_v2_16gpu_b48_acc2}"
+export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_v2_16gpu_b48}"
 
 exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" "$@"
