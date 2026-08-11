@@ -27,9 +27,11 @@ if [[ ! -f "${CONDA_SH}" ]]; then
 fi
 # Always reactivate so a stale nested virtualenv cannot take precedence.
 # shellcheck disable=SC1090
+set +u
 source "${CONDA_SH}"
 conda activate "${FASTWAM_EVAL_ENV}"
 unset VIRTUAL_ENV
+set -u
 hash -r
 
 MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
