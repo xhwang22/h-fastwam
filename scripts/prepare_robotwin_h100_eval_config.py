@@ -30,15 +30,16 @@ def prepare(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Training config not found: {source}")
 
     qwen_dir = _resolved_dir(args.qwen_dir, "Qwen")
-    tokenizer_parent = _resolved_dir(args.tokenizer_parent, "Wan tokenizer parent")
-    tokenizer_json = tokenizer_parent / "google" / "umt5-xxl" / "tokenizer.json"
-    if not tokenizer_json.is_file():
-        raise FileNotFoundError(f"UMT5 tokenizer.json not found: {tokenizer_json}")
-
     cfg = OmegaConf.load(source)
     model_cfg = cfg.model if "model" in cfg else cfg
     target = str(model_cfg.get("_target_", ""))
     encoder_type = str(model_cfg.visual_encoder_config.get("encoder_type", ""))
+    language_backend = str(model_cfg.get("language_backend", "")).lower()
+    if language_backend != "qwen3":
+        raise ValueError(
+            "The T5-free H100 launcher only supports language_backend=qwen3; "
+            f"got {language_backend!r}."
+        )
 
     if args.model == "xr1":
         if target != "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam":
@@ -72,7 +73,7 @@ def prepare(args: argparse.Namespace) -> None:
         raise ValueError(f"Unsupported model kind: {args.model}")
 
     model_cfg.fastwam_checkpoint = None
-    model_cfg.tokenizer_model_id = str(tokenizer_parent)
+    model_cfg.load_text_encoder = False
     model_cfg.language_model_id = str(qwen_dir)
     model_cfg.language_local_files_only = True
 
@@ -82,7 +83,6 @@ def prepare(args: argparse.Namespace) -> None:
     print(f"target: {target}")
     print(f"encoder: {encoder_type}")
     print(f"qwen: {qwen_dir}")
-    print(f"tokenizer: {tokenizer_parent}")
 
 
 def main() -> None:
@@ -91,7 +91,6 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--qwen-dir", required=True)
-    parser.add_argument("--tokenizer-parent", required=True)
     parser.add_argument("--xr1-checkpoint")
     parser.add_argument("--vjepa-checkpoint")
     parser.add_argument("--vjepa-repo")

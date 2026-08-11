@@ -75,22 +75,17 @@ if [[ ! -f "${QWEN_DIR}/config.json" ]]; then
   echo "[h100-eval] ERROR: complete Qwen3-VL-2B snapshot not found: ${QWEN_DIR}" >&2
   exit 1
 fi
+python - <<'PY'
+from packaging.version import Version
+import transformers
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
-if [[ -z "${TOKENIZER_PARENT:-}" ]]; then
-  DIRECT_TOKENIZER_PARENT="${REPO_ROOT}/checkpoints/Wan-AI/Wan2.1-T2V-1.3B"
-  if [[ -f "${DIRECT_TOKENIZER_PARENT}/google/umt5-xxl/tokenizer.json" ]]; then
-    TOKENIZER_PARENT="${DIRECT_TOKENIZER_PARENT}"
-  else
-    TOKENIZER_JSON="$(find -L "${REPO_ROOT}/checkpoints" -type f \
-      -path '*/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer.json' \
-      -print -quit 2>/dev/null || true)"
-    TOKENIZER_PARENT="${TOKENIZER_JSON%/google/umt5-xxl/tokenizer.json}"
-  fi
-fi
-if [[ -z "${TOKENIZER_PARENT}" || ! -f "${TOKENIZER_PARENT}/google/umt5-xxl/tokenizer.json" ]]; then
-  echo "[h100-eval] ERROR: Wan UMT5 tokenizer not found." >&2
-  exit 1
-fi
+if Version(transformers.__version__) < Version("4.57.0"):
+    raise RuntimeError(
+        f"transformers>=4.57.0 is required, found {transformers.__version__}"
+    )
+print(f"[h100-eval] transformers={transformers.__version__} Qwen3-VL=OK")
+PY
 
 EVAL_CONFIG_DIR="${EVAL_CONFIG_DIR:-${REPO_ROOT}/checkpoints/h100_eval_configs}"
 mkdir -p "${EVAL_CONFIG_DIR}"
@@ -101,7 +96,6 @@ PREPARE_ARGS=(
   --input "${TRAIN_CONFIG}"
   --output "${EVAL_CONFIG}"
   --qwen-dir "${QWEN_DIR}"
-  --tokenizer-parent "${TOKENIZER_PARENT}"
 )
 if [[ "${MODEL_KIND}" == "xr1" ]]; then
   XR1_CHECKPOINT="${XR1_CHECKPOINT:-${REPO_ROOT}/checkpoints/XiaomiRobotics/Xiaomi-Robotics-1-5B}"

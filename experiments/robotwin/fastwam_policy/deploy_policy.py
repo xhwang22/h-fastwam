@@ -157,7 +157,11 @@ class WorldActionRobotWinPolicy:
         num_video_frames: int,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
-        model_cfg_copy.load_text_encoder = True
+        # HFastWAM Qwen runs tokenize prompts with the Qwen language expert and
+        # use proprio/dummy cross-attention context. Loading Wan UMT5 here is
+        # redundant and adds a large offline asset/runtime dependency.
+        language_backend = str(model_cfg_copy.get("language_backend", "legacy")).lower()
+        model_cfg_copy.load_text_encoder = language_backend != "qwen3"
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
