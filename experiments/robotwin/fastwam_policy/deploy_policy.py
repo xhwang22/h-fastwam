@@ -13,7 +13,7 @@ from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
+from torchvision.transforms import functional as transforms_F
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -129,10 +129,26 @@ def _resolve_dataset_stats_path(dataset_stats_path: Optional[str]) -> Path:
     return resolved
 
 
-def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
-    pil_image = Image.fromarray(image.astype(np.uint8), mode="RGB")
-    resized = pil_image.resize(size_wh, resample=Image.BILINEAR)
-    return np.asarray(resized, dtype=np.uint8)
+def _training_aligned_camera_tensor(
+    image: np.ndarray,
+    final_size_hw: tuple[int, int],
+) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1)
+    tensor = tensor.to(torch.float32) / 255.0
+    # Match FastWAMProcessor's ToTensor + Resize([240, 320]).
+    tensor = transforms_F.resize(
+        tensor,
+        size=[240, 320],
+        interpolation=transforms_F.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    # Match RobotVideoDataset's fixed RoboTwin canvas construction.
+    return transforms_F.resize(
+        tensor,
+        size=list(final_size_hw),
+        interpolation=transforms_F.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
 
 
 class WorldActionRobotWinPolicy:
@@ -164,7 +180,16 @@ class WorldActionRobotWinPolicy:
         model_cfg_copy.load_text_encoder = language_backend != "qwen3"
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
-        self.model.load_checkpoint(checkpoint_path)
+        model_target = str(model_cfg_copy.get("_target_", ""))
+        visual_encoder_type = str(
+            model_cfg_copy.get("visual_encoder_config", {}).get("encoder_type", "")
+        )
+        strict_checkpoint = (
+            "HFastWAMIDM" in model_target
+            or "HFastWAMFullConditionIDM" in model_target
+            or visual_encoder_type == "xr1_vision"
+        )
+        self.model.load_checkpoint(checkpoint_path, strict=strict_checkpoint)
         self.model = self.model.to(device).eval()
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
@@ -224,18 +249,24 @@ class WorldActionRobotWinPolicy:
 
     def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs_data = observation["observation"]
-        head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
-        left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
-        right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
-        bottom = np.concatenate([left, right], axis=1)
-        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
-
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
+        head = _training_aligned_camera_tensor(
+            obs_data["head_camera"]["rgb"],
+            (256, 320),
+        )
+        left = _training_aligned_camera_tensor(
+            obs_data["left_camera"]["rgb"],
+            (128, 160),
+        )
+        right = _training_aligned_camera_tensor(
+            obs_data["right_camera"]["rgb"],
+            (128, 160),
+        )
+        bottom = torch.cat([left, right], dim=-1)
+        image_tensor = torch.cat([head, bottom], dim=-2).unsqueeze(0).to(
             device=self.model.device,
             dtype=self.model.torch_dtype,
         )
-        image_tensor = image_tensor * (2.0 / 255.0) - 1.0
-        return image_tensor
+        return image_tensor * 2.0 - 1.0
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)

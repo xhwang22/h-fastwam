@@ -34,6 +34,9 @@ EVALUATION:
   timing_enabled: false
   skip_get_obs_within_replan: true
   eval_video_log: true
+  # Training data was recorded at 640x480 before the 240x320 preprocessing
+  # resize. Use the matching live renderer resolution during evaluation.
+  camera_type: Large_D435
 
   # Runtime inputs
   dataset_stats_path: null

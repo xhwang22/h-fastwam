@@ -27,6 +27,21 @@ hash -r
 
 MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
+CAMERA_TYPE="${CAMERA_TYPE:-Large_D435}"
+for override in "$@"; do
+  override_key="${override%%=*}"
+  case "${override_key}" in
+    EVALUATION.task_name|EVALUATION.eval_num_episodes|EVALUATION.eval_video_log|\
+    EVALUATION.render_backend|EVALUATION.num_inference_steps|\
+    EVALUATION.replan_steps|EVALUATION.skip_get_obs_within_replan|\
+    EVALUATION.timing_enabled|MULTIRUN.*)
+      ;;
+    *)
+      echo "[h100-eval] ERROR: unsupported/unsafe override: ${override}" >&2
+      exit 1
+      ;;
+  esac
+done
 RUN_DIR="$(realpath "${RUN_DIR}")"
 TRAIN_CONFIG="${TRAIN_CONFIG:-${RUN_DIR}/config.yaml}"
 ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-${REPO_ROOT}/checkpoints/RoboTwin}"
@@ -73,7 +88,7 @@ export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-auto}"
+export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 # The experimental IDM KV cache changed predictions and must stay disabled.
 export FASTWAM_IDM_INFERENCE_KV_CACHE=0
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
@@ -167,6 +182,22 @@ else
   fi
 fi
 
+if [[ "${CHECK_ALIGNMENT:-1}" == "1" ]]; then
+  ALIGN_ARGS=(
+    --model "${MODEL_KIND}"
+    --train-config "${TRAIN_CONFIG}"
+    --eval-config "${EVAL_CONFIG}"
+    --checkpoint "${CKPT}"
+    --dataset-stats "${STATS}"
+    --repo-root "${REPO_ROOT}"
+    --camera-type "${CAMERA_TYPE}"
+  )
+  if [[ -n "${TRAINING_STATS:-}" ]]; then
+    ALIGN_ARGS+=(--training-stats "${TRAINING_STATS}")
+  fi
+  python scripts/check_robotwin_eval_alignment.py "${ALIGN_ARGS[@]}"
+fi
+
 if [[ "${CHECK_ENV:-1}" == "1" ]]; then
   python scripts/check_robotwin_h100_eval_env.py --robotwin-root "${ROBOTWIN_ROOT}"
 fi
@@ -204,6 +235,7 @@ CMD=(
   EVALUATION.eval_num_episodes="${EVAL_EPISODES}"
   EVALUATION.eval_video_log="${EVAL_VIDEO_LOG}"
   EVALUATION.render_backend="${RENDER_BACKEND}"
+  EVALUATION.camera_type="${CAMERA_TYPE}"
   EVALUATION.num_inference_steps="${NUM_INFERENCE_STEPS}"
   EVALUATION.replan_steps="${REPLAN_STEPS}"
   EVALUATION.skip_get_obs_within_replan=true

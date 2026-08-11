@@ -302,6 +302,7 @@ def main(cfg: DictConfig):
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
     _append_override(overrides, "eval_video_log", cfg.EVALUATION.eval_video_log)
+    _append_override(overrides, "camera_type", cfg.EVALUATION.camera_type)
     _append_override(
         overrides,
         "skip_get_obs_within_replan",

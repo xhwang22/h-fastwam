@@ -202,6 +202,36 @@ def main(usr_args):
     print(f"Patched: {path}")
 
 
+def patch_camera_override(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    marker = "FASTWAM_CAMERA_TYPE_OVERRIDE"
+    if marker in text:
+        print(f"Camera override already patched: {path}")
+        return
+    text = replace_once(
+        text,
+        """    if "eval_video_log" in usr_args:
+        args["eval_video_log"] = parse_bool(usr_args["eval_video_log"])
+
+    args['task_name'] = task_name
+""",
+        """    if "eval_video_log" in usr_args:
+        args["eval_video_log"] = parse_bool(usr_args["eval_video_log"])
+
+    # FASTWAM_CAMERA_TYPE_OVERRIDE: match the resolution used by training data.
+    camera_type = usr_args.get("camera_type")
+    if camera_type is not None and str(camera_type).strip() != "":
+        args["camera"]["head_camera_type"] = str(camera_type)
+        args["camera"]["wrist_camera_type"] = str(camera_type)
+
+    args['task_name'] = task_name
+""",
+        "camera type override",
+    )
+    path.write_text(text, encoding="utf-8")
+    print(f"Patched camera override: {path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Patch an upstream RoboTwin checkout for FastWAM evaluation."
@@ -217,6 +247,7 @@ def main() -> None:
     if not target.is_file():
         raise FileNotFoundError(f"RoboTwin eval policy not found: {target}")
     patch_eval_policy(target)
+    patch_camera_override(target)
 
 
 if __name__ == "__main__":

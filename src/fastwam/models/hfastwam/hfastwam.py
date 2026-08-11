@@ -2644,24 +2644,35 @@ class HFastWAM(nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path: str, optimizer=None):
+    def load_checkpoint(self, path: str, optimizer=None, strict: bool = False):
         payload = torch.load(path, map_location="cpu", weights_only=False)
 
-        def _log(name, missing, unexpected):
+        def _validate(name, missing, unexpected):
             logger.info(
                 "Loaded %s (missing=%d, unexpected=%d).",
                 name, len(missing), len(unexpected),
             )
+            if strict and (missing or unexpected):
+                raise ValueError(
+                    f"Strict checkpoint load failed for {name}: "
+                    f"missing={missing[:20]}, unexpected={unexpected[:20]}"
+                )
 
         if "language_expert" in payload:
-            _log("language_expert", *self.language_expert.load_state_dict(
+            _validate("language_expert", *self.language_expert.load_state_dict(
                 payload["language_expert"], strict=False,
             ))
+        elif strict:
+            raise ValueError(f"Strict checkpoint is missing `language_expert`: {path}")
         if "mot" in payload:
-            _log("mot", *self.mot.load_state_dict(payload["mot"], strict=False))
+            _validate("mot", *self.mot.load_state_dict(payload["mot"], strict=False))
         elif "dit" in payload:
+            if strict:
+                raise ValueError(
+                    f"Strict HFastWAM checkpoint requires `mot`, found legacy `dit`: {path}"
+                )
             logger.warning("Legacy ckpt: loading 'dit' into video_expert only.")
-            _log("video_expert (legacy dit)", *self.video_expert.load_state_dict(
+            _validate("video_expert (legacy dit)", *self.video_expert.load_state_dict(
                 payload["dit"], strict=False,
             ))
         else:
@@ -2669,14 +2680,18 @@ class HFastWAM(nn.Module):
         if self.proprio_encoder is not None:
             if "proprio_encoder" in payload:
                 self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+            elif strict:
+                raise ValueError(f"Strict checkpoint is missing `proprio_encoder`: {path}")
             else:
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
         if self.use_visual_encoder and "visual_encoder" in payload:
-            _log("visual_encoder", *self.visual_encoder.load_state_dict(
+            _validate("visual_encoder", *self.visual_encoder.load_state_dict(
                 payload["visual_encoder"], strict=False,
             ))
+        elif strict and self.use_visual_encoder:
+            raise ValueError(f"Strict checkpoint is missing `visual_encoder`: {path}")
         if "training_phase" in payload:
             self._training_phase = payload["training_phase"]
         if optimizer is not None and "optimizer" in payload:
