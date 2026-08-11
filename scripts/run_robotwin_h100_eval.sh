@@ -6,6 +6,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
+  if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
+    FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
+  else
+    FASTWAM_EVAL_ENV="/fsx/${USER}/conda-envs/fastwam-eval"
+  fi
+fi
+CONDA_SH="${CONDA_SH:-/fsx/${USER}/miniforge3/etc/profile.d/conda.sh}"
+if [[ ! -f "${CONDA_SH}" ]]; then
+  echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
+  exit 1
+fi
+# Always reactivate so a stale nested virtualenv cannot take precedence.
+# shellcheck disable=SC1090
+source "${CONDA_SH}"
+conda activate "${FASTWAM_EVAL_ENV}"
+unset VIRTUAL_ENV
+hash -r
+
 MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
 RUN_DIR="$(realpath "${RUN_DIR}")"
@@ -59,6 +78,11 @@ export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-auto}"
 export FASTWAM_IDM_INFERENCE_KV_CACHE=0
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/fastwam_torch_extensions_${USER}}"
+export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${USER}}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${USER}}"
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+mkdir -p "${TORCH_EXTENSIONS_DIR}" "${WARP_CACHE_PATH}" "${XDG_CACHE_HOME}"
 
 if [[ -z "${QWEN_DIR:-}" ]]; then
   DIRECT_QWEN_DIR="${REPO_ROOT}/checkpoints/Qwen/Qwen3-VL-2B-Instruct"
@@ -75,6 +99,7 @@ if [[ ! -f "${QWEN_DIR}/config.json" ]]; then
   echo "[h100-eval] ERROR: complete Qwen3-VL-2B snapshot not found: ${QWEN_DIR}" >&2
   exit 1
 fi
+if [[ "${SKIP_MODEL_PREFLIGHT:-0}" != "1" ]]; then
 python - <<'PY'
 from packaging.version import Version
 import transformers
@@ -86,6 +111,7 @@ if Version(transformers.__version__) < Version("4.57.0"):
     )
 print(f"[h100-eval] transformers={transformers.__version__} Qwen3-VL=OK")
 PY
+fi
 
 EVAL_CONFIG_DIR="${EVAL_CONFIG_DIR:-${REPO_ROOT}/checkpoints/h100_eval_configs}"
 mkdir -p "${EVAL_CONFIG_DIR}"
@@ -114,25 +140,36 @@ else
   exit 1
 fi
 
-python scripts/prepare_robotwin_h100_eval_config.py "${PREPARE_ARGS[@]}"
+if [[ "${SKIP_EVAL_PREPARE:-0}" != "1" ]]; then
+  python scripts/prepare_robotwin_h100_eval_config.py "${PREPARE_ARGS[@]}"
 
-EXPECTED_POLICY="${REPO_ROOT}/experiments/robotwin/fastwam_policy"
-POLICY_LINK="${ROBOTWIN_ROOT}/policy/fastwam_policy"
-if [[ -L "${POLICY_LINK}" ]]; then
-  CURRENT_POLICY="$(realpath "${POLICY_LINK}")"
-  if [[ "${CURRENT_POLICY}" != "$(realpath "${EXPECTED_POLICY}")" ]]; then
-    echo "[h100-eval] ERROR: policy symlink conflict:" >&2
-    echo "  current:  ${CURRENT_POLICY}" >&2
-    echo "  expected: ${EXPECTED_POLICY}" >&2
+  EXPECTED_POLICY="${REPO_ROOT}/experiments/robotwin/fastwam_policy"
+  POLICY_LINK="${ROBOTWIN_ROOT}/policy/fastwam_policy"
+  if [[ -L "${POLICY_LINK}" ]]; then
+    CURRENT_POLICY="$(realpath "${POLICY_LINK}")"
+    if [[ "${CURRENT_POLICY}" != "$(realpath "${EXPECTED_POLICY}")" ]]; then
+      echo "[h100-eval] ERROR: policy symlink conflict:" >&2
+      echo "  current:  ${CURRENT_POLICY}" >&2
+      echo "  expected: ${EXPECTED_POLICY}" >&2
+      exit 1
+    fi
+  elif [[ -e "${POLICY_LINK}" ]]; then
+    echo "[h100-eval] ERROR: policy path exists and is not a symlink: ${POLICY_LINK}" >&2
+    exit 1
+  else
+    ln -s "${EXPECTED_POLICY}" "${POLICY_LINK}"
+  fi
+  python scripts/patch_robotwin_eval_compat.py --robotwin-root "${ROBOTWIN_ROOT}"
+else
+  if [[ ! -f "${EVAL_CONFIG}" ]]; then
+    echo "[h100-eval] ERROR: prepared eval config not found: ${EVAL_CONFIG}" >&2
     exit 1
   fi
-elif [[ -e "${POLICY_LINK}" ]]; then
-  echo "[h100-eval] ERROR: policy path exists and is not a symlink: ${POLICY_LINK}" >&2
-  exit 1
-else
-  ln -s "${EXPECTED_POLICY}" "${POLICY_LINK}"
 fi
-python scripts/patch_robotwin_eval_compat.py --robotwin-root "${ROBOTWIN_ROOT}"
+
+if [[ "${CHECK_ENV:-1}" == "1" ]]; then
+  python scripts/check_robotwin_h100_eval_env.py --robotwin-root "${ROBOTWIN_ROOT}"
+fi
 
 MODE="${MODE:-smoke}"
 if [[ "${MODE}" == "smoke" ]]; then
