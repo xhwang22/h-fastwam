@@ -14,7 +14,13 @@ if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
     FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
   fi
 fi
-CONDA_SH="${CONDA_SH:-/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh}"
+if [[ -z "${CONDA_SH:-}" ]]; then
+  if [[ -f "/fsx/miniforge3/etc/profile.d/conda.sh" ]]; then
+    CONDA_SH="/fsx/miniforge3/etc/profile.d/conda.sh"
+  else
+    CONDA_SH="/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh"
+  fi
+fi
 if [[ ! -f "${CONDA_SH}" ]]; then
   echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
   exit 1

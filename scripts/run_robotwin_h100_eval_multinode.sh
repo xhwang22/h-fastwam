@@ -43,7 +43,13 @@ if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
     FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
   fi
 fi
-CONDA_SH="${CONDA_SH:-/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh}"
+if [[ -z "${CONDA_SH:-}" ]]; then
+  if [[ -f "/fsx/miniforge3/etc/profile.d/conda.sh" ]]; then
+    CONDA_SH="/fsx/miniforge3/etc/profile.d/conda.sh"
+  else
+    CONDA_SH="/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh"
+  fi
+fi
 
 # Prepare shared config/policy exactly once before remote managers start.
 MODEL_KIND="${MODEL_KIND}" \
