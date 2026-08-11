@@ -33,7 +33,7 @@ fi
 
 MODE="${MODE:-full}"
 CKPT_NAME="$(basename "${CKPT}" .pt)"
-OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_${NODE_COUNT}node}"
+OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2_${NODE_COUNT}node}"
 EVAL_CONFIG="${EVAL_CONFIG:-${REPO_ROOT}/checkpoints/h100_eval_configs/${MODEL_KIND}_$(basename "${RUN_DIR}").yaml}"
 if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
   if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then

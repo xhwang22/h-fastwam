@@ -223,7 +223,7 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 REPLAN_STEPS="${REPLAN_STEPS:-24}"
 RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 CKPT_NAME="$(basename "${CKPT}" .pt)"
-OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}}"
+OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2}"
 
 CMD=(
   python experiments/robotwin/run_robotwin_manager.py
