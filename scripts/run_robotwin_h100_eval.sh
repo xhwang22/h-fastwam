@@ -159,6 +159,7 @@ MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-1}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 REPLAN_STEPS="${REPLAN_STEPS:-24}"
+RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 CKPT_NAME="$(basename "${CKPT}" .pt)"
 OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}}"
 
@@ -171,7 +172,7 @@ CMD=(
   EVALUATION.robotwin_root="${ROBOTWIN_ROOT}"
   EVALUATION.eval_num_episodes="${EVAL_EPISODES}"
   EVALUATION.eval_video_log="${EVAL_VIDEO_LOG}"
-  EVALUATION.render_backend=gpu
+  EVALUATION.render_backend="${RENDER_BACKEND}"
   EVALUATION.num_inference_steps="${NUM_INFERENCE_STEPS}"
   EVALUATION.replan_steps="${REPLAN_STEPS}"
   EVALUATION.skip_get_obs_within_replan=true
