@@ -23,9 +23,9 @@ python scripts/build_interndata_a1_manifest.py \
   --root "${INTERN_A1_ROOT}" \
   --output "${INTERN_A1_MANIFEST_DIR}"
 
-export FASTWAM_EXPECTED_WORLD_SIZE=16
-export GLOBAL_BATCH_SIZE=$(( 48 * FASTWAM_EXPECTED_WORLD_SIZE ))
-export GRADIENT_ACCUMULATION_STEPS=1
+export FASTWAM_EXPECTED_WORLD_SIZE="${FASTWAM_EXPECTED_WORLD_SIZE:-16}"
+export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$(( 48 * FASTWAM_EXPECTED_WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS ))}"
 export TASK_CONFIG=interndata_a1_pretrain_3cam_384_1e-4
 export DATA_CONFIG=interndata_a1_v3
 export MODEL_CONFIG="${MODEL_CONFIG:-hfastwam_small_vjepa21_predictor}"
@@ -40,7 +40,7 @@ export SAVE_EVERY="${SAVE_EVERY:-2000}"
 export LOG_EVERY=1
 export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
-export FASTWAM_USE_EFA=1
+export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-1}"
 export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_v3_16gpu_b48}"
 export WANDB="${WANDB:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-interndata-a1}"

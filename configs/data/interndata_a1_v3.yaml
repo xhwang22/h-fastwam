@@ -5,7 +5,8 @@ train:
   # null enumerates each valid clip at most once, dropping only the final
   # incomplete distributed batch selected by epoch_size_multiple.
   samples_per_epoch: null
-  # 16 ranks x per-rank batch 48; avoids Accelerate duplicating a tail batch.
+  # Effective global batch 768 for both 16x48x1 and 8x48x2; avoids a partial
+  # accumulation step and Accelerate duplicating the distributed tail batch.
   epoch_size_multiple: 768
   is_training_set: true
   val_set_proportion: 0.01
