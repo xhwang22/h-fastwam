@@ -48,11 +48,14 @@ MAX_SAMPLES="${MAX_SAMPLES:-10000}"
 STATS_BATCH_SIZE="${STATS_BATCH_SIZE:-2}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
 OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_global_stats.pt}"
+STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
 
 exec torchrun \
-  --standalone \
   --nnodes=1 \
+  --node_rank=0 \
   --nproc_per_node="${NPROC_PER_NODE}" \
+  --master_addr=127.0.0.1 \
+  --master_port="${STATS_MASTER_PORT}" \
   scripts/precompute_vjepa21_stats.py \
   --data-config interndata_a1_v3 \
   --output-path "${OUTPUT_PATH}" \

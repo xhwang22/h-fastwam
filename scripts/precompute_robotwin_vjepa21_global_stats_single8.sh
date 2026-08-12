@@ -44,6 +44,7 @@ MAX_SAMPLES="${MAX_SAMPLES:-10000}"
 STATS_BATCH_SIZE="${STATS_BATCH_SIZE:-2}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
 OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"
+STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
 
 DATA_OVERRIDE_ARGS=()
 for override in "${ROBOTWIN_DATA_OVERRIDES[@]}"; do
@@ -52,9 +53,11 @@ done
 DATA_OVERRIDE_ARGS+=(--data-override "data.train.num_segments=1")
 
 exec torchrun \
-  --standalone \
   --nnodes=1 \
+  --node_rank=0 \
   --nproc_per_node="${NPROC_PER_NODE}" \
+  --master_addr=127.0.0.1 \
+  --master_port="${STATS_MASTER_PORT}" \
   scripts/precompute_vjepa21_stats.py \
   --data-config "${ROBOTWIN_DATA_CONFIG}" \
   --output-path "${OUTPUT_PATH}" \
