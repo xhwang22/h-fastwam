@@ -4,14 +4,33 @@ import torch
 class WanContinuousFlowMatchScheduler:
     """Continuous-time Flow-Matching scheduler with shift-based sampling."""
 
-    def __init__(self, num_train_timesteps: int = 1000, shift: float = 5.0, eps: float = 1e-10):
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+        shift: float = 5.0,
+        eps: float = 1e-10,
+        sampling_distribution: str = "shifted_uniform",
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+    ):
         if num_train_timesteps <= 0:
             raise ValueError(f"`num_train_timesteps` must be positive, got {num_train_timesteps}")
         if shift <= 0:
             raise ValueError(f"`shift` must be positive, got {shift}")
+        sampling_distribution = str(sampling_distribution).strip().lower().replace("-", "_")
+        if sampling_distribution not in {"shifted_uniform", "logit_normal"}:
+            raise ValueError(
+                "`sampling_distribution` must be 'shifted_uniform' or "
+                f"'logit_normal', got {sampling_distribution!r}."
+            )
+        if logit_std <= 0:
+            raise ValueError(f"`logit_std` must be positive, got {logit_std}")
         self.num_train_timesteps = int(num_train_timesteps)
         self.shift = float(shift)
         self.eps = float(eps)
+        self.sampling_distribution = sampling_distribution
+        self.logit_mean = float(logit_mean)
+        self.logit_std = float(logit_std)
         self._y_min, self._weight_norm_const = self._precompute_training_weight_stats()
 
     @staticmethod
@@ -20,10 +39,22 @@ class WanContinuousFlowMatchScheduler:
 
     def _precompute_training_weight_stats(self) -> tuple[float, float]:
         steps = self.num_train_timesteps
-        u_grid = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)[:-1]
+        if self.sampling_distribution == "shifted_uniform":
+            # Preserve the historical baseline exactly.
+            u_grid = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)[:-1]
+        else:
+            probabilities = (
+                torch.arange(steps, dtype=torch.float64) + 0.5
+            ) / float(steps)
+            standard_normal = (
+                torch.erfinv(2.0 * probabilities - 1.0) * (2.0 ** 0.5)
+            )
+            u_grid = torch.sigmoid(
+                self.logit_mean + self.logit_std * standard_normal
+            )
         t_grid = self._phi(u_grid, self.shift) * float(steps)
         y_grid = torch.exp(-2.0 * ((t_grid - (steps / 2.0)) / steps) ** 2)
-        y_min = float(y_grid.min().item())
+        y_min = float(torch.exp(torch.tensor(-0.5, dtype=torch.float64)).item())
         y_shifted_grid = y_grid - y_min
         norm_const = float(y_shifted_grid.mean().item())
         return y_min, norm_const
@@ -31,7 +62,12 @@ class WanContinuousFlowMatchScheduler:
     def sample_training_t(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if batch_size <= 0:
             raise ValueError(f"`batch_size` must be positive, got {batch_size}")
-        u = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        if self.sampling_distribution == "shifted_uniform":
+            u = torch.rand((batch_size,), device=device, dtype=torch.float32)
+        else:
+            logits = torch.randn((batch_size,), device=device, dtype=torch.float32)
+            logits = logits * self.logit_std + self.logit_mean
+            u = torch.sigmoid(logits)
         sigma = self._phi(u, self.shift)
         timestep = sigma * float(self.num_train_timesteps)
         return timestep.to(dtype=dtype)

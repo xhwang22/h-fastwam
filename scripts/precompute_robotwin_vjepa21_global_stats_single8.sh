@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Compute fixed V-JEPA 2.1 statistics on the RoboTwin training distribution.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
+if [[ -f "${CONDA_ACTIVATE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONDA_ACTIVATE}" fastwam
+fi
+
+# shellcheck source=_robotwin_data_source.sh
+source "${SCRIPT_DIR}/_robotwin_data_source.sh"
+ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
+fastwam_select_robotwin_data_source
+
+export TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/checkpoints/torch_hub}"
+VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
+VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
+if [[ ! -f "${VJEPA21_CHECKPOINT}" ]]; then
+  echo "[robotwin-vjepa21-stats] ERROR: checkpoint not found: ${VJEPA21_CHECKPOINT}" >&2
+  exit 1
+fi
+if [[ ! -f "${VJEPA21_REPO}/app/vjepa_2_1/models/vision_transformer.py" ]]; then
+  echo "[robotwin-vjepa21-stats] ERROR: source tree not found: ${VJEPA21_REPO}" >&2
+  exit 1
+fi
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+MAX_SAMPLES="${MAX_SAMPLES:-10000}"
+STATS_BATCH_SIZE="${STATS_BATCH_SIZE:-2}"
+TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
+OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"
+
+DATA_OVERRIDE_ARGS=()
+for override in "${ROBOTWIN_DATA_OVERRIDES[@]}"; do
+  DATA_OVERRIDE_ARGS+=(--data-override "${override}")
+done
+DATA_OVERRIDE_ARGS+=(--data-override "data.train.num_segments=1")
+
+exec torchrun \
+  --standalone \
+  --nproc_per_node="${NPROC_PER_NODE}" \
+  scripts/precompute_vjepa21_stats.py \
+  --data-config "${ROBOTWIN_DATA_CONFIG}" \
+  --output-path "${OUTPUT_PATH}" \
+  --checkpoint-path "${VJEPA21_CHECKPOINT}" \
+  --repo-path "${VJEPA21_REPO}" \
+  --model-name vjepa2_1_vit_gigantic_384 \
+  --max-samples "${MAX_SAMPLES}" \
+  --batch-size "${STATS_BATCH_SIZE}" \
+  --temporal-downsample "${TEMPORAL_DOWNSAMPLE}" \
+  --causal-tubelet-encoding \
+  "${DATA_OVERRIDE_ARGS[@]}" \
+  "$@"

@@ -113,9 +113,15 @@ class HFastWAM(nn.Module):
         video_train_shift: float = 5.0,
         video_infer_shift: float = 5.0,
         video_num_train_timesteps: int = 1000,
+        video_train_sampling_distribution: str = "shifted_uniform",
+        video_train_logit_mean: float = 0.0,
+        video_train_logit_std: float = 1.0,
         action_train_shift: float = 5.0,
         action_infer_shift: float = 5.0,
         action_num_train_timesteps: int = 1000,
+        action_train_sampling_distribution: str = "shifted_uniform",
+        action_train_logit_mean: float = 0.0,
+        action_train_logit_std: float = 1.0,
         # Loss weights
         loss_lambda_language: float = 1.0,
         loss_lambda_video: float = 1.0,
@@ -184,7 +190,11 @@ class HFastWAM(nn.Module):
         # and avoid spurious timestep sampling.
         if not self.is_jepa_predictor:
             self.train_video_scheduler = WanContinuousFlowMatchScheduler(
-                num_train_timesteps=video_num_train_timesteps, shift=video_train_shift,
+                num_train_timesteps=video_num_train_timesteps,
+                shift=video_train_shift,
+                sampling_distribution=video_train_sampling_distribution,
+                logit_mean=video_train_logit_mean,
+                logit_std=video_train_logit_std,
             )
             self.infer_video_scheduler = WanContinuousFlowMatchScheduler(
                 num_train_timesteps=video_num_train_timesteps, shift=video_infer_shift,
@@ -193,7 +203,11 @@ class HFastWAM(nn.Module):
             self.train_video_scheduler = None
             self.infer_video_scheduler = None
         self.train_action_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=action_num_train_timesteps, shift=action_train_shift,
+            num_train_timesteps=action_num_train_timesteps,
+            shift=action_train_shift,
+            sampling_distribution=action_train_sampling_distribution,
+            logit_mean=action_train_logit_mean,
+            logit_std=action_train_logit_std,
         )
         self.infer_action_scheduler = WanContinuousFlowMatchScheduler(
             num_train_timesteps=action_num_train_timesteps, shift=action_infer_shift,
@@ -236,6 +250,18 @@ class HFastWAM(nn.Module):
             list(self.mot.expert_order),
             self.is_jepa_predictor,
             self.video_loss_type,
+        )
+        logger.info(
+            "Training timestep sampling: video=%s shift=%.4g logit=(%.4g, %.4g), "
+            "action=%s shift=%.4g logit=(%.4g, %.4g)",
+            "none" if self.train_video_scheduler is None else self.train_video_scheduler.sampling_distribution,
+            video_train_shift,
+            video_train_logit_mean,
+            video_train_logit_std,
+            self.train_action_scheduler.sampling_distribution,
+            action_train_shift,
+            action_train_logit_mean,
+            action_train_logit_std,
         )
 
     # ------------------------------------------------------------------ #
@@ -2983,9 +3009,19 @@ class HFastWAM(nn.Module):
             video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
             video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
             video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+            video_train_sampling_distribution=str(
+                video_scheduler.get("sampling_distribution", "shifted_uniform")
+            ),
+            video_train_logit_mean=float(video_scheduler.get("logit_mean", 0.0)),
+            video_train_logit_std=float(video_scheduler.get("logit_std", 1.0)),
             action_train_shift=float(action_scheduler.get("train_shift", 5.0)),
             action_infer_shift=float(action_scheduler.get("infer_shift", 5.0)),
             action_num_train_timesteps=int(action_scheduler.get("num_train_timesteps", 1000)),
+            action_train_sampling_distribution=str(
+                action_scheduler.get("sampling_distribution", "shifted_uniform")
+            ),
+            action_train_logit_mean=float(action_scheduler.get("logit_mean", 0.0)),
+            action_train_logit_std=float(action_scheduler.get("logit_std", 1.0)),
             loss_lambda_language=float(loss_config.get("lambda_language", 1.0)),
             loss_lambda_video=float(loss_config.get("lambda_video", 1.0)),
             loss_lambda_action=float(loss_config.get("lambda_action", 1.0)),

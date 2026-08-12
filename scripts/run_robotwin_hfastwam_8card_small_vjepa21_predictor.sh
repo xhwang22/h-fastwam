@@ -177,6 +177,17 @@ if [[ -n "${STANDARDISE_OUTPUT:-}" ]]; then
   )
 fi
 
+NORMALISE_STATS_OVERRIDES=()
+if [[ -n "${VJEPA21_NORMALISE_STATS_PATH:-}" ]]; then
+  if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
+    echo "[8card-small-vjepa-predictor] ERROR: VJEPA21_NORMALISE_STATS_PATH not found: ${VJEPA21_NORMALISE_STATS_PATH}" >&2
+    exit 1
+  fi
+  NORMALISE_STATS_OVERRIDES=(
+    "model.visual_encoder_config.normalise_stats_path=${VJEPA21_NORMALISE_STATS_PATH}"
+  )
+fi
+
 GAP_OVERRIDES=()
 if [[ "${FRAME_GAP:-}" == "3" ]]; then
   GAP_OVERRIDES=(
@@ -244,6 +255,7 @@ CMD=(
       "${PRETRAIN_OVERRIDES[@]}"
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
+      "${NORMALISE_STATS_OVERRIDES[@]}"
       "${GAP_OVERRIDES[@]}"
       "${TEMPORAL_OVERRIDES[@]}"
       "${VIDEO_LATENT_CACHE_OVERRIDES[@]}"

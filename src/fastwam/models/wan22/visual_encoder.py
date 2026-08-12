@@ -272,6 +272,128 @@ class BaseVisualEncoder(ABC, nn.Module):
         var = latents.var(dim=(3, 4), keepdim=True, unbiased=False)
         return (latents - mean) / (var.sqrt() + eps)
 
+    def _configure_fixed_output_normalisation(
+        self,
+        normalise_stats_path: Optional[str],
+        num_channels: int,
+        min_std: float = 1e-6,
+    ) -> None:
+        self._has_fixed_stats = False
+        self.normalise_stats_path = normalise_stats_path
+        if normalise_stats_path is None:
+            return
+
+        stats_path = Path(normalise_stats_path).expanduser().resolve()
+        if not stats_path.is_file():
+            raise FileNotFoundError(
+                f"Visual encoder normalisation stats not found: {stats_path}"
+            )
+        stats = torch.load(stats_path, map_location="cpu", weights_only=False)
+        if not isinstance(stats, dict) or "mean" not in stats or "std" not in stats:
+            raise ValueError(
+                f"Visual encoder stats must contain `mean` and `std`: {stats_path}"
+            )
+        expected_metadata = {
+            "model_name": getattr(self, "model_name", None),
+            "temporal_downsample": getattr(
+                self, "temporal_downsample_factor", None
+            ),
+            "causal_tubelet_encoding": bool(
+                getattr(self, "causal_tubelet_encoding", False)
+            ),
+            "causal_prefix_encoding": bool(
+                getattr(self, "causal_prefix_encoding", False)
+            ),
+            "skip_projection": bool(getattr(self, "skip_projection", False)),
+        }
+        for key, expected in expected_metadata.items():
+            if key in stats and expected is not None and stats[key] != expected:
+                raise ValueError(
+                    f"Visual encoder stats `{key}` mismatch: "
+                    f"file={stats[key]!r}, model={expected!r}, path={stats_path}."
+                )
+        mean = torch.as_tensor(stats["mean"], dtype=torch.float32).reshape(-1)
+        std = torch.as_tensor(stats["std"], dtype=torch.float32).reshape(-1)
+        if mean.numel() != num_channels or std.numel() != num_channels:
+            raise ValueError(
+                "Visual encoder stats channel mismatch: "
+                f"expected {num_channels}, mean={mean.numel()}, std={std.numel()}."
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError(f"Visual encoder stats contain NaN/Inf: {stats_path}")
+        if torch.any(std <= 0):
+            raise ValueError(f"Visual encoder stats contain non-positive std: {stats_path}")
+
+        self.register_buffer("_norm_mean", mean.view(1, -1, 1, 1, 1))
+        self.register_buffer(
+            "_norm_std",
+            std.clamp_min(float(min_std)).view(1, -1, 1, 1, 1),
+        )
+        self._has_fixed_stats = True
+        logger.info(
+            "%s: loaded fixed output normalisation from %s "
+            "(channels=%d, mean=[%.4f, %.4f], std=[%.4f, %.4f])",
+            self.__class__.__name__,
+            stats_path,
+            num_channels,
+            mean.min().item(),
+            mean.max().item(),
+            std.min().item(),
+            std.max().item(),
+        )
+
+    def _normalise_encoder_output(self, latents: torch.Tensor) -> torch.Tensor:
+        if bool(getattr(self, "_has_fixed_stats", False)):
+            mean = self._norm_mean.to(device=latents.device, dtype=torch.float32)
+            std = self._norm_std.to(device=latents.device, dtype=torch.float32)
+            return ((latents.float() - mean) / std).to(dtype=latents.dtype)
+        if self.standardise_output:
+            return self._standardise_latents(latents)
+        return latents
+
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        if bool(getattr(self, "_has_fixed_stats", False)):
+            self._buffers["_norm_mean"] = self._norm_mean.float()
+            self._buffers["_norm_std"] = self._norm_std.float()
+        return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        mean_key = prefix + "_norm_mean"
+        std_key = prefix + "_norm_std"
+        if (
+            mean_key in state_dict
+            and std_key in state_dict
+            and not hasattr(self, "_norm_mean")
+            and not hasattr(self, "_norm_std")
+        ):
+            self.register_buffer("_norm_mean", torch.empty_like(state_dict[mean_key]))
+            self.register_buffer("_norm_std", torch.empty_like(state_dict[std_key]))
+            self._has_fixed_stats = True
+            self.normalise_stats_path = "<checkpoint>"
+            logger.info(
+                "%s: restored fixed output normalisation buffers from checkpoint.",
+                self.__class__.__name__,
+            )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     # ---- train/eval override ---------------------------------------------- #
     def train(self, mode: bool = True):
         super().train(mode)
@@ -1040,6 +1162,7 @@ class VJEPA2Encoder(BaseVisualEncoder):
         skip_projection: bool = False,
         causal_tubelet_encoding: bool = False,
         causal_prefix_encoding: bool = False,
+        normalise_stats_path: Optional[str] = None,
         torch_dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
@@ -1071,6 +1194,10 @@ class VJEPA2Encoder(BaseVisualEncoder):
         self.z_dim = self.output_dim
         self.upsampling_factor = spatial_downsample
         self.temporal_downsample_factor = temporal_downsample
+        self._configure_fixed_output_normalisation(
+            normalise_stats_path,
+            num_channels=self.output_dim,
+        )
 
         logger.info(
             "VJEPA2Encoder: model=%s  hidden_dim=%d  spatial_patch=%d  temporal_patch=%d  "
@@ -1165,21 +1292,17 @@ class VJEPA2Encoder(BaseVisualEncoder):
         # In skip_projection mode: no SIGReg, but standardise is still
         # useful to normalise features to mean=0 std=1 per channel.
         if self.skip_projection:
-            if self.standardise_output:
-                projected = self._standardise_latents(projected)
+            projected = self._normalise_encoder_output(projected)
             if return_pre_standardise:
                 return projected, None
             return projected
 
         if return_pre_standardise:
             latents_raw = projected
-            if self.standardise_output:
-                projected = self._standardise_latents(projected)
+            projected = self._normalise_encoder_output(projected)
             return projected, latents_raw
 
-        if self.standardise_output:
-            projected = self._standardise_latents(projected)
-        return projected
+        return self._normalise_encoder_output(projected)
 
     def _extract_tokens(self, frames: torch.Tensor) -> torch.Tensor:
         """Extract spatiotemporal patch tokens from V-JEPA 2.
@@ -1582,6 +1705,7 @@ class VJEPA21Encoder(VJEPA2Encoder):
         checkpoint_source: str = "local",
         checkpoint_path: Optional[str] = None,
         repo_path: Optional[str] = None,
+        normalise_stats_path: Optional[str] = None,
         torch_dtype: torch.dtype = torch.bfloat16,
     ):
         nn.Module.__init__(self)
@@ -1635,6 +1759,10 @@ class VJEPA21Encoder(VJEPA2Encoder):
         self.z_dim = self.output_dim
         self.upsampling_factor = spatial_downsample
         self.temporal_downsample_factor = temporal_downsample
+        self._configure_fixed_output_normalisation(
+            normalise_stats_path,
+            num_channels=self.output_dim,
+        )
 
         logger.info(
             "VJEPA21Encoder: model=%s hidden_dim=%d output_dim=%d "

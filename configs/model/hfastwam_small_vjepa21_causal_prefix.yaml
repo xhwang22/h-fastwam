@@ -26,6 +26,7 @@ visual_encoder_config:
   spatial_downsample: 16
   temporal_downsample: 4
   standardise_output: true
+  normalise_stats_path: null
   causal_prefix_encoding: true
 
 visual_encoder: null
@@ -90,11 +91,17 @@ video_scheduler:
   train_shift: 5.0
   infer_shift: 5.0
   num_train_timesteps: 1000
+  sampling_distribution: shifted_uniform
+  logit_mean: 0.0
+  logit_std: 1.0
 
 action_scheduler:
   train_shift: 5.0
   infer_shift: 5.0
   num_train_timesteps: 1000
+  sampling_distribution: shifted_uniform
+  logit_mean: 0.0
+  logit_std: 1.0
 
 loss_config:
   lambda_language: 1.0

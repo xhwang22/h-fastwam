@@ -162,6 +162,17 @@ if [[ -n "${STANDARDISE_OUTPUT:-}" ]]; then
   )
 fi
 
+NORMALISE_STATS_OVERRIDES=()
+if [[ -n "${VJEPA21_NORMALISE_STATS_PATH:-}" ]]; then
+  if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
+    echo "[8card-small-vjepa21] ERROR: VJEPA21_NORMALISE_STATS_PATH not found: ${VJEPA21_NORMALISE_STATS_PATH}" >&2
+    exit 1
+  fi
+  NORMALISE_STATS_OVERRIDES=(
+    "model.visual_encoder_config.normalise_stats_path=${VJEPA21_NORMALISE_STATS_PATH}"
+  )
+fi
+
 TEMPORAL_OVERRIDES=()
 if [[ -n "${TEMPORAL_DOWNSAMPLE:-}" ]]; then
   TEMPORAL_OVERRIDES=(
@@ -214,6 +225,7 @@ CMD=(
       model.visual_encoder_config.repo_path="${VJEPA21_REPO}"
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
+      "${NORMALISE_STATS_OVERRIDES[@]}"
       "${TEMPORAL_OVERRIDES[@]}"
       "${CAUSAL_TUBELET_OVERRIDES[@]}"
       "${VIDEO_LATENT_CACHE_OVERRIDES[@]}"
