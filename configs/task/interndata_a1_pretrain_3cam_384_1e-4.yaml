@@ -7,7 +7,7 @@ model:
   mot_checkpoint_mixed_attn: false
 
 lr_scheduler_type: "cosine"
-learning_rate: 1.0e-4
+learning_rate: 5.0e-5
 num_epochs: 1
 max_steps: null
 log_every: 1
@@ -15,5 +15,5 @@ save_every: 2000
 eval_every: 0
 
 gradient_accumulation_steps: 1
-weight_decay: 1.0e-2
+weight_decay: 5.0e-3
 resume: null

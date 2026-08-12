@@ -47,13 +47,8 @@ def _rotation_to_6d(rotation: np.ndarray) -> np.ndarray:
     return np.concatenate([rotation[..., :, 0], rotation[..., :, 1]], axis=-1)
 
 
-def _scale_gripper(value: np.ndarray, value_range: list[float]) -> np.ndarray:
-    minimum, maximum = map(float, value_range)
-    denominator = maximum - minimum
-    if denominator < 1e-6:
-        return np.zeros_like(value, dtype=np.float32)
-    scaled = (np.asarray(value, dtype=np.float32) - minimum) / denominator
-    return np.clip(scaled * 2.0 - 1.0, -1.0, 1.0)
+def _canonical_gripper_open(value: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(value, dtype=np.float32), 0.0, 1.0) * 2.0 - 1.0
 
 
 class _ParquetShardCache:
@@ -264,7 +259,7 @@ class InternDataA1V3Dataset(Dataset):
         self.manifest_dir = (
             Path(manifest_dir).expanduser().resolve()
             if manifest_dir is not None
-            else self.root / ".fastwam_intern_a1" / "manifest_v2"
+            else self.root / ".fastwam_intern_a1" / "manifest_v3"
         )
         done_path = self.manifest_dir / "done.json"
         if not done_path.is_file():
@@ -394,25 +389,95 @@ class InternDataA1V3Dataset(Dataset):
         start = int(rng.integers(max(clip_count, 1)))
         return episode_row, start
 
-    def iter_epoch_indices(self, epoch_seed: int) -> Iterator[int]:
+    def _iter_group_batches(
+        self,
+        group_index: int,
+        rng: np.random.Generator,
+        batch_size: int,
+    ):
+        start_index = int(self.group_starts[group_index])
+        end_index = int(self.group_ends[group_index])
+        rows = self.episode_rows[start_index:end_index].copy()
+        rng.shuffle(rows)
+        states = [
+            [int(row), 0, max(int(self.arrays["length"][row]) - 32, 0)]
+            for row in rows
+            if int(self.arrays["length"][row]) > 32
+        ]
+        cursor = 0
+        batch = []
+        while states:
+            if cursor >= len(states):
+                cursor = 0
+            episode_row, clip_start, clip_count = states[cursor]
+            remaining = clip_count - clip_start
+            take = min(
+                self.clips_per_episode,
+                remaining,
+                batch_size - len(batch),
+            )
+            batch.extend(
+                self._encode_index(episode_row, start)
+                for start in range(clip_start, clip_start + take)
+            )
+            clip_start += take
+            if clip_start >= clip_count:
+                states.pop(cursor)
+            else:
+                states[cursor][1] = clip_start
+                cursor += 1
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        return batch
+
+    def iter_epoch_indices(
+        self,
+        epoch_seed: int,
+        batch_size: Optional[int] = None,
+        num_processes: Optional[int] = None,
+    ) -> Iterator[int]:
         rng = np.random.default_rng(int(epoch_seed))
+        batch_size = 1 if batch_size is None else int(batch_size)
+        del num_processes
         if self.enumerate_full_epoch:
             yielded = 0
-            group_order = rng.permutation(len(self.group_starts))
-            for group_index in group_order:
-                start_index = int(self.group_starts[group_index])
-                end_index = int(self.group_ends[group_index])
-                rows = self.episode_rows[start_index:end_index].copy()
-                rng.shuffle(rows)
-                for episode_row in rows:
-                    clip_count = int(self.arrays["length"][episode_row]) - 32
-                    if clip_count <= 0:
+            group_iterators = {
+                int(group_index): iter(
+                    self._iter_group_batches(
+                        int(group_index),
+                        rng,
+                        batch_size,
+                    )
+                )
+                for group_index in range(len(self.group_starts))
+            }
+            active_groups = list(group_iterators)
+            tail = []
+            while active_groups:
+                rng.shuffle(active_groups)
+                next_active = []
+                for group_index in active_groups:
+                    iterator = group_iterators[group_index]
+                    try:
+                        batch = next(iterator)
+                    except StopIteration as stop:
+                        if stop.value:
+                            tail.extend(stop.value)
                         continue
-                    for clip_start in range(clip_count):
-                        yield self._encode_index(int(episode_row), clip_start)
+                    for encoded_index in batch:
+                        yield encoded_index
                         yielded += 1
                         if yielded >= self.samples_per_epoch:
                             return
+                    next_active.append(group_index)
+                active_groups = next_active
+            rng.shuffle(tail)
+            for encoded_index in tail:
+                yield encoded_index
+                yielded += 1
+                if yielded >= self.samples_per_epoch:
+                    return
             return
 
         yielded = 0
@@ -449,7 +514,6 @@ class InternDataA1V3Dataset(Dataset):
             dict.fromkeys(
                 metadata["state_pose_keys"]
                 + metadata["action_pose_keys"]
-                + metadata["state_gripper_keys"]
                 + metadata["action_gripper_keys"]
             )
         )
@@ -490,26 +554,30 @@ class InternDataA1V3Dataset(Dataset):
             ],
             axis=1,
         )
-        state_gripper = np.stack(
-            [
-                _scale_gripper(
-                    payload[key][state_slice],
-                    metadata["state_gripper_ranges"][arm_index],
-                ).reshape(-1)
-                for arm_index, key in enumerate(metadata["state_gripper_keys"])
-            ],
-            axis=1,
-        )
         action_gripper = np.stack(
             [
-                _scale_gripper(
-                    payload[key][action_slice],
-                    metadata["action_gripper_ranges"][arm_index],
-                ).reshape(-1)
-                for arm_index, key in enumerate(metadata["action_gripper_keys"])
+                _canonical_gripper_open(payload[key][action_slice]).reshape(-1)
+                for key in metadata["action_gripper_keys"]
             ],
             axis=1,
         )
+        state_gripper = np.zeros_like(action_gripper)
+        if clip_start > 0:
+            previous_slice = slice(local_start - 1, local_start + 31)
+            state_gripper = np.stack(
+                [
+                    _canonical_gripper_open(payload[key][previous_slice]).reshape(-1)
+                    for key in metadata["action_gripper_keys"]
+                ],
+                axis=1,
+            )
+        else:
+            # action openness at row t is the target state at t+1. Shift it
+            # back for proprio. At the episode start, repeat the first command;
+            # this affects only one clip per episode and avoids an arbitrary
+            # half-open proprio value.
+            state_gripper[0] = action_gripper[0]
+            state_gripper[1:] = action_gripper[:-1]
 
         if (
             state_pose.shape != (32, arm_count, 7)

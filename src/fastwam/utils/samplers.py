@@ -31,7 +31,11 @@ class ResumableEpochSampler(Sampler[int]):
         epoch_seed = self.seed + self.epoch + self.epoch_offset
         custom_iterator = getattr(self.dataset, "iter_epoch_indices", None)
         if callable(custom_iterator):
-            indices = custom_iterator(epoch_seed)
+            indices = custom_iterator(
+                epoch_seed,
+                batch_size=self.batch_size,
+                num_processes=self.num_processes,
+            )
         else:
             g = torch.Generator(device="cpu")
             g.manual_seed(epoch_seed)

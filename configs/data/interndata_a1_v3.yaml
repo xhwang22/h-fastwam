@@ -13,6 +13,7 @@ train:
   num_frames: 33
   action_video_freq_ratio: 4
   video_size: [384, 320]
+  # Each local batch gets short sequential blocks from multiple episodes.
   clips_per_episode: 8
   locality_stride: 4
   max_open_parquet_shards: 2

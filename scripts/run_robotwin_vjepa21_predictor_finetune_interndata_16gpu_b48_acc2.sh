@@ -20,4 +20,6 @@ export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA=1
 export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_predictor_finetune_interndata_16gpu_b48_acc2}"
 
-exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" "$@"
+exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" \
+  "++model.language_pad_to_max_length=true" \
+  "$@"

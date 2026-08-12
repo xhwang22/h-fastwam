@@ -13,7 +13,7 @@ if [[ -f "${CONDA_ACTIVATE}" ]]; then
 fi
 
 export INTERN_A1_ROOT="${INTERN_A1_ROOT:-/fsx/pretrain_data/InternData-A1}"
-export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v2}"
+export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v3}"
 if [[ ! -d "${INTERN_A1_ROOT}" ]]; then
   echo "[interndata-a1] ERROR: dataset root does not exist: ${INTERN_A1_ROOT}" >&2
   exit 1
@@ -41,10 +41,12 @@ export LOG_EVERY=1
 export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA=1
-export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_v2_16gpu_b48}"
+export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_v3_16gpu_b48}"
 export WANDB="${WANDB:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-interndata-a1}"
 export WANDB_GROUP="${WANDB_GROUP:-vjepa21-predictor-pretrain}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
-exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" "$@"
+exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" \
+  "++model.language_pad_to_max_length=true" \
+  "$@"

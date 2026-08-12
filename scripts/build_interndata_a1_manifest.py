@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 MIN_EPISODE_FRAMES = 33
 
 
@@ -50,6 +50,24 @@ def _schema_from_features(features: dict) -> dict | None:
     }
     feature_keys = set(features)
     if dual_required <= feature_keys:
+        if {
+            "master_actions.left_gripper.openness",
+            "master_actions.right_gripper.openness",
+        } <= feature_keys:
+            action_gripper_keys = [
+                "master_actions.left_gripper.openness",
+                "master_actions.right_gripper.openness",
+            ]
+        elif {
+            "actions.left_gripper.openness",
+            "actions.right_gripper.openness",
+        } <= feature_keys:
+            action_gripper_keys = [
+                "actions.left_gripper.openness",
+                "actions.right_gripper.openness",
+            ]
+        else:
+            return None
         return {
             "family": "dual",
             "state_pose_keys": [
@@ -60,14 +78,7 @@ def _schema_from_features(features: dict) -> dict | None:
                 "actions.left_ee_to_left_armbase_pose",
                 "actions.right_ee_to_right_armbase_pose",
             ],
-            "state_gripper_keys": [
-                "states.left_gripper.position",
-                "states.right_gripper.position",
-            ],
-            "action_gripper_keys": [
-                "actions.left_gripper.position",
-                "actions.right_gripper.position",
-            ],
+            "action_gripper_keys": action_gripper_keys,
             "camera_keys": {
                 "head": "images.rgb.head",
                 "left": "images.rgb.hand_left",
@@ -75,19 +86,13 @@ def _schema_from_features(features: dict) -> dict | None:
             },
         }
     if single_required <= feature_keys:
-        action_gripper_key = (
-            "actions.gripper.openness"
-            if "actions.gripper.openness" in feature_keys
-            else "actions.gripper.position"
-        )
-        if action_gripper_key not in feature_keys:
+        if "actions.gripper.openness" not in feature_keys:
             return None
         return {
             "family": "single",
             "state_pose_keys": ["states.ee_to_armbase_pose"],
             "action_pose_keys": ["actions.ee_to_armbase_pose"],
-            "state_gripper_keys": ["states.gripper.position"],
-            "action_gripper_keys": [action_gripper_key],
+            "action_gripper_keys": ["actions.gripper.openness"],
             "camera_keys": {
                 "head": "images.rgb.head",
                 "left": "images.rgb.hand",
@@ -97,15 +102,20 @@ def _schema_from_features(features: dict) -> dict | None:
     return None
 
 
-def _range_from_stats(stats: dict, key: str) -> list[float]:
-    entry = stats.get(key)
-    if not isinstance(entry, dict):
-        raise ValueError(f"Missing stats for `{key}`.")
-    min_value = np.asarray(entry["min"], dtype=np.float32).reshape(-1)
-    max_value = np.asarray(entry["max"], dtype=np.float32).reshape(-1)
-    if min_value.size != 1 or max_value.size != 1:
-        raise ValueError(f"Gripper stats for `{key}` must be scalar.")
-    return [float(min_value[0]), float(max_value[0])]
+def _validate_canonical_gripper_stats(stats: dict, keys: list[str]) -> None:
+    for key in keys:
+        entry = stats.get(key)
+        if not isinstance(entry, dict):
+            raise ValueError(f"Missing canonical gripper stats for `{key}`.")
+        minimum = np.asarray(entry["min"], dtype=np.float32).reshape(-1)
+        maximum = np.asarray(entry["max"], dtype=np.float32).reshape(-1)
+        if minimum.size != 1 or maximum.size != 1:
+            raise ValueError(f"Canonical gripper `{key}` must be scalar.")
+        if float(minimum[0]) < -1e-4 or float(maximum[0]) > 1.0001:
+            raise ValueError(
+                f"Canonical gripper `{key}` is outside [0,1]: "
+                f"min={minimum[0]}, max={maximum[0]}."
+            )
 
 
 def _episode_columns(camera_keys: dict) -> list[str]:
@@ -235,19 +245,16 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
                 continue
             with (source_root / "meta" / "stats.json").open("r", encoding="utf-8") as handle:
                 stats = json.load(handle)
-
+            _validate_canonical_gripper_stats(
+                stats,
+                schema["action_gripper_keys"],
+            )
             dataset_id = len(datasets)
             dataset_meta = {
                 "relative_root": str(source_root.relative_to(root)),
                 "robot_type": info.get("robot_type"),
                 "fps": int(info["fps"]),
                 **schema,
-                "state_gripper_ranges": [
-                    _range_from_stats(stats, key) for key in schema["state_gripper_keys"]
-                ],
-                "action_gripper_ranges": [
-                    _range_from_stats(stats, key) for key in schema["action_gripper_keys"]
-                ],
             }
             if dataset_meta["fps"] != 30:
                 excluded.append(str(source_root.relative_to(root)))
@@ -384,7 +391,7 @@ def main() -> None:
     output = (
         Path(args.output)
         if args.output is not None
-        else root / ".fastwam_intern_a1" / "manifest_v2"
+        else root / ".fastwam_intern_a1" / "manifest_v3"
     )
     build_manifest(root=root, output_dir=output, force=args.force)
 

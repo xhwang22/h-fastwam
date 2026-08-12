@@ -104,6 +104,7 @@ class HFastWAM(nn.Module):
         tokenizer=None,
         language_tokenizer=None,
         language_backend: str = "legacy",
+        language_pad_to_max_length: bool = False,
         text_dim: int = 4096,
         proprio_dim: Optional[int] = None,
         device: str = "cpu",
@@ -146,6 +147,7 @@ class HFastWAM(nn.Module):
         self.tokenizer = tokenizer
         self.language_tokenizer = language_tokenizer
         self.language_backend = str(language_backend)
+        self.language_pad_to_max_length = bool(language_pad_to_max_length)
         self.text_dim = int(text_dim)
         self.torch_dtype = torch_dtype
 
@@ -733,7 +735,11 @@ class HFastWAM(nn.Module):
                 add_special_tokens=True,
                 truncation=True,
                 max_length=max_length,
-                padding=True,
+                padding=(
+                    "max_length"
+                    if self.language_pad_to_max_length
+                    else True
+                ),
             )
             ids = encoded["input_ids"]
         else:
@@ -2743,6 +2749,7 @@ class HFastWAM(nn.Module):
         language_backend: str = "legacy",
         language_model_id: str = "Qwen/Qwen3-VL-2B-Instruct",
         language_local_files_only: bool = False,
+        language_pad_to_max_length: bool = False,
         language_vocab_size: int = 32000,
         language_ffn_dim: Optional[int] = None,
         language_max_task_len: int = 128,
@@ -2968,6 +2975,7 @@ class HFastWAM(nn.Module):
             tokenizer=components.tokenizer,
             language_tokenizer=language_tokenizer,
             language_backend=language_backend,
+            language_pad_to_max_length=language_pad_to_max_length,
             text_dim=int(video_dit_config["text_dim"]),
             proprio_dim=proprio_dim,
             device=device,
