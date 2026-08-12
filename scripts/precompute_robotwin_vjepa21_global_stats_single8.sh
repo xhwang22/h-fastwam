@@ -6,6 +6,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# This is intentionally a one-node job. HyperPod/PET and outer torchrun
+# environments must not leak their multi-node rendezvous into the inner run.
+unset PET_NNODES PET_NODE_RANK PET_MASTER_ADDR PET_MASTER_PORT PET_NPROC_PER_NODE
+unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE GROUP_RANK
+unset GROUP_WORLD_SIZE ROLE_RANK ROLE_WORLD_SIZE
+unset NNODES NODE_RANK MASTER_ADDR MASTER_PORT NODE_IP_LIST
+unset TORCHELASTIC_RUN_ID TORCHELASTIC_RESTART_COUNT TORCHELASTIC_MAX_RESTARTS
+unset FASTWAM_MANAGED_DISTRIBUTED _MULTINODE_LAUNCHED
+
 CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
 if [[ -f "${CONDA_ACTIVATE}" ]]; then
   # shellcheck disable=SC1090
@@ -29,7 +38,8 @@ if [[ ! -f "${VJEPA21_REPO}/app/vjepa_2_1/models/vision_transformer.py" ]]; then
   exit 1
 fi
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NPROC_PER_NODE=8
 MAX_SAMPLES="${MAX_SAMPLES:-10000}"
 STATS_BATCH_SIZE="${STATS_BATCH_SIZE:-2}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
@@ -43,6 +53,7 @@ DATA_OVERRIDE_ARGS+=(--data-override "data.train.num_segments=1")
 
 exec torchrun \
   --standalone \
+  --nnodes=1 \
   --nproc_per_node="${NPROC_PER_NODE}" \
   scripts/precompute_vjepa21_stats.py \
   --data-config "${ROBOTWIN_DATA_CONFIG}" \
