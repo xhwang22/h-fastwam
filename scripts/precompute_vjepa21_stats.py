@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import torch
 import torch.distributed as dist
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 
@@ -160,6 +162,119 @@ def _extract_videos(sample: dict) -> list[torch.Tensor]:
     raise ValueError("Dataset sample contains no video tensor.")
 
 
+class _RankShardSampler(Sampler[int]):
+    def __init__(
+        self,
+        dataset,
+        seed: int,
+        local_batch_size: int,
+        rank: int,
+        world_size: int,
+        max_samples: int | None,
+    ):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.local_batch_size = int(local_batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.global_sample_count = (
+            len(dataset)
+            if max_samples is None
+            else min(int(max_samples), len(dataset))
+        )
+
+    def __iter__(self) -> Iterator[int]:
+        return _iter_indices(
+            dataset=self.dataset,
+            seed=self.seed,
+            local_batch_size=self.local_batch_size,
+            rank=self.rank,
+            world_size=self.world_size,
+            max_samples=self.global_sample_count,
+        )
+
+    def __len__(self) -> int:
+        remaining = max(self.global_sample_count - self.rank, 0)
+        return (remaining + self.world_size - 1) // self.world_size
+
+
+class _StatsVideoDataset(Dataset):
+    """Strip action/text fields in workers so only video crosses process IPC."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict:
+        try:
+            return {
+                "videos": _extract_videos(self.dataset[int(index)]),
+                "error": None,
+            }
+        except Exception as exc:
+            return {
+                "videos": [],
+                "error": f"sample {index}: {type(exc).__name__}: {exc}",
+            }
+
+
+def _collate_stats_videos(samples: list[dict]) -> dict:
+    videos = [
+        video
+        for sample in samples
+        for video in sample["videos"]
+    ]
+    errors = [
+        sample["error"]
+        for sample in samples
+        if sample["error"] is not None
+    ]
+    if not videos:
+        return {
+            "videos": None,
+            "sample_count": len(samples),
+            "errors": errors,
+        }
+    shapes = {tuple(video.shape) for video in videos}
+    if len(shapes) != 1:
+        raise ValueError(
+            f"Stats batches require one video shape, got {sorted(shapes)}."
+        )
+    return {
+        "videos": torch.stack(videos, dim=0),
+        "sample_count": len(samples),
+        "errors": errors,
+    }
+
+
+def _build_stats_loader(
+    dataset,
+    sampler: Sampler[int],
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    multiprocessing_context: str,
+) -> DataLoader:
+    kwargs = {
+        "dataset": _StatsVideoDataset(dataset),
+        "batch_size": int(batch_size),
+        "sampler": sampler,
+        "num_workers": int(num_workers),
+        "pin_memory": True,
+        "drop_last": False,
+        "collate_fn": _collate_stats_videos,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+        kwargs["persistent_workers"] = True
+        kwargs["multiprocessing_context"] = multiprocessing_context
+        if "in_order" in inspect.signature(DataLoader).parameters:
+            kwargs["in_order"] = False
+    return DataLoader(**kwargs)
+
+
 @torch.no_grad()
 def _encode_raw_latents(encoder, videos: torch.Tensor, device: torch.device) -> torch.Tensor:
     videos = videos.to(device=device, dtype=torch.bfloat16, non_blocking=True)
@@ -283,6 +398,13 @@ def main() -> None:
         help="Maximum dataset samples across all ranks; omit to scan the full split.",
     )
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--multiprocessing-context",
+        choices=("fork", "forkserver", "spawn"),
+        default="spawn",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--spatial-downsample", type=int, default=16)
     parser.add_argument("--temporal-downsample", type=int, default=4)
@@ -299,6 +421,10 @@ def main() -> None:
         parser.error("Causal tubelet and causal prefix modes are mutually exclusive.")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive.")
+    if args.num_workers < 0:
+        parser.error("--num-workers must be non-negative.")
+    if args.prefetch_factor <= 0:
+        parser.error("--prefetch-factor must be positive.")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -325,7 +451,7 @@ def main() -> None:
         ).to(device)
         encoder.eval()
         dataset = _build_dataset(args.data_config, args.seed, args.data_override)
-        indices = _iter_indices(
+        sampler = _RankShardSampler(
             dataset=dataset,
             seed=args.seed,
             local_batch_size=args.batch_size,
@@ -333,55 +459,44 @@ def main() -> None:
             world_size=world_size,
             max_samples=args.max_samples,
         )
-        local_limit = (
-            None
-            if args.max_samples is None
-            else (max(args.max_samples - rank, 0) + world_size - 1) // world_size
+        loader = _build_stats_loader(
+            dataset=dataset,
+            sampler=sampler,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            multiprocessing_context=args.multiprocessing_context,
         )
         progress = tqdm(
-            indices,
-            total=local_limit,
+            total=len(sampler),
             desc=f"rank {rank} V-JEPA stats",
             disable=rank != 0,
+            unit="video",
         )
         accumulator = WelfordAccumulator(encoder.output_dim)
-        batch_videos: list[torch.Tensor] = []
-        batch_shape = None
         processed_videos = 0
         failed_samples = 0
+        processed_samples = 0
 
-        def flush() -> None:
-            nonlocal processed_videos, batch_videos, batch_shape
-            if not batch_videos:
-                return
-            videos = torch.stack(batch_videos, dim=0)
-            latents = _encode_raw_latents(encoder, videos, device)
-            accumulator.update(latents)
-            processed_videos += len(batch_videos)
-            batch_videos = []
-            batch_shape = None
-
-        for index in progress:
-            try:
-                videos = _extract_videos(dataset[int(index)])
-            except Exception as exc:
-                failed_samples += 1
-                logger.warning("Failed dataset sample %s: %s", index, exc)
-                continue
-            for video in videos:
-                shape = tuple(video.shape)
-                if batch_shape is not None and shape != batch_shape:
-                    flush()
-                batch_shape = shape
-                batch_videos.append(video)
-                if len(batch_videos) >= args.batch_size:
-                    flush()
+        for batch in loader:
+            sample_count = int(batch["sample_count"])
+            processed_samples += sample_count
+            errors = batch["errors"]
+            failed_samples += len(errors)
+            for error in errors[:3]:
+                logger.warning("%s", error)
+            videos = batch["videos"]
+            if videos is not None:
+                latents = _encode_raw_latents(encoder, videos, device)
+                accumulator.update(latents)
+                processed_videos += int(videos.shape[0])
             if rank == 0:
                 progress.set_postfix(
                     videos=processed_videos,
                     failed=failed_samples,
                 )
-        flush()
+                progress.update(sample_count)
+        progress.close()
 
         count_tensor = torch.tensor(
             [processed_videos, failed_samples],

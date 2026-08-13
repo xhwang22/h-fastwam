@@ -41,6 +41,9 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE=8
 STATS_BATCH_SIZE="${STATS_BATCH_SIZE:-16}"
+STATS_NUM_WORKERS="${STATS_NUM_WORKERS:-8}"
+STATS_PREFETCH_FACTOR="${STATS_PREFETCH_FACTOR:-2}"
+STATS_MULTIPROCESSING_CONTEXT="${STATS_MULTIPROCESSING_CONTEXT:-spawn}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
 OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"
 STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
@@ -69,6 +72,9 @@ exec torchrun \
   --model-name vjepa2_1_vit_gigantic_384 \
   "${MAX_SAMPLE_ARGS[@]}" \
   --batch-size "${STATS_BATCH_SIZE}" \
+  --num-workers "${STATS_NUM_WORKERS}" \
+  --prefetch-factor "${STATS_PREFETCH_FACTOR}" \
+  --multiprocessing-context "${STATS_MULTIPROCESSING_CONTEXT}" \
   --temporal-downsample "${TEMPORAL_DOWNSAMPLE}" \
   --causal-tubelet-encoding \
   "${DATA_OVERRIDE_ARGS[@]}" \
