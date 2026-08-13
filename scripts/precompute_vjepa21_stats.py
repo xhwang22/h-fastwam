@@ -87,12 +87,41 @@ class WelfordAccumulator:
         return (self.m2 / self.n).sqrt()
 
 
-def _init_distributed() -> tuple[int, int, torch.device]:
+def _init_runtime(
+    shard_rank_offset: int | None,
+    shard_world_size: int | None,
+) -> tuple[int, int, torch.device]:
     if not torch.cuda.is_available():
         raise RuntimeError("V-JEPA 2.1 statistics require CUDA.")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    if shard_rank_offset is not None:
+        if shard_world_size is None:
+            raise ValueError("--shard-world-size is required in sharded mode.")
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+        rank = int(shard_rank_offset) + local_rank
+        world_size = int(shard_world_size)
+        if rank < 0 or rank >= world_size:
+            raise ValueError(
+                f"Sharded rank {rank} must be in [0, {world_size})."
+            )
+        if int(shard_rank_offset) + local_world_size > world_size:
+            raise ValueError(
+                "Local shard ranks exceed --shard-world-size: "
+                f"offset={shard_rank_offset}, local_world_size={local_world_size}, "
+                f"world_size={world_size}."
+            )
+        logger.info(
+            "Running independent statistics shard rank %d/%d on local GPU %d.",
+            rank,
+            world_size,
+            local_rank,
+        )
+        return rank, world_size, device
+
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
         dist.init_process_group(
             backend="gloo",
             timeout=timedelta(minutes=10),
@@ -105,9 +134,8 @@ def _init_distributed() -> tuple[int, int, torch.device]:
             rank,
             world_size,
         )
-        return rank, world_size, torch.device("cuda", local_rank)
-    torch.cuda.set_device(0)
-    return 0, 1, torch.device("cuda", 0)
+        return rank, world_size, device
+    return 0, 1, device
 
 
 def _build_dataset(data_config: str, seed: int, overrides: list[str]):
@@ -408,6 +436,62 @@ def _save_stats(path: Path, payload: dict) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _load_stats(path: Path) -> dict:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"Expected a dictionary in {path}, got {type(payload).__name__}."
+        )
+    return payload
+
+
+def _run_config(args: argparse.Namespace) -> dict:
+    return {
+        "encoder_type": "vjepa2_1",
+        "model_name": args.model_name,
+        "checkpoint_path": str(Path(args.checkpoint_path).expanduser().resolve()),
+        "repo_path": str(Path(args.repo_path).expanduser().resolve()),
+        "data_config": args.data_config,
+        "data_overrides": list(args.data_override),
+        "seed": args.seed,
+        "spatial_downsample": args.spatial_downsample,
+        "temporal_downsample": args.temporal_downsample,
+        "causal_tubelet_encoding": args.causal_tubelet_encoding,
+        "causal_prefix_encoding": args.causal_prefix_encoding,
+        "skip_projection": True,
+        "batch_size": args.batch_size,
+        "max_samples": args.max_samples,
+    }
+
+
+def _shard_path(shard_output_dir: Path, rank: int, world_size: int) -> Path:
+    return shard_output_dir / f"rank-{rank:05d}-of-{world_size:05d}.pt"
+
+
+def _validate_completed_shard(
+    path: Path,
+    payload: dict,
+    rank: int,
+    world_size: int,
+    run_config: dict,
+) -> None:
+    if payload.get("format") != "fastwam_vjepa21_stats_shard":
+        raise ValueError(f"Invalid V-JEPA statistics shard format in {path}.")
+    if int(payload.get("format_version", -1)) != 1:
+        raise ValueError(f"Unsupported V-JEPA statistics shard version in {path}.")
+    if int(payload.get("rank", -1)) != rank:
+        raise ValueError(f"Shard rank mismatch in {path}.")
+    if int(payload.get("world_size", -1)) != world_size:
+        raise ValueError(f"Shard world-size mismatch in {path}.")
+    if payload.get("run_config") != run_config:
+        raise ValueError(
+            f"Shard configuration mismatch in {path}; use a new shard directory."
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compute fixed global V-JEPA 2.1 output mean/std."
@@ -445,6 +529,29 @@ def main() -> None:
         default=[],
         help="Hydra override, for example data.train.samples_per_epoch=10000.",
     )
+    parser.add_argument(
+        "--shard-output-dir",
+        type=Path,
+        default=None,
+        help="Write this rank's accumulator to a file instead of using collectives.",
+    )
+    parser.add_argument(
+        "--shard-rank-offset",
+        type=int,
+        default=None,
+        help="Global rank of local rank 0 when writing independent shards.",
+    )
+    parser.add_argument(
+        "--shard-world-size",
+        type=int,
+        default=None,
+        help="Total number of independent statistics shards.",
+    )
+    parser.add_argument(
+        "--resume-shards",
+        action="store_true",
+        help="Skip a rank when its compatible completed shard already exists.",
+    )
     args = parser.parse_args()
     if args.causal_tubelet_encoding and args.causal_prefix_encoding:
         parser.error("Causal tubelet and causal prefix modes are mutually exclusive.")
@@ -454,12 +561,53 @@ def main() -> None:
         parser.error("--num-workers must be non-negative.")
     if args.prefetch_factor <= 0:
         parser.error("--prefetch-factor must be positive.")
+    shard_args = (
+        args.shard_output_dir,
+        args.shard_rank_offset,
+        args.shard_world_size,
+    )
+    if any(value is not None for value in shard_args) and any(
+        value is None for value in shard_args
+    ):
+        parser.error(
+            "--shard-output-dir, --shard-rank-offset, and --shard-world-size "
+            "must be provided together."
+        )
+    if args.resume_shards and args.shard_output_dir is None:
+        parser.error("--resume-shards requires sharded output arguments.")
+    if args.shard_rank_offset is not None and args.shard_rank_offset < 0:
+        parser.error("--shard-rank-offset must be non-negative.")
+    if args.shard_world_size is not None and args.shard_world_size <= 0:
+        parser.error("--shard-world-size must be positive.")
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    rank, world_size, device = _init_distributed()
+    rank, world_size, device = _init_runtime(
+        args.shard_rank_offset,
+        args.shard_world_size,
+    )
+    run_config = _run_config(args)
+    shard_path = None
+    if args.shard_output_dir is not None:
+        shard_path = _shard_path(
+            args.shard_output_dir.expanduser().resolve(),
+            rank,
+            world_size,
+        )
+        if args.resume_shards and shard_path.is_file():
+            completed_shard = _load_stats(shard_path)
+            _validate_completed_shard(
+                shard_path,
+                completed_shard,
+                rank,
+                world_size,
+                run_config,
+            )
+            logger.info("Reusing completed statistics shard: %s", shard_path)
+            return
+
     try:
         from fastwam.models.wan22.visual_encoder import VJEPA21Encoder
 
@@ -534,8 +682,32 @@ def main() -> None:
             failed_samples,
         )
 
+        if shard_path is not None:
+            shard_payload = {
+                "format": "fastwam_vjepa21_stats_shard",
+                "format_version": 1,
+                "rank": rank,
+                "world_size": world_size,
+                "run_config": run_config,
+                "processed_samples": processed_samples,
+                "processed_videos": processed_videos,
+                "failed_samples": failed_samples,
+                "latent_vector_count": accumulator.n,
+                "num_channels": encoder.output_dim,
+                "mean": accumulator.mean,
+                "m2": accumulator.m2,
+            }
+            _save_stats(shard_path, shard_payload)
+            logger.info(
+                "Saved statistics shard rank %d/%d to %s.",
+                rank,
+                world_size,
+                shard_path,
+            )
+            return
+
         count_tensor = torch.tensor(
-            [processed_videos, failed_samples],
+            [processed_samples, processed_videos, failed_samples],
             dtype=torch.long,
         )
         if world_size > 1:
@@ -556,23 +728,14 @@ def main() -> None:
 
             metadata = {
                 "version": 1,
-                "encoder_type": "vjepa2_1",
-                "model_name": args.model_name,
-                "checkpoint_path": str(Path(args.checkpoint_path).expanduser().resolve()),
-                "repo_path": str(Path(args.repo_path).expanduser().resolve()),
-                "data_config": args.data_config,
-                "data_overrides": list(args.data_override),
-                "seed": args.seed,
-                "spatial_downsample": args.spatial_downsample,
-                "temporal_downsample": args.temporal_downsample,
-                "causal_tubelet_encoding": args.causal_tubelet_encoding,
-                "causal_prefix_encoding": args.causal_prefix_encoding,
-                "skip_projection": True,
+                **run_config,
                 "normalisation_axes": "global_sample_time_space_per_channel",
-                "processed_videos": int(count_tensor[0].item()),
-                "failed_samples": int(count_tensor[1].item()),
+                "processed_samples": int(count_tensor[0].item()),
+                "processed_videos": int(count_tensor[1].item()),
+                "failed_samples": int(count_tensor[2].item()),
                 "latent_vector_count": merged.n,
                 "num_channels": encoder.output_dim,
+                "aggregation_mode": "distributed_gloo",
             }
             output_payload = {
                 "mean": mean,

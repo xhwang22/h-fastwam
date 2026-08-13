@@ -20,9 +20,8 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE=8
 export FASTWAM_EXPECTED_WORLD_SIZE=64
-# Statistics only exchange a tiny CPU payload, so EFA/NCCL is unnecessary.
+# Each node runs independently and exchanges results through the shared FS.
 export FASTWAM_USE_EFA=0
-export MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-${MASTER_PORT:-29547}}"
 
 # HyperPod/PET provides PET_NNODES, PET_NODE_RANK, PET_MASTER_ADDR, and
 # optionally PET_MASTER_PORT. The helper maps them to torchrun topology.
@@ -58,6 +57,13 @@ STATS_PREFETCH_FACTOR="${STATS_PREFETCH_FACTOR:-2}"
 STATS_MULTIPROCESSING_CONTEXT="${STATS_MULTIPROCESSING_CONTEXT:-spawn}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
 OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"
+STATS_SHARD_RUN_NAME="${STATS_SHARD_RUN_NAME:-${MAX_SAMPLES:-all}}"
+if [[ ! "${STATS_SHARD_RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "[robotwin-vjepa21-stats-8x8] ERROR: STATS_SHARD_RUN_NAME contains unsupported characters." >&2
+  exit 1
+fi
+SHARD_DIR="${STATS_SHARD_DIR:-${OUTPUT_PATH}.shards/${STATS_SHARD_RUN_NAME}}"
+STATS_MERGE_TIMEOUT="${STATS_MERGE_TIMEOUT:-7200}"
 MAX_SAMPLE_ARGS=()
 if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then
   MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")
@@ -69,15 +75,16 @@ for override in "${ROBOTWIN_DATA_OVERRIDES[@]}"; do
 done
 DATA_OVERRIDE_ARGS+=(--data-override "data.train.num_segments=1")
 
-echo "[robotwin-vjepa21-stats-8x8] node_rank=${NODE_RANK}/${NNODES} gpus_per_node=${NPROC_PER_NODE} master=${MASTER_ADDR}:${MASTER_PORT}"
+GLOBAL_RANK_OFFSET=$(( NODE_RANK * NPROC_PER_NODE ))
+echo "[robotwin-vjepa21-stats-8x8] node_rank=${NODE_RANK}/${NNODES} gpus_per_node=${NPROC_PER_NODE} rank_offset=${GLOBAL_RANK_OFFSET}"
 echo "[robotwin-vjepa21-stats-8x8] output=${OUTPUT_PATH}"
+echo "[robotwin-vjepa21-stats-8x8] shards=${SHARD_DIR}"
 
-exec torchrun \
-  --nnodes="${NNODES}" \
-  --node_rank="${NODE_RANK}" \
+torchrun \
+  --standalone \
+  --nnodes=1 \
+  --node_rank=0 \
   --nproc_per_node="${NPROC_PER_NODE}" \
-  --master_addr="${MASTER_ADDR}" \
-  --master_port="${MASTER_PORT}" \
   scripts/precompute_vjepa21_stats.py \
   --data-config "${ROBOTWIN_DATA_CONFIG}" \
   --output-path "${OUTPUT_PATH}" \
@@ -91,5 +98,19 @@ exec torchrun \
   --multiprocessing-context "${STATS_MULTIPROCESSING_CONTEXT}" \
   --temporal-downsample "${TEMPORAL_DOWNSAMPLE}" \
   --causal-tubelet-encoding \
+  --shard-output-dir "${SHARD_DIR}" \
+  --shard-rank-offset "${GLOBAL_RANK_OFFSET}" \
+  --shard-world-size 64 \
+  --resume-shards \
   "${DATA_OVERRIDE_ARGS[@]}" \
   "$@"
+
+if (( NODE_RANK == 0 )); then
+  python scripts/merge_vjepa21_stats_shards.py \
+    --shard-dir "${SHARD_DIR}" \
+    --output-path "${OUTPUT_PATH}" \
+    --expected-world-size 64 \
+    --wait-timeout "${STATS_MERGE_TIMEOUT}"
+else
+  echo "[robotwin-vjepa21-stats-8x8] node ${NODE_RANK} completed its local shards."
+fi
