@@ -96,6 +96,8 @@ _multinode_dispatch() {
   local conda_activate="${CONDA_ACTIVATE_PATH:-/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate}"
   local conda_env="${CONDA_ENV_NAME:-fastwam}"
   local repo_dir="${REPO_ROOT:-/apdcephfs_csgl/share_306089109/shaunxhwang/h-fastwam}"
+  local launch_log_dir="${MULTINODE_LAUNCH_LOG_DIR:-${repo_dir}/runs/multinode/${RUN_NAME:-unnamed}}"
+  mkdir -p "${launch_log_dir}"
 
   for (( i=1; i<NNODES; i++ )); do
     local node="${_NODES[$i]}"
@@ -104,7 +106,8 @@ _multinode_dispatch() {
     # Remote runs a non-login shell: explicitly cd into the repo and activate
     # the conda env before exec'ing the training script.
     local remote_cmd
-    remote_cmd="cd $(printf '%q' "${repo_dir}") && source $(printf '%q' "${conda_activate}") $(printf '%q' "${conda_env}") && NODE_RANK=${i} ${env_prefix}bash $(printf '%q' "${caller}")"
+    local remote_log="${launch_log_dir}/launch.log.rank${i}"
+    remote_cmd="mkdir -p $(printf '%q' "${launch_log_dir}") && cd $(printf '%q' "${repo_dir}") && { echo '[multinode] host='\"\$(hostname)\"' rank=${i}/${NNODES} started='\"\$(date -Is)\"; source $(printf '%q' "${conda_activate}") $(printf '%q' "${conda_env}") && NODE_RANK=${i} ${env_prefix}bash $(printf '%q' "${caller}"); } 2>&1 | tee -a $(printf '%q' "${remote_log}")"
     # shellcheck disable=SC2029
     ssh -p "${SSH_PORT:-36000}" -o StrictHostKeyChecking=no -o BatchMode=yes "${ip}" \
       "${remote_cmd}" &

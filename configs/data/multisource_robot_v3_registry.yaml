@@ -3,13 +3,15 @@ action_schema_id: bimanual_eef20_v1eefT
 canvas_layout: L3
 canvas_size: [384, 320]
 
-# All new sources start in VIDEO_ONLY. Promotion to FULL requires a source
-# adapter plus the action/gripper/base-motion QA gates recorded below.
+# Source adapters canonicalize verified EEF/action fields to EEF20. Episodes
+# with dynamic/unknown base motion or unsupported action semantics remain
+# VIDEO_ONLY while still contributing world-model supervision.
 sources:
   - source_id: agibotworld_beta
     root: ${oc.env:AGIBOT_WORLD_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/AgiBot-World-Beta_lerobotv3}
     enabled: true
-    route: VIDEO_ONLY
+    route: ADAPTER
+    adapter: agibot_eef
     weight: 0.17
     family: dual
     qa_status: pose_verified_gripper_unverified
@@ -22,7 +24,8 @@ sources:
   - source_id: droid
     root: ${oc.env:DROID_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/DROID_LeRobot-v3.0}
     enabled: true
-    route: VIDEO_ONLY
+    route: ADAPTER
+    adapter: droid_eef
     weight: 0.08
     family: single
     qa_status: cartesian_verified_camera_and_gripper_direction_unverified
@@ -37,7 +40,8 @@ sources:
   - source_id: open_x_embodiment
     root: ${oc.env:OPEN_X_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/Open-X-Embodiment}
     enabled: true
-    route: VIDEO_ONLY
+    route: ADAPTER
+    adapter: oxe_eef
     weight: 0.09
     family: single
     qa_status: low_frequency_action_semantics_unverified
@@ -50,7 +54,8 @@ sources:
   - source_id: robocoin
     root: ${oc.env:ROBOCOIN_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/RoboCOIN_v3.0_official}
     enabled: true
-    route: VIDEO_ONLY
+    route: ADAPTER
+    adapter: robocoin_eef
     weight: 0.08
     family: dual
     qa_status: major_camera_clusters_verified_action_clusters_not_canonicalized
@@ -93,7 +98,8 @@ sources:
   - source_id: galaxea_openworld
     root: ${oc.env:GALAXEA_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain/Galaxea-Open-World-Dataset-LeRobot-v3.0}
     enabled: true
-    route: VIDEO_ONLY
+    route: ADAPTER
+    adapter: galaxea_eef
     weight: 0.08
     family: dual
     qa_status: eef_and_gripper_verified_dynamic_base_not_materialized

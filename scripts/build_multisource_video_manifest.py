@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build a compact video-only manifest for heterogeneous LeRobot v3 sources."""
+"""Build a compact canonical manifest for heterogeneous LeRobot v3 sources."""
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import fcntl
 import hashlib
 import json
@@ -18,8 +19,10 @@ import numpy as np
 from omegaconf import OmegaConf
 
 
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 4
 WINDOW_SECONDS = 3.2
+ROUTE_FULL = 0
+ROUTE_VIDEO_ONLY = 1
 
 
 def _load_registry(path: Path) -> dict[str, Any]:
@@ -59,8 +62,16 @@ def _resolve_camera_key(
     return None
 
 
-def _episode_columns(camera_keys: dict[str, str | None]) -> list[str]:
-    columns = ["episode_index", "tasks", "length"]
+def _episode_columns(
+    camera_keys: dict[str, str | None],
+    adapter: dict[str, Any],
+) -> list[str]:
+    columns = [
+        "episode_index",
+        "tasks",
+        "length",
+        "dataset_from_index",
+    ]
     for camera_key in camera_keys.values():
         if camera_key is None:
             continue
@@ -71,16 +82,21 @@ def _episode_columns(camera_keys: dict[str, str | None]) -> list[str]:
                 f"videos/{camera_key}/from_timestamp",
             ]
         )
+    columns.extend(adapter.get("route_stats_columns", []))
     return list(dict.fromkeys(columns))
 
 
-def _read_episode_rows(dataset_root: Path, camera_keys: dict[str, str | None]) -> list[dict]:
+def _read_episode_rows(
+    dataset_root: Path,
+    camera_keys: dict[str, str | None],
+    adapter: dict[str, Any],
+) -> list[dict]:
     import pyarrow.parquet as pq
 
     paths = sorted((dataset_root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
     if not paths:
         raise FileNotFoundError(f"No episode metadata parquet files under {dataset_root}.")
-    wanted_columns = _episode_columns(camera_keys)
+    wanted_columns = _episode_columns(camera_keys, adapter)
     rows = []
     for path in paths:
         parquet = pq.ParquetFile(path)
@@ -154,6 +170,273 @@ def _camera_values(
     return int(chunk), int(file_index), float(from_timestamp)
 
 
+def _data_file_intervals(
+    dataset_root: Path,
+) -> tuple[list[int], list[tuple[int, int, int, int]]]:
+    import pyarrow.parquet as pq
+
+    intervals = []
+    cumulative_start = 0
+    paths = sorted((dataset_root / "data").glob("chunk-*/file-*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"No data parquet files under {dataset_root}.")
+    for path in paths:
+        chunk = int(path.parent.name.removeprefix("chunk-"))
+        file_index = int(path.stem.removeprefix("file-"))
+        row_count = int(pq.ParquetFile(path).metadata.num_rows)
+        cumulative_end = cumulative_start + row_count
+        intervals.append((cumulative_start, cumulative_end, chunk, file_index))
+        cumulative_start = cumulative_end
+    return [interval[1] for interval in intervals], intervals
+
+
+def _resolve_data_file(
+    dataset_from_index: int,
+    episode_length: int,
+    file_ends: list[int],
+    intervals: list[tuple[int, int, int, int]],
+) -> tuple[int, int, int]:
+    interval_index = bisect.bisect_right(file_ends, int(dataset_from_index))
+    if interval_index >= len(intervals):
+        raise ValueError(
+            f"dataset_from_index={dataset_from_index} is outside data files."
+        )
+    file_start, file_end, chunk, file_index = intervals[interval_index]
+    if int(dataset_from_index) + int(episode_length) > file_end:
+        raise ValueError(
+            "Episode crosses a parquet boundary: "
+            f"start={dataset_from_index}, length={episode_length}, "
+            f"file=[{file_start},{file_end})."
+        )
+    return chunk, file_index, file_start
+
+
+def _robocoin_base_keys(features: dict[str, Any]) -> list[str]:
+    keys = []
+    for key, value in features.items():
+        names = value.get("names") if isinstance(value, dict) else None
+        text = f"{key} {names}".lower()
+        if any(
+            marker in text
+            for marker in (
+                "robot_pos_",
+                "robot_quat_",
+                "base_",
+                "chassis",
+                "wheel",
+            )
+        ):
+            keys.append(key)
+    return keys
+
+
+def _adapter_from_features(
+    adapter_name: str,
+    features: dict[str, Any],
+    fps: float,
+) -> dict[str, Any]:
+    if adapter_name == "video_only":
+        return {"type": "video_only", "route_default": ROUTE_VIDEO_ONLY}
+    if adapter_name == "agibot_eef":
+        required = {
+            "observation.states.end.position",
+            "observation.states.end.orientation",
+            "actions.end.position",
+            "actions.end.orientation",
+            "actions.effector.position",
+        }
+        if not required <= set(features):
+            return {"type": "video_only", "route_default": ROUTE_VIDEO_ONLY}
+        return {
+            "type": "agibot_eef",
+            "route_default": ROUTE_FULL,
+            "columns": sorted(required | {"actions.robot.velocity"}),
+            "gripper_valid": [False, False],
+            "route_motion_key": "actions.robot.velocity",
+            "route_motion_threshold": 1e-4,
+            "route_stats_columns": [
+                "stats/actions.robot.velocity/min",
+                "stats/actions.robot.velocity/max",
+            ],
+        }
+    if adapter_name == "droid_eef":
+        required = {
+            "observation.state.cartesian_position",
+            "observation.state.gripper_position",
+            "action.cartesian_position",
+            "action.gripper_position",
+        }
+        if not required <= set(features):
+            return {"type": "video_only", "route_default": ROUTE_VIDEO_ONLY}
+        return {
+            "type": "droid_eef",
+            "route_default": ROUTE_FULL,
+            "columns": sorted(required),
+            "gripper_valid": [False, False],
+        }
+    if adapter_name == "oxe_eef":
+        state = features.get("observation.state", {})
+        if (
+            float(fps) >= 9.999
+            and list(state.get("shape", [])) == [8]
+        ):
+            return {
+                "type": "oxe_euler_state",
+                "route_default": ROUTE_FULL,
+                "columns": ["observation.state"],
+                "gripper_valid": [False, False],
+            }
+        return {"type": "video_only", "route_default": ROUTE_VIDEO_ONLY}
+    if adapter_name == "galaxea_eef":
+        required = {
+            "observation.state.left_ee_pose",
+            "observation.state.right_ee_pose",
+            "observation.state.left_gripper",
+            "observation.state.right_gripper",
+            "observation.state.chassis",
+        }
+        if not required <= set(features):
+            return {"type": "video_only", "route_default": ROUTE_VIDEO_ONLY}
+        return {
+            "type": "galaxea_eef",
+            "route_default": ROUTE_FULL,
+            "columns": sorted(required),
+            "route_motion_key": "observation.state.chassis",
+            "route_motion_slice": [3, 6],
+            "route_motion_stat_threshold": 0.03,
+            "route_stats_columns": [
+                "stats/observation.state.chassis/mean",
+                "stats/observation.state.chassis/std",
+            ],
+        }
+    if adapter_name == "robocoin_eef":
+        required = {"eef_sim_pose_state", "eef_sim_pose_action"}
+        if not required <= set(features):
+            return {"type": "video_only", "route_default": ROUTE_VIDEO_ONLY}
+        columns = set(required)
+        has_gripper = {
+            "gripper_open_scale_state",
+            "gripper_open_scale_action",
+        } <= set(features)
+        if has_gripper:
+            columns.update(
+                {
+                    "gripper_open_scale_state",
+                    "gripper_open_scale_action",
+                }
+            )
+        base_keys = _robocoin_base_keys(features)
+        return {
+            "type": "robocoin_eef",
+            "route_default": (
+                ROUTE_VIDEO_ONLY if base_keys else ROUTE_FULL
+            ),
+            "columns": sorted(columns),
+            "has_gripper": has_gripper,
+            "base_keys": base_keys,
+        }
+    raise ValueError(f"Unknown adapter type: {adapter_name}")
+
+
+class _ParquetColumnCache:
+    def __init__(self):
+        self.path: Path | None = None
+        self.columns: tuple[str, ...] = ()
+        self.payload: dict[str, np.ndarray] = {}
+
+    def get(self, path: Path, columns: list[str]) -> dict[str, np.ndarray]:
+        wanted = tuple(columns)
+        if self.path == path and self.columns == wanted:
+            return self.payload
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(path, columns=list(wanted))
+        payload = {}
+        for column in wanted:
+            array = table[column].combine_chunks()
+            if pa.types.is_fixed_size_list(array.type):
+                child = array.values.to_numpy(zero_copy_only=False)
+                payload[column] = child.reshape(
+                    len(array),
+                    int(array.type.list_size),
+                )
+            else:
+                payload[column] = np.asarray(array.to_pylist())
+        self.path = path
+        self.columns = wanted
+        self.payload = payload
+        return payload
+
+
+def _episode_route(
+    adapter: dict[str, Any],
+    episode_row: dict[str, Any],
+    dataset_root: Path,
+    data_chunk: int,
+    data_file: int,
+    local_start: int,
+    length: int,
+    cache: _ParquetColumnCache,
+) -> int:
+    route_default = int(adapter["route_default"])
+    motion_key = adapter.get("route_motion_key")
+    if route_default == ROUTE_VIDEO_ONLY or motion_key is None:
+        return route_default
+    stats_columns = adapter.get("route_stats_columns", [])
+    if len(stats_columns) == 2 and all(
+        column in episode_row for column in stats_columns
+    ):
+        first = np.asarray(episode_row[stats_columns[0]], dtype=np.float64)
+        second = np.asarray(episode_row[stats_columns[1]], dtype=np.float64)
+        motion_slice = adapter.get("route_motion_slice")
+        if motion_slice is not None:
+            first = first[int(motion_slice[0]) : int(motion_slice[1])]
+            second = second[int(motion_slice[0]) : int(motion_slice[1])]
+        stat_threshold = adapter.get("route_motion_stat_threshold")
+        if stat_threshold is not None:
+            score = float(np.abs(first).sum() + second.sum())
+            return (
+                ROUTE_FULL
+                if score < float(stat_threshold)
+                else ROUTE_VIDEO_ONLY
+            )
+        threshold = float(adapter.get("route_motion_threshold", 0.0))
+        max_abs = float(
+            max(
+                np.max(np.abs(first), initial=0.0),
+                np.max(np.abs(second), initial=0.0),
+            )
+        )
+        return ROUTE_FULL if max_abs <= threshold else ROUTE_VIDEO_ONLY
+    data_path = dataset_root / (
+        f"data/chunk-{data_chunk:03d}/file-{data_file:03d}.parquet"
+    )
+    payload = cache.get(data_path, [motion_key])
+    motion = np.asarray(
+        payload[motion_key][local_start : local_start + length],
+        dtype=np.float64,
+    )
+    if not np.isfinite(motion).all():
+        return ROUTE_VIDEO_ONLY
+    motion_slice = adapter.get("route_motion_slice")
+    if motion_slice is not None:
+        motion = motion[..., int(motion_slice[0]) : int(motion_slice[1])]
+    stat_threshold = adapter.get("route_motion_stat_threshold")
+    if stat_threshold is not None:
+        score = float(
+            np.abs(motion.mean(axis=0)).sum()
+            + motion.std(axis=0).sum()
+        )
+        return ROUTE_FULL if score < float(stat_threshold) else ROUTE_VIDEO_ONLY
+    threshold = float(adapter.get("route_motion_threshold", 0.0))
+    return (
+        ROUTE_FULL
+        if float(np.max(np.abs(motion), initial=0.0)) <= threshold
+        else ROUTE_VIDEO_ONLY
+    )
+
+
 def _keep_episode(family: str, camera_values: dict[str, tuple[int, int, float]]) -> bool:
     valid = {role: values[1] >= 0 for role, values in camera_values.items()}
     if valid["head"]:
@@ -209,13 +492,11 @@ def build_manifest(
         for source_config in registry["sources"]:
             if not bool(source_config.get("enabled", True)):
                 continue
-            if str(source_config.get("route", "")).upper() != "VIDEO_ONLY":
-                continue
             source_name = str(source_config["source_id"])
             source_root = Path(str(source_config["root"])).expanduser().resolve()
             if not source_root.is_dir():
                 raise FileNotFoundError(
-                    f"VIDEO_ONLY source `{source_name}` does not exist: {source_root}"
+                    f"Source `{source_name}` does not exist: {source_root}"
                 )
             source_id = len(sources)
             source_meta = {
@@ -227,6 +508,7 @@ def build_manifest(
             }
             sources.append(source_meta)
             family = str(source_config.get("family", "unknown"))
+            adapter_name = str(source_config.get("adapter", "video_only"))
             camera_candidates = source_config.get("cameras") or {}
             removed_patterns = [
                 str(value) for value in source_config.get("removed_episode_files", [])
@@ -244,6 +526,7 @@ def build_manifest(
                 continue
 
             valid_dataset_count = 0
+            route_cache = _ParquetColumnCache()
             for dataset_root in dataset_roots:
                 relative_root = str(dataset_root.relative_to(source_root))
                 try:
@@ -268,7 +551,17 @@ def build_manifest(
                     }
                     if not any(camera_keys.values()):
                         raise ValueError("No registered camera key is present.")
-                    episode_rows = _read_episode_rows(dataset_root, camera_keys)
+                    adapter = _adapter_from_features(
+                        adapter_name,
+                        features,
+                        fps,
+                    )
+                    episode_rows = _read_episode_rows(
+                        dataset_root,
+                        camera_keys,
+                        adapter,
+                    )
+                    file_ends, data_intervals = _data_file_intervals(dataset_root)
                 except Exception as exc:
                     excluded.append(
                         {
@@ -289,6 +582,7 @@ def build_manifest(
                     "fps": fps,
                     "family": family,
                     "camera_keys": camera_keys,
+                    "adapter": adapter,
                 }
                 valid_episodes = 0
                 for row in episode_rows:
@@ -305,6 +599,24 @@ def build_manifest(
                     }
                     if not _keep_episode(family, camera_values):
                         continue
+                    data_chunk, data_file, data_file_from = _resolve_data_file(
+                        dataset_from_index=int(row["dataset_from_index"]),
+                        episode_length=length,
+                        file_ends=file_ends,
+                        intervals=data_intervals,
+                    )
+                    data_from = int(row["dataset_from_index"])
+                    local_start = data_from - data_file_from
+                    route_id = _episode_route(
+                        adapter=adapter,
+                        episode_row=row,
+                        dataset_root=dataset_root,
+                        data_chunk=data_chunk,
+                        data_file=data_file,
+                        local_start=local_start,
+                        length=length,
+                        cache=route_cache,
+                    )
                     task_values = row.get("tasks") or [
                         dataset_root.name.replace("_", " ")
                     ]
@@ -327,6 +639,11 @@ def build_manifest(
                     arrays["episode_index"].append(episode_index)
                     arrays["length"].append(length)
                     arrays["start_count"].append(start_count)
+                    arrays["route_id"].append(route_id)
+                    arrays["data_chunk"].append(data_chunk)
+                    arrays["data_file"].append(data_file)
+                    arrays["data_from"].append(data_from)
+                    arrays["data_file_from"].append(data_file_from)
                     arrays["task_id"].append(task_id)
                     arrays["shard_id"].append(shard_id)
                     for role in ("head", "left", "right"):
@@ -377,6 +694,11 @@ def build_manifest(
             "episode_index": np.int32,
             "length": np.int32,
             "start_count": np.int32,
+            "route_id": np.int8,
+            "data_chunk": np.int16,
+            "data_file": np.int32,
+            "data_from": np.int64,
+            "data_file_from": np.int64,
             "task_id": np.int32,
             "shard_id": np.int64,
             "head_chunk": np.int16,
@@ -403,6 +725,7 @@ def build_manifest(
 
         start_counts = np.asarray(arrays["start_count"], dtype=np.int64)
         source_ids = np.asarray(arrays["source_id"], dtype=np.int64)
+        route_ids = np.asarray(arrays["route_id"], dtype=np.int64)
         source_episode_counts = {
             sources[source_id]["source_id"]: int((source_ids == source_id).sum())
             for source_id in range(len(sources))
@@ -411,6 +734,23 @@ def build_manifest(
             sources[source_id]["source_id"]: int(
                 start_counts[source_ids == source_id].sum()
             )
+            for source_id in range(len(sources))
+        }
+        source_route_clip_counts = {
+            sources[source_id]["source_id"]: {
+                "FULL": int(
+                    start_counts[
+                        (source_ids == source_id)
+                        & (route_ids == ROUTE_FULL)
+                    ].sum()
+                ),
+                "VIDEO_ONLY": int(
+                    start_counts[
+                        (source_ids == source_id)
+                        & (route_ids == ROUTE_VIDEO_ONLY)
+                    ].sum()
+                ),
+            }
             for source_id in range(len(sources))
         }
         done = {
@@ -423,6 +763,7 @@ def build_manifest(
             "native_start_count": int(start_counts.sum()),
             "source_episode_counts": source_episode_counts,
             "source_native_start_counts": source_clip_counts,
+            "source_route_native_start_counts": source_route_clip_counts,
             "excluded_dataset_count": len(excluded),
             "excluded_datasets": excluded,
         }

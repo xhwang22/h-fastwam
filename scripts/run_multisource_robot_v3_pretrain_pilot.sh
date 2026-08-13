@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Route-safe multisource pilot: InternData FULL + five VIDEO_ONLY sources.
+# Route-safe multisource pilot with per-source EEF20 adapters.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +35,7 @@ for variable in \
 done
 
 export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v3}"
-export MULTISOURCE_VIDEO_MANIFEST_DIR="${MULTISOURCE_VIDEO_MANIFEST_DIR:-${PRETRAIN_DATA_ROOT}/.fastwam_multisource/video_manifest_v2}"
+export MULTISOURCE_VIDEO_MANIFEST_DIR="${MULTISOURCE_VIDEO_MANIFEST_DIR:-${PRETRAIN_DATA_ROOT}/.fastwam_multisource/canonical_manifest_v4}"
 MULTISOURCE_REGISTRY="${MULTISOURCE_REGISTRY:-configs/data/multisource_robot_v3_registry.yaml}"
 
 python scripts/build_interndata_a1_manifest.py \
@@ -45,7 +45,7 @@ python scripts/build_multisource_video_manifest.py \
   --registry "${MULTISOURCE_REGISTRY}" \
   --output "${MULTISOURCE_VIDEO_MANIFEST_DIR}"
 
-export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${MULTISOURCE_VIDEO_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_mixture85_15_stats.pt}"
+export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${MULTISOURCE_VIDEO_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_declared_weights_stats.pt}"
 if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
   echo "[multisource-v3] ERROR: V-JEPA global stats do not exist: ${VJEPA21_NORMALISE_STATS_PATH}" >&2
   echo "Run scripts/precompute_multisource_vjepa21_global_stats_single8.sh first." >&2
@@ -68,7 +68,7 @@ export SAVE_EVERY="${SAVE_EVERY:-500}"
 export LOG_EVERY=1
 export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 export ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_bf16.yaml}"
-export RUN_NAME="${RUN_NAME:-multisource_robot_v3_pilot_85full_15video}"
+export RUN_NAME="${RUN_NAME:-multisource_robot_v3_pilot_declared_weights}"
 export WANDB="${WANDB:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-multisource-robot}"
 export WANDB_GROUP="${WANDB_GROUP:-vjepa21-predictor-pilot}"

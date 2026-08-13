@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compute fixed V-JEPA 2.1 statistics for the 85/15 multisource mixture.
+# Compute fixed V-JEPA 2.1 statistics for the declared six-source weights.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,7 +41,7 @@ for variable in \
 done
 
 export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v3}"
-export MULTISOURCE_VIDEO_MANIFEST_DIR="${MULTISOURCE_VIDEO_MANIFEST_DIR:-${PRETRAIN_DATA_ROOT}/.fastwam_multisource/video_manifest_v2}"
+export MULTISOURCE_VIDEO_MANIFEST_DIR="${MULTISOURCE_VIDEO_MANIFEST_DIR:-${PRETRAIN_DATA_ROOT}/.fastwam_multisource/canonical_manifest_v4}"
 MULTISOURCE_REGISTRY="${MULTISOURCE_REGISTRY:-configs/data/multisource_robot_v3_registry.yaml}"
 python scripts/build_interndata_a1_manifest.py \
   --root "${INTERN_A1_ROOT}" \
@@ -70,7 +70,7 @@ STATS_NUM_WORKERS="${STATS_NUM_WORKERS:-8}"
 STATS_PREFETCH_FACTOR="${STATS_PREFETCH_FACTOR:-2}"
 STATS_MULTIPROCESSING_CONTEXT="${STATS_MULTIPROCESSING_CONTEXT:-spawn}"
 STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
-OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${MULTISOURCE_VIDEO_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_mixture85_15_stats.pt}"
+OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${MULTISOURCE_VIDEO_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_declared_weights_stats.pt}"
 MAX_SAMPLE_ARGS=()
 if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then
   MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")

@@ -2,7 +2,10 @@ train:
   _target_: fastwam.datasets.lerobot.multisource_v3_dataset.MultiSourceRobotV3Dataset
   samples_per_epoch: ${oc.env:MULTISOURCE_SAMPLES_PER_EPOCH,768000}
   epoch_size_multiple: ${oc.env:GLOBAL_BATCH_SIZE,768}
-  full_batch_fraction: 0.85
+  # Normalize the declared weights across all six sources:
+  # InternData 0.20; video sources 0.17/0.08/0.09/0.08/0.08.
+  full_batch_fraction: null
+  intern_a1_weight: 0.20
   video_clips_per_episode: 8
   video_locality_stride: 1
   seed: ${seed}
@@ -27,12 +30,13 @@ train:
     resized_frames_per_entry: 128
     max_retries: 3
 
-  video_only:
+  external_sources:
     manifest_dir: ${oc.env:MULTISOURCE_VIDEO_MANIFEST_DIR}
     is_training_set: true
     val_set_proportion: 0.01
     seed: ${seed}
     video_size: [384, 320]
+    max_open_parquet_shards: 2
     max_open_video_shards: 6
     video_decode_threads: 2
     video_frame_cache_entries: 3
