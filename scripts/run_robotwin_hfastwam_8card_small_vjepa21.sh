@@ -187,6 +187,15 @@ if [[ -n "${CAUSAL_TUBELET_ENCODING:-}" ]]; then
   )
 fi
 
+TIMESTEP_SAMPLING_OVERRIDES=()
+if [[ -n "${TIMESTEP_SAMPLING_PRESET:-}" ]]; then
+  # shellcheck source=_timestep_sampling_preset.sh
+  source "${SCRIPT_DIR}/_timestep_sampling_preset.sh"
+  fastwam_timestep_sampling_preset \
+    "${TIMESTEP_SAMPLING_PRESET}" \
+    "${TIMESTEP_SAMPLING_TARGET:-both}"
+fi
+
 CMD=(
   accelerate launch
     --config_file "${ACCEL_CONFIG}"
@@ -228,6 +237,7 @@ CMD=(
       "${NORMALISE_STATS_OVERRIDES[@]}"
       "${TEMPORAL_OVERRIDES[@]}"
       "${CAUSAL_TUBELET_OVERRIDES[@]}"
+      "${TIMESTEP_SAMPLING_OVERRIDES[@]}"
       "${VIDEO_LATENT_CACHE_OVERRIDES[@]}"
       "${RESUME_OVERRIDES[@]}"
 )
