@@ -230,7 +230,7 @@ _fastwam_configure_wandb() {
   fi
 }
 
-fastwam_prepare_aws_hyperpod() {
+fastwam_prepare_aws_hyperpod_runtime() {
   _fastwam_configure_proxy
   _fastwam_configure_hyperpod_topology
   if [[ -n "${FASTWAM_EXPECTED_WORLD_SIZE:-}" ]]; then
@@ -245,6 +245,10 @@ fastwam_prepare_aws_hyperpod() {
   fi
   _fastwam_configure_aws_network
   _fastwam_install_shared_ffmpeg
+}
+
+fastwam_prepare_aws_hyperpod() {
+  fastwam_prepare_aws_hyperpod_runtime
   _fastwam_configure_wandb
 
   if ! command -v accelerate >/dev/null 2>&1; then
