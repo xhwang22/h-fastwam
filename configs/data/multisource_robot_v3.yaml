@@ -1,0 +1,48 @@
+train:
+  _target_: fastwam.datasets.lerobot.multisource_v3_dataset.MultiSourceRobotV3Dataset
+  samples_per_epoch: ${oc.env:MULTISOURCE_SAMPLES_PER_EPOCH,768000}
+  epoch_size_multiple: ${oc.env:GLOBAL_BATCH_SIZE,768}
+  full_batch_fraction: 0.85
+  video_clips_per_episode: 8
+  video_locality_stride: 1
+  seed: ${seed}
+
+  intern_a1:
+    root: ${oc.env:INTERN_A1_ROOT}
+    manifest_dir: ${oc.env:INTERN_A1_MANIFEST_DIR}
+    is_training_set: true
+    val_set_proportion: 0.01
+    seed: ${seed}
+    num_frames: 33
+    action_video_freq_ratio: 4
+    video_size: [384, 320]
+    clips_per_episode: 8
+    locality_stride: 4
+    max_open_parquet_shards: 2
+    max_open_video_shards: 6
+    video_decode_threads: 2
+    video_frame_cache_entries: 3
+    video_prefetch_frames: 24
+    resized_frame_cache_entries: 3
+    resized_frames_per_entry: 128
+    max_retries: 3
+
+  video_only:
+    manifest_dir: ${oc.env:MULTISOURCE_VIDEO_MANIFEST_DIR}
+    is_training_set: true
+    val_set_proportion: 0.01
+    seed: ${seed}
+    video_size: [384, 320]
+    max_open_video_shards: 6
+    video_decode_threads: 2
+    video_frame_cache_entries: 3
+    video_prefetch_frames: 12
+    resized_frame_cache_entries: 3
+    resized_frames_per_entry: 96
+    max_retries: 3
+
+  processor:
+    action_output_dim: 20
+    proprio_output_dim: 20
+
+val: null

@@ -1540,6 +1540,23 @@ class HFastWAM(nn.Module):
             D, T_lat, H_lat, W_lat = cached_latents.shape[2:]
             flat_cached_latents = cached_latents.reshape(B * N, D, T_lat, H_lat, W_lat)
 
+        flat_video_spatial_valid_mask = None
+        video_spatial_valid_mask = segments.get("video_spatial_valid_mask")
+        if video_spatial_valid_mask is not None:
+            if (
+                video_spatial_valid_mask.ndim != 4
+                or video_spatial_valid_mask.shape[:2] != (B, N)
+            ):
+                raise ValueError(
+                    "Interleaved `video_spatial_valid_mask` must be [B,N,H,W], "
+                    f"got {tuple(video_spatial_valid_mask.shape)}."
+                )
+            flat_video_spatial_valid_mask = video_spatial_valid_mask.reshape(
+                B * N,
+                video_spatial_valid_mask.shape[-2],
+                video_spatial_valid_mask.shape[-1],
+            )
+
         task_ids = segments.get("task_token_ids")
         if task_ids is None and "prompt" in segments:
             flat_prompts = self._flatten_segment_prompts(segments["prompt"], batch_size=B, num_segments=N)
@@ -1751,6 +1768,7 @@ class HFastWAM(nn.Module):
             target_video=target_video,
             fuse_flag=fuse_flag,
             timestep_video=timestep_video,
+            spatial_valid_mask=flat_video_spatial_valid_mask,
         )
         total_loss = total_loss + self.loss_lambda_video * loss_video
         loss_dict["loss_video"] = self.loss_lambda_video * float(loss_video.detach().item())
@@ -2043,6 +2061,7 @@ class HFastWAM(nn.Module):
             target_video=target_video,
             fuse_flag=fuse_flag,
             timestep_video=timestep_video,
+            spatial_valid_mask=sample.get("video_spatial_valid_mask"),
         )
         total_loss = total_loss + self.loss_lambda_video * loss_video
         loss_dict["loss_video"] = self.loss_lambda_video * float(loss_video.detach().item())
@@ -2259,20 +2278,59 @@ class HFastWAM(nn.Module):
         target_video: torch.Tensor,
         fuse_flag: bool = False,
         timestep_video: Optional[torch.Tensor] = None,
+        spatial_valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        valid = None
+        if spatial_valid_mask is not None:
+            valid = spatial_valid_mask.to(
+                device=pred_video.device,
+                dtype=torch.float32,
+            )
+            if valid.ndim == 3:
+                valid = valid.unsqueeze(1)
+            if (
+                valid.ndim != 4
+                or valid.shape[0] != pred_video.shape[0]
+                or valid.shape[1] != 1
+            ):
+                raise ValueError(
+                    "`video_spatial_valid_mask` must be [B,H,W] or [B,1,H,W], "
+                    f"got {tuple(valid.shape)} for video {tuple(pred_video.shape)}."
+                )
+            valid = F.interpolate(
+                valid,
+                size=pred_video.shape[-2:],
+                mode="nearest",
+            ).unsqueeze(2)
+
+        def reduce_error(error: torch.Tensor) -> torch.Tensor:
+            if valid is None:
+                return error.mean(dim=(1, 2, 3, 4))
+            weighted = error * valid
+            elements_per_spatial_position = error.shape[1] * error.shape[2]
+            denominator = (
+                valid.sum(dim=(1, 2, 3, 4))
+                * elements_per_spatial_position
+            ).clamp_min(1.0)
+            return weighted.sum(dim=(1, 2, 3, 4)) / denominator
+
         if self.video_loss_type == "l1":
             # JEPA predictor: plain L1 regression in encoder-latent space.
             # No timestep weighting — the predictor is deterministic.
-            return F.l1_loss(pred_video.float(), target_video.float(), reduction="none").mean(
-                dim=(1, 2, 3, 4)
-            ).mean()
+            error = F.l1_loss(
+                pred_video.float(),
+                target_video.float(),
+                reduction="none",
+            )
+            return reduce_error(error).mean()
         # Flow-matching (WAN DiT): MSE weighted by the flow-matching training weight.
         if fuse_flag:
             pred_video = pred_video[:, :, 1:]
             target_video = target_video[:, :, 1:]
-        per_sample = F.mse_loss(
+        error = F.mse_loss(
             pred_video.float(), target_video.float(), reduction="none",
-        ).mean(dim=(1, 2, 3, 4))
+        )
+        per_sample = reduce_error(error)
         if timestep_video is None:
             raise ValueError("timestep_video is required for flow_matching video loss.")
         w = self.train_video_scheduler.training_weight(timestep_video).to(

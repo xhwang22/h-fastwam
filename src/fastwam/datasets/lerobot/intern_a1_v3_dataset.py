@@ -731,7 +731,7 @@ class InternDataA1V3Dataset(Dataset):
         clip_start: int,
         metadata: dict,
         dataset_root: Path,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         camera_keys = metadata["camera_keys"]
         fps = int(metadata["fps"])
         head = self._decode_camera(
@@ -761,6 +761,10 @@ class InternDataA1V3Dataset(Dataset):
             fps,
             (128, 160),
         )
+        view_role_valid_mask = torch.tensor(
+            [head is not None, left is not None, right is not None],
+            dtype=torch.bool,
+        )
         if head is None:
             raise ValueError("InternData sample has no head camera.")
 
@@ -770,7 +774,8 @@ class InternDataA1V3Dataset(Dataset):
             right = torch.zeros((9, 3, 128, 160), dtype=torch.uint8)
         bottom = torch.cat([left, right], dim=-1)
         canvas = torch.cat([head, bottom], dim=-2)
-        return (canvas.float() * (2.0 / 255.0) - 1.0).permute(1, 0, 2, 3)
+        video = (canvas.float() * (2.0 / 255.0) - 1.0).permute(1, 0, 2, 3)
+        return video, view_role_valid_mask
 
     def _get_encoded(self, episode_row: int, clip_start: int, sample_index: int) -> dict:
         dataset_id, metadata, dataset_root = self._dataset_meta(episode_row)
@@ -780,7 +785,19 @@ class InternDataA1V3Dataset(Dataset):
             metadata,
             dataset_root,
         )
-        video = self._load_video(episode_row, clip_start, metadata, dataset_root)
+        video, view_role_valid_mask = self._load_video(
+            episode_row,
+            clip_start,
+            metadata,
+            dataset_root,
+        )
+        video_spatial_valid_mask = torch.zeros((384, 320), dtype=torch.bool)
+        if bool(view_role_valid_mask[0]):
+            video_spatial_valid_mask[:256, :] = True
+        if bool(view_role_valid_mask[1]):
+            video_spatial_valid_mask[256:, :160] = True
+        if bool(view_role_valid_mask[2]):
+            video_spatial_valid_mask[256:, 160:] = True
         task = self.tasks[int(self.arrays["task_id"][episode_row])]
         return {
             "video": video,
@@ -793,6 +810,8 @@ class InternDataA1V3Dataset(Dataset):
             "action_dim_is_pad": action_dim_is_pad,
             "proprio_is_pad": torch.zeros((32,), dtype=torch.bool),
             "proprio_dim_is_pad": action_dim_is_pad.clone(),
+            "view_role_valid_mask": view_role_valid_mask,
+            "video_spatial_valid_mask": video_spatial_valid_mask,
             "dataset_id": torch.tensor(dataset_id, dtype=torch.int32),
         }
 

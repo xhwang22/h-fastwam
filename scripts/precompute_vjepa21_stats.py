@@ -129,8 +129,17 @@ def _iter_indices(
         indices = iter(range(len(dataset)))
 
     stop = len(dataset) if max_samples is None else min(int(max_samples), len(dataset))
-    rank_indices = islice(indices, rank, stop, world_size)
-    yield from rank_indices
+    global_batch_size = int(local_batch_size) * int(world_size)
+    consumed = 0
+    while consumed < stop:
+        take = min(global_batch_size, stop - consumed)
+        block = list(islice(indices, take))
+        if not block:
+            return
+        local_start = int(rank) * int(local_batch_size)
+        local_end = local_start + int(local_batch_size)
+        yield from block[local_start:local_end]
+        consumed += len(block)
 
 
 def _extract_videos(sample: dict) -> list[torch.Tensor]:
@@ -194,8 +203,16 @@ class _RankShardSampler(Sampler[int]):
         )
 
     def __len__(self) -> int:
-        remaining = max(self.global_sample_count - self.rank, 0)
-        return (remaining + self.world_size - 1) // self.world_size
+        global_batch_size = self.local_batch_size * self.world_size
+        full_batches, remainder = divmod(
+            self.global_sample_count,
+            global_batch_size,
+        )
+        local_remainder = min(
+            max(remainder - self.rank * self.local_batch_size, 0),
+            self.local_batch_size,
+        )
+        return full_batches * self.local_batch_size + local_remainder
 
 
 class _StatsVideoDataset(Dataset):

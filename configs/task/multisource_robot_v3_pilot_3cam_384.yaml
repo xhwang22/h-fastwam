@@ -1,0 +1,19 @@
+# @package _global_
+
+batch_size: 48
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+lr_scheduler_type: "cosine"
+learning_rate: 5.0e-5
+num_epochs: 1
+max_steps: 1000
+log_every: 1
+save_every: 500
+eval_every: 0
+
+gradient_accumulation_steps: 1
+weight_decay: 5.0e-3
+resume: null

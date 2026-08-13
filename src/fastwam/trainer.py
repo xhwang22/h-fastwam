@@ -679,6 +679,30 @@ class Wan22Trainer:
         )
         return DataLoader(dataset, **loader_kwargs)
 
+    def _assert_route_batch_compatible(self, sample: dict) -> None:
+        route_id = sample.get("route_id")
+        if route_id is None:
+            return
+        if not torch.is_tensor(route_id):
+            route_id = torch.as_tensor(route_id)
+        route_id = route_id.to(
+            device=self.accelerator.device,
+            dtype=torch.int64,
+        ).reshape(-1)
+        if route_id.numel() == 0:
+            raise ValueError("`route_id` must not be empty.")
+        if not bool(torch.all(route_id == route_id[0]).item()):
+            raise ValueError(
+                "One local batch mixes FULL and VIDEO_ONLY samples: "
+                f"{route_id.detach().cpu().tolist()}."
+            )
+        gathered = self.accelerator.gather(route_id[:1]).reshape(-1)
+        if not bool(torch.all(gathered == gathered[0]).item()):
+            raise ValueError(
+                "Distributed global batch mixes routes across ranks: "
+                f"{gathered.detach().cpu().tolist()}."
+            )
+
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
         if not hasattr(dataset, "__len__"):
             raise TypeError(f"`{dataset_name}` must implement __len__ for rank consistency checks.")
@@ -1572,6 +1596,7 @@ class Wan22Trainer:
                         record_function("fastwam_forward") if _torch_prof_step else nullcontext()
                     )
                     with _forward_context:
+                        self._assert_route_batch_compatible(sample)
                         with self.accelerator.autocast():
                             loss, loss_dict = train_model.training_loss(sample)
                     _t_fwd = _cuda_t()

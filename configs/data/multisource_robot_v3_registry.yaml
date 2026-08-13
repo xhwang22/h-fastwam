@@ -1,0 +1,105 @@
+version: 1
+action_schema_id: bimanual_eef20_v1eefT
+canvas_layout: L3
+canvas_size: [384, 320]
+
+# All new sources start in VIDEO_ONLY. Promotion to FULL requires a source
+# adapter plus the action/gripper/base-motion QA gates recorded below.
+sources:
+  - source_id: agibotworld_beta
+    root: ${oc.env:AGIBOT_WORLD_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/AgiBot-World-Beta_lerobotv3}
+    enabled: true
+    route: VIDEO_ONLY
+    weight: 0.17
+    family: dual
+    qa_status: pose_verified_gripper_unverified
+    cameras:
+      head: [observation.images.head]
+      left: [observation.images.hand_left]
+      right: [observation.images.hand_right]
+    mapping_evidence: "meta/info.json and sampled parquet audit, 2026-08-12"
+
+  - source_id: droid
+    root: ${oc.env:DROID_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/DROID_LeRobot-v3.0}
+    enabled: true
+    route: VIDEO_ONLY
+    weight: 0.08
+    family: single
+    qa_status: cartesian_verified_camera_and_gripper_direction_unverified
+    cameras:
+      # exterior_1 is a provisional canonical exterior view. Formal runs must
+      # replace this evidence with decoded-frame/manual camera verification.
+      head: [observation.images.exterior_1_left]
+      left: [observation.images.wrist_left]
+      right: []
+    mapping_evidence: "schema verified; exterior_1 canonical role pending manual frame review"
+
+  - source_id: open_x_embodiment
+    root: ${oc.env:OPEN_X_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/Open-X-Embodiment}
+    enabled: true
+    route: VIDEO_ONLY
+    weight: 0.09
+    family: single
+    qa_status: low_frequency_action_semantics_unverified
+    cameras:
+      head: [observation.images.image]
+      left: []
+      right: []
+    mapping_evidence: "meta/info.json for Bridge, Fractal and BC-Z, 2026-08-12"
+
+  - source_id: robocoin
+    root: ${oc.env:ROBOCOIN_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain_LeRobot/RoboCOIN_v3.0_official}
+    enabled: true
+    route: VIDEO_ONLY
+    weight: 0.08
+    family: dual
+    qa_status: major_camera_clusters_verified_action_clusters_not_canonicalized
+    cameras:
+      head:
+        - observation.images.cam_high_rgb
+        - observation.images.cam_head_rgb
+        - observation.images.cam_front_head_rgb
+        - observation.images.cam_front_rgb
+        - observation.images.cam_front_chest_rgb
+        - observation.images.camera_head_rgb
+        - observation.images.cam_head_left_rgb
+        - observation.images.cam_high_center_fisheye_rgb
+        - observation.images.cam_high_left_rgb
+        - observation.images.cam_chest_rgb
+        - observation.images.cam_high_realsense_rgb
+        - observation.images.ego_view
+        - observation.images.cam_third_view
+        - observation.images.high
+        - observation.images.head
+        - observation.images.front_head
+        - observation.images.front
+        - observation.images.front_chest
+      left:
+        - observation.images.cam_left_wrist_rgb
+        - observation.images.camera_left_wrist_rgb
+        - observation.images.cam_left_wrist_rgb_rgb
+        - observation.images.cam_left_wrist
+        - observation.images.color_left_wrist
+        - observation.images.left_wrist
+      right:
+        - observation.images.cam_right_wrist_rgb
+        - observation.images.camera_right_wrist_rgb
+        - observation.images.cam_right_wrist_rgb_rgb
+        - observation.images.cam_right_wrist
+        - observation.images.color_right_wrist
+        - observation.images.right_wrist
+    mapping_evidence: "major schema clusters and local README audit, 2026-08-12"
+
+  - source_id: galaxea_openworld
+    root: ${oc.env:GALAXEA_ROOT,/apdcephfs/cs/jp_csgl/apdcephfs_csgl/share_306089109/cheerchuang/Data_Pretrain/Galaxea-Open-World-Dataset-LeRobot-v3.0}
+    enabled: true
+    route: VIDEO_ONLY
+    weight: 0.08
+    family: dual
+    qa_status: eef_and_gripper_verified_dynamic_base_not_materialized
+    removed_episode_files: [meta/removed_episodes.json]
+    cameras:
+      head: [observation.images.head_rgb]
+      left: [observation.images.left_wrist_rgb]
+      right: [observation.images.right_wrist_rgb]
+    mapping_evidence: "meta/info.json, README static-base criteria and sampled parquet audit, 2026-08-12"
