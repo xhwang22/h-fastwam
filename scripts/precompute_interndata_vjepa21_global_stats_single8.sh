@@ -20,7 +20,7 @@ if [[ -f "${CONDA_ACTIVATE}" ]]; then
 fi
 
 export INTERN_A1_ROOT="${INTERN_A1_ROOT:-/fsx/pretrain_data/InternData-A1}"
-export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v3}"
+export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v4_10hz}"
 if [[ ! -d "${INTERN_A1_ROOT}" ]]; then
   echo "[vjepa21-stats] ERROR: InternData root does not exist: ${INTERN_A1_ROOT}" >&2
   exit 1
@@ -49,7 +49,7 @@ STATS_NUM_WORKERS="${STATS_NUM_WORKERS:-8}"
 STATS_PREFETCH_FACTOR="${STATS_PREFETCH_FACTOR:-2}"
 STATS_MULTIPROCESSING_CONTEXT="${STATS_MULTIPROCESSING_CONTEXT:-spawn}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
-OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_global_stats.pt}"
+OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_10hz_global_stats.pt}"
 STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
 MAX_SAMPLE_ARGS=()
 if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then

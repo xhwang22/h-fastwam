@@ -11,12 +11,15 @@ train:
   is_training_set: true
   val_set_proportion: 0.01
   seed: ${seed}
+  # Native 30Hz is resampled to the shared 10Hz action contract:
+  # 97 native frames -> 33 control states / 32 actions / 9 video frames.
   num_frames: 33
   action_video_freq_ratio: 4
   video_size: [384, 320]
   # Each local batch gets short sequential blocks from multiple episodes.
   clips_per_episode: 8
-  locality_stride: 4
+  # Shift by one 2.5Hz video frame so adjacent samples reuse 8/9 frames.
+  locality_stride: 12
   max_open_parquet_shards: 2
   max_open_video_shards: 6
   video_decode_threads: 2
@@ -24,7 +27,7 @@ train:
   # three camera windows and decode ahead for batch-level reuse.
   video_frame_cache_entries: 3
   video_prefetch_frames: 24
-  # Adjacent clips share most video frames after every four start offsets.
+  # Adjacent native-frame starts share most 3.2-second video windows.
   resized_frame_cache_entries: 3
   resized_frames_per_entry: 128
   max_retries: 3

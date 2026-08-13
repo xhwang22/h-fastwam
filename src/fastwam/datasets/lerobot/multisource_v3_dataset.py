@@ -987,7 +987,7 @@ class MultiSourceRobotV3Dataset(Dataset):
         full_batch_fraction: Optional[float] = None,
         intern_a1_weight: float = 0.20,
         video_clips_per_episode: int = 8,
-        video_locality_stride: int = 1,
+        video_locality_stride: Optional[int] = None,
         seed: int = 42,
         processor=None,
     ):
@@ -1012,7 +1012,11 @@ class MultiSourceRobotV3Dataset(Dataset):
             )
         self.seed = int(seed)
         self.video_clips_per_episode = max(int(video_clips_per_episode), 1)
-        self.video_locality_stride = max(int(video_locality_stride), 1)
+        self.video_locality_stride = (
+            None
+            if video_locality_stride is None
+            else max(int(video_locality_stride), 1)
+        )
 
         weights = np.asarray(self.external_sources.source_weights, dtype=np.float64)
         if np.any(weights < 0) or float(weights.sum()) <= 0:
@@ -1134,9 +1138,21 @@ class MultiSourceRobotV3Dataset(Dataset):
             cumulative[source_episode_index] - previous_end
         )
         base_start = clip_ordinal - previous_end
+        episode_row = int(
+            self.external_sources.source_route_episode_rows[pool_key][
+                source_episode_index
+            ]
+        )
+        dataset_id = int(self.external_sources.arrays["dataset_id"][episode_row])
+        source_fps = float(self.external_sources.datasets[dataset_id]["fps"])
+        locality_stride = (
+            self.video_locality_stride
+            if self.video_locality_stride is not None
+            else max(int(round(source_fps * 0.4)), 1)
+        )
         for local_index in range(group_size):
             episode_start = (
-                base_start + local_index * self.video_locality_stride
+                base_start + local_index * locality_stride
             ) % episode_clip_count
             yield self._encode_external(
                 route_id,

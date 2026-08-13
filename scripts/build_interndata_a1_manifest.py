@@ -15,8 +15,9 @@ from pathlib import Path
 import numpy as np
 
 
-MANIFEST_VERSION = 3
-MIN_EPISODE_FRAMES = 33
+MANIFEST_VERSION = 4
+NATIVE_WINDOW_FRAMES = 97
+MIN_EPISODE_FRAMES = NATIVE_WINDOW_FRAMES
 
 
 def _discover_dataset_roots(root: Path) -> list[Path]:
@@ -364,9 +365,14 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
         done = {
             "version": MANIFEST_VERSION,
             "source_root": str(root),
+            "native_fps": 30,
+            "target_control_hz": 10,
+            "native_window_frames": NATIVE_WINDOW_FRAMES,
             "dataset_count": len(datasets),
             "episode_count": int(lengths.size),
-            "clip_count_full_horizon": int(np.maximum(lengths - 32, 0).sum()),
+            "clip_count_full_horizon": int(
+                np.maximum(lengths - (NATIVE_WINDOW_FRAMES - 1), 0).sum()
+            ),
             "shard_count": len(shard_to_id),
             "excluded_dataset_count": len(excluded),
             "excluded_datasets": excluded,
@@ -391,7 +397,7 @@ def main() -> None:
     output = (
         Path(args.output)
         if args.output is not None
-        else root / ".fastwam_intern_a1" / "manifest_v3"
+        else root / ".fastwam_intern_a1" / "manifest_v4_10hz"
     )
     build_manifest(root=root, output_dir=output, force=args.force)
 

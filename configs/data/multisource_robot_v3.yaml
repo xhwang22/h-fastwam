@@ -7,7 +7,8 @@ train:
   full_batch_fraction: null
   intern_a1_weight: 0.20
   video_clips_per_episode: 8
-  video_locality_stride: 1
+  # null chooses one 2.5Hz video-frame shift for each source FPS.
+  video_locality_stride: null
   seed: ${seed}
 
   intern_a1:
@@ -16,11 +17,12 @@ train:
     is_training_set: true
     val_set_proportion: 0.01
     seed: ${seed}
+    # InternData native 30Hz is converted to the common 10Hz contract.
     num_frames: 33
     action_video_freq_ratio: 4
     video_size: [384, 320]
     clips_per_episode: 8
-    locality_stride: 4
+    locality_stride: 12
     max_open_parquet_shards: 2
     max_open_video_shards: 6
     video_decode_threads: 2

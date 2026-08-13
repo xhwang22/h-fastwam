@@ -22,6 +22,24 @@ DEFAULT_PROMPT = (
 _ENCODED_INDEX_MARKER = 1 << 62
 _EPISODE_ROW_MASK = (1 << 30) - 1
 _START_MASK = (1 << 32) - 1
+NATIVE_FPS = 30
+TARGET_CONTROL_HZ = 10
+NATIVE_CONTROL_STRIDE = NATIVE_FPS // TARGET_CONTROL_HZ
+NATIVE_WINDOW_FRAMES = 97
+NATIVE_HORIZON = NATIVE_WINDOW_FRAMES - 1
+STATE_NATIVE_INDICES = np.arange(0, NATIVE_HORIZON, NATIVE_CONTROL_STRIDE, dtype=np.int64)
+ACTION_NATIVE_INDICES = np.arange(
+    NATIVE_CONTROL_STRIDE - 1,
+    NATIVE_HORIZON,
+    NATIVE_CONTROL_STRIDE,
+    dtype=np.int64,
+)
+VIDEO_NATIVE_INDICES = np.arange(
+    0,
+    NATIVE_WINDOW_FRAMES,
+    NATIVE_CONTROL_STRIDE * 4,
+    dtype=np.int64,
+)
 
 
 def _quaternion_wxyz_to_matrix(quaternion: np.ndarray) -> np.ndarray:
@@ -243,7 +261,7 @@ class InternDataA1V3Dataset(Dataset):
         action_video_freq_ratio: int = 4,
         video_size: tuple[int, int] | list[int] = (384, 320),
         clips_per_episode: int = 8,
-        locality_stride: int = 4,
+        locality_stride: int = 12,
         max_open_parquet_shards: int = 2,
         max_open_video_shards: int = 6,
         video_decode_threads: int = 2,
@@ -259,7 +277,7 @@ class InternDataA1V3Dataset(Dataset):
         self.manifest_dir = (
             Path(manifest_dir).expanduser().resolve()
             if manifest_dir is not None
-            else self.root / ".fastwam_intern_a1" / "manifest_v3"
+            else self.root / ".fastwam_intern_a1" / "manifest_v4_10hz"
         )
         done_path = self.manifest_dir / "done.json"
         if not done_path.is_file():
@@ -269,6 +287,11 @@ class InternDataA1V3Dataset(Dataset):
             )
         with done_path.open("r", encoding="utf-8") as handle:
             self.manifest = json.load(handle)
+        if int(self.manifest.get("version", -1)) != 4:
+            raise ValueError(
+                "InternData 10Hz pretraining requires manifest version 4. "
+                "Rebuild it with scripts/build_interndata_a1_manifest.py."
+            )
         with (self.manifest_dir / "datasets.json").open("r", encoding="utf-8") as handle:
             self.datasets = json.load(handle)
         with (self.manifest_dir / "tasks.json").open("r", encoding="utf-8") as handle:
@@ -314,7 +337,7 @@ class InternDataA1V3Dataset(Dataset):
         self.is_training_set = bool(is_training_set)
         self.val_set_proportion = float(val_set_proportion)
         self.seed = int(seed)
-        self.video_indices = np.arange(0, 33, 4, dtype=np.int64)
+        self.video_indices = VIDEO_NATIVE_INDICES
         self.clips_per_episode = max(int(clips_per_episode), 1)
         self.locality_stride = max(int(locality_stride), 1)
         self.max_retries = max(int(max_retries), 0)
@@ -333,7 +356,8 @@ class InternDataA1V3Dataset(Dataset):
             raise ValueError("InternData split contains no episodes.")
         self.full_epoch_clip_count = int(
             np.maximum(
-                self.arrays["length"][self.episode_rows].astype(np.int64) - 32,
+                self.arrays["length"][self.episode_rows].astype(np.int64)
+                - NATIVE_HORIZON,
                 0,
             ).sum()
         )
@@ -385,7 +409,7 @@ class InternDataA1V3Dataset(Dataset):
 
         rng = np.random.default_rng(self.seed + int(index))
         episode_row = int(self.episode_rows[int(rng.integers(self.episode_rows.size))])
-        clip_count = int(self.arrays["length"][episode_row]) - 32
+        clip_count = int(self.arrays["length"][episode_row]) - NATIVE_HORIZON
         start = int(rng.integers(max(clip_count, 1)))
         return episode_row, start
 
@@ -400,9 +424,13 @@ class InternDataA1V3Dataset(Dataset):
         rows = self.episode_rows[start_index:end_index].copy()
         rng.shuffle(rows)
         states = [
-            [int(row), 0, max(int(self.arrays["length"][row]) - 32, 0)]
+            [
+                int(row),
+                0,
+                max(int(self.arrays["length"][row]) - NATIVE_HORIZON, 0),
+            ]
             for row in rows
-            if int(self.arrays["length"][row]) > 32
+            if int(self.arrays["length"][row]) > NATIVE_HORIZON
         ]
         cursor = 0
         batch = []
@@ -489,7 +517,9 @@ class InternDataA1V3Dataset(Dataset):
                 rows = self.episode_rows[start_index:end_index].copy()
                 rng.shuffle(rows)
                 for episode_row in rows:
-                    clip_count = int(self.arrays["length"][episode_row]) - 32
+                    clip_count = (
+                        int(self.arrays["length"][episode_row]) - NATIVE_HORIZON
+                    )
                     if clip_count <= 0:
                         continue
                     base_start = int(rng.integers(clip_count))
@@ -536,37 +566,39 @@ class InternDataA1V3Dataset(Dataset):
             - int(self.arrays["data_file_from"][episode_row])
             + int(clip_start)
         )
-        state_slice = slice(local_start, local_start + 32)
-        action_slice = slice(local_start, local_start + 32)
+        state_indices = local_start + STATE_NATIVE_INDICES
+        action_indices = local_start + ACTION_NATIVE_INDICES
 
         arm_count = 2 if metadata["family"] == "dual" else 1
         state_pose = np.stack(
             [
-                np.asarray(payload[key][state_slice], dtype=np.float32)
+                np.asarray(payload[key][state_indices], dtype=np.float32)
                 for key in metadata["state_pose_keys"]
             ],
             axis=1,
         )
         action_pose = np.stack(
             [
-                np.asarray(payload[key][action_slice], dtype=np.float32)
+                np.asarray(payload[key][action_indices], dtype=np.float32)
                 for key in metadata["action_pose_keys"]
             ],
             axis=1,
         )
         action_gripper = np.stack(
             [
-                _canonical_gripper_open(payload[key][action_slice]).reshape(-1)
+                _canonical_gripper_open(payload[key][action_indices]).reshape(-1)
                 for key in metadata["action_gripper_keys"]
             ],
             axis=1,
         )
         state_gripper = np.zeros_like(action_gripper)
         if clip_start > 0:
-            previous_slice = slice(local_start - 1, local_start + 31)
+            state_gripper_indices = local_start + STATE_NATIVE_INDICES - 1
             state_gripper = np.stack(
                 [
-                    _canonical_gripper_open(payload[key][previous_slice]).reshape(-1)
+                    _canonical_gripper_open(
+                        payload[key][state_gripper_indices]
+                    ).reshape(-1)
                     for key in metadata["action_gripper_keys"]
                 ],
                 axis=1,
@@ -577,7 +609,18 @@ class InternDataA1V3Dataset(Dataset):
             # this affects only one clip per episode and avoids an arbitrary
             # half-open proprio value.
             state_gripper[0] = action_gripper[0]
-            state_gripper[1:] = action_gripper[:-1]
+            initial_episode_state_indices = (
+                local_start + STATE_NATIVE_INDICES[1:] - 1
+            )
+            state_gripper[1:] = np.stack(
+                [
+                    _canonical_gripper_open(
+                        payload[key][initial_episode_state_indices]
+                    ).reshape(-1)
+                    for key in metadata["action_gripper_keys"]
+                ],
+                axis=1,
+            )
 
         if (
             state_pose.shape != (32, arm_count, 7)
@@ -838,7 +881,9 @@ class InternDataA1V3Dataset(Dataset):
                 episode_row = int(
                     self.episode_rows[fallback % int(self.episode_rows.size)]
                 )
-                clip_count = int(self.arrays["length"][episode_row]) - 32
+                clip_count = (
+                    int(self.arrays["length"][episode_row]) - NATIVE_HORIZON
+                )
                 clip_start = (fallback >> 32) % max(clip_count, 1)
                 logger.warning(
                     "InternData sample failed (attempt %d/%d): %s",

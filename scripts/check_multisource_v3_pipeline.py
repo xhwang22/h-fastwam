@@ -40,7 +40,7 @@ def _validate_route_sampler(
         float(intern_weight) + video_weight
     )
     dataset.video_clips_per_episode = 8
-    dataset.video_locality_stride = 1
+    dataset.video_locality_stride = None
     dataset.intern_a1 = _DummyInternData()
     dataset.external_sources = video_dataset
     full_source_ids = [-1]
