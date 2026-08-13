@@ -64,6 +64,7 @@ if [[ ! "${STATS_SHARD_RUN_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
 fi
 SHARD_DIR="${STATS_SHARD_DIR:-${OUTPUT_PATH}.shards/${STATS_SHARD_RUN_NAME}}"
 STATS_MERGE_TIMEOUT="${STATS_MERGE_TIMEOUT:-7200}"
+STATS_LOCAL_MASTER_PORT="${VJEPA21_STATS_LOCAL_MASTER_PORT:-29547}"
 MAX_SAMPLE_ARGS=()
 if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then
   MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")
@@ -76,15 +77,16 @@ done
 DATA_OVERRIDE_ARGS+=(--data-override "data.train.num_segments=1")
 
 GLOBAL_RANK_OFFSET=$(( NODE_RANK * NPROC_PER_NODE ))
-echo "[robotwin-vjepa21-stats-8x8] node_rank=${NODE_RANK}/${NNODES} gpus_per_node=${NPROC_PER_NODE} rank_offset=${GLOBAL_RANK_OFFSET}"
+echo "[robotwin-vjepa21-stats-8x8] node_rank=${NODE_RANK}/${NNODES} gpus_per_node=${NPROC_PER_NODE} rank_offset=${GLOBAL_RANK_OFFSET} local_rdzv=127.0.0.1:${STATS_LOCAL_MASTER_PORT}"
 echo "[robotwin-vjepa21-stats-8x8] output=${OUTPUT_PATH}"
 echo "[robotwin-vjepa21-stats-8x8] shards=${SHARD_DIR}"
 
 torchrun \
-  --standalone \
   --nnodes=1 \
   --node_rank=0 \
   --nproc_per_node="${NPROC_PER_NODE}" \
+  --master_addr=127.0.0.1 \
+  --master_port="${STATS_LOCAL_MASTER_PORT}" \
   scripts/precompute_vjepa21_stats.py \
   --data-config "${ROBOTWIN_DATA_CONFIG}" \
   --output-path "${OUTPUT_PATH}" \
