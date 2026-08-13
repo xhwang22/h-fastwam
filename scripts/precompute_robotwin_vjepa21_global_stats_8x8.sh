@@ -65,6 +65,7 @@ fi
 SHARD_DIR="${STATS_SHARD_DIR:-${OUTPUT_PATH}.shards/${STATS_SHARD_RUN_NAME}}"
 STATS_MERGE_TIMEOUT="${STATS_MERGE_TIMEOUT:-7200}"
 STATS_LOCAL_MASTER_PORT="${VJEPA21_STATS_LOCAL_MASTER_PORT:-29547}"
+STATS_LOG_DIR="${STATS_LOG_DIR:-${SHARD_DIR}/logs}"
 MAX_SAMPLE_ARGS=()
 if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then
   MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")
@@ -77,42 +78,49 @@ done
 DATA_OVERRIDE_ARGS+=(--data-override "data.train.num_segments=1")
 
 GLOBAL_RANK_OFFSET=$(( NODE_RANK * NPROC_PER_NODE ))
+mkdir -p "${STATS_LOG_DIR}"
+LOG_FILE="${STATS_LOG_DIR}/node-${NODE_RANK}-of-${NNODES}.log"
 echo "[robotwin-vjepa21-stats-8x8] node_rank=${NODE_RANK}/${NNODES} gpus_per_node=${NPROC_PER_NODE} rank_offset=${GLOBAL_RANK_OFFSET} local_rdzv=127.0.0.1:${STATS_LOCAL_MASTER_PORT}"
 echo "[robotwin-vjepa21-stats-8x8] output=${OUTPUT_PATH}"
 echo "[robotwin-vjepa21-stats-8x8] shards=${SHARD_DIR}"
+echo "[robotwin-vjepa21-stats-8x8] log=${LOG_FILE}"
 
-torchrun \
-  --nnodes=1 \
-  --node_rank=0 \
-  --nproc_per_node="${NPROC_PER_NODE}" \
-  --master_addr=127.0.0.1 \
-  --master_port="${STATS_LOCAL_MASTER_PORT}" \
-  scripts/precompute_vjepa21_stats.py \
-  --data-config "${ROBOTWIN_DATA_CONFIG}" \
-  --output-path "${OUTPUT_PATH}" \
-  --checkpoint-path "${VJEPA21_CHECKPOINT}" \
-  --repo-path "${VJEPA21_REPO}" \
-  --model-name vjepa2_1_vit_gigantic_384 \
-  "${MAX_SAMPLE_ARGS[@]}" \
-  --batch-size "${STATS_BATCH_SIZE}" \
-  --num-workers "${STATS_NUM_WORKERS}" \
-  --prefetch-factor "${STATS_PREFETCH_FACTOR}" \
-  --multiprocessing-context "${STATS_MULTIPROCESSING_CONTEXT}" \
-  --temporal-downsample "${TEMPORAL_DOWNSAMPLE}" \
-  --causal-tubelet-encoding \
-  --shard-output-dir "${SHARD_DIR}" \
-  --shard-rank-offset "${GLOBAL_RANK_OFFSET}" \
-  --shard-world-size 64 \
-  --resume-shards \
-  "${DATA_OVERRIDE_ARGS[@]}" \
+TORCHRUN_CMD=(
+  torchrun
+  --nnodes=1
+  --node_rank=0
+  --nproc_per_node="${NPROC_PER_NODE}"
+  --master_addr=127.0.0.1
+  --master_port="${STATS_LOCAL_MASTER_PORT}"
+  scripts/precompute_vjepa21_stats.py
+  --data-config "${ROBOTWIN_DATA_CONFIG}"
+  --output-path "${OUTPUT_PATH}"
+  --checkpoint-path "${VJEPA21_CHECKPOINT}"
+  --repo-path "${VJEPA21_REPO}"
+  --model-name vjepa2_1_vit_gigantic_384
+  "${MAX_SAMPLE_ARGS[@]}"
+  --batch-size "${STATS_BATCH_SIZE}"
+  --num-workers "${STATS_NUM_WORKERS}"
+  --prefetch-factor "${STATS_PREFETCH_FACTOR}"
+  --multiprocessing-context "${STATS_MULTIPROCESSING_CONTEXT}"
+  --temporal-downsample "${TEMPORAL_DOWNSAMPLE}"
+  --causal-tubelet-encoding
+  --shard-output-dir "${SHARD_DIR}"
+  --shard-rank-offset "${GLOBAL_RANK_OFFSET}"
+  --shard-world-size 64
+  --resume-shards
+  "${DATA_OVERRIDE_ARGS[@]}"
   "$@"
+)
+"${TORCHRUN_CMD[@]}" 2>&1 | tee "${LOG_FILE}"
 
 if (( NODE_RANK == 0 )); then
   python scripts/merge_vjepa21_stats_shards.py \
     --shard-dir "${SHARD_DIR}" \
     --output-path "${OUTPUT_PATH}" \
     --expected-world-size 64 \
-    --wait-timeout "${STATS_MERGE_TIMEOUT}"
+    --wait-timeout "${STATS_MERGE_TIMEOUT}" \
+    2>&1 | tee -a "${LOG_FILE}"
 else
   echo "[robotwin-vjepa21-stats-8x8] node ${NODE_RANK} completed its local shards."
 fi

@@ -644,10 +644,13 @@ def main() -> None:
             prefetch_factor=args.prefetch_factor,
             multiprocessing_context=args.multiprocessing_context,
         )
+        show_progress = rank == 0
+        if shard_path is not None:
+            show_progress = int(os.environ.get("LOCAL_RANK", "0")) == 0
         progress = tqdm(
             total=len(sampler),
             desc=f"rank {rank} V-JEPA stats",
-            disable=rank != 0,
+            disable=not show_progress,
             unit="video",
         )
         accumulator = WelfordAccumulator(encoder.output_dim)
@@ -667,7 +670,7 @@ def main() -> None:
                 latents = _encode_raw_latents(encoder, videos, device)
                 accumulator.update(latents)
                 processed_videos += int(videos.shape[0])
-            if rank == 0:
+            if show_progress:
                 progress.set_postfix(
                     videos=processed_videos,
                     failed=failed_samples,
