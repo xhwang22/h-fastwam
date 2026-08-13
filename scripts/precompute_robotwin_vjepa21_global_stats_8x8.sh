@@ -20,6 +20,8 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE=8
 export FASTWAM_EXPECTED_WORLD_SIZE=64
+# Statistics only exchange a tiny CPU payload, so EFA/NCCL is unnecessary.
+export FASTWAM_USE_EFA=0
 export MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-${MASTER_PORT:-29547}}"
 
 # HyperPod/PET provides PET_NNODES, PET_NODE_RANK, PET_MASTER_ADDR, and

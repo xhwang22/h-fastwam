@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 import tempfile
+from datetime import timedelta
 from itertools import islice
 from pathlib import Path
 from typing import Iterator
@@ -92,8 +93,19 @@ def _init_distributed() -> tuple[int, int, torch.device]:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
-        return dist.get_rank(), dist.get_world_size(), torch.device("cuda", local_rank)
+        dist.init_process_group(
+            backend="gloo",
+            timeout=timedelta(minutes=10),
+        )
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        dist.barrier()
+        logger.info(
+            "Rank %d/%d completed the distributed Gloo connectivity check.",
+            rank,
+            world_size,
+        )
+        return rank, world_size, torch.device("cuda", local_rank)
     torch.cuda.set_device(0)
     return 0, 1, torch.device("cuda", 0)
 
@@ -514,10 +526,16 @@ def main() -> None:
                 )
                 progress.update(sample_count)
         progress.close()
+        logger.info(
+            "Rank %d finished its local shard: samples=%d videos=%d failed=%d.",
+            rank,
+            processed_samples,
+            processed_videos,
+            failed_samples,
+        )
 
         count_tensor = torch.tensor(
             [processed_videos, failed_samples],
-            device=device,
             dtype=torch.long,
         )
         if world_size > 1:
