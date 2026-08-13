@@ -44,11 +44,14 @@ fi
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE=8
-MAX_SAMPLES="${MAX_SAMPLES:-10000}"
 STATS_BATCH_SIZE="${STATS_BATCH_SIZE:-2}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
 OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_global_stats.pt}"
 STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
+MAX_SAMPLE_ARGS=()
+if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then
+  MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")
+fi
 
 exec torchrun \
   --nnodes=1 \
@@ -62,7 +65,7 @@ exec torchrun \
   --checkpoint-path "${VJEPA21_CHECKPOINT}" \
   --repo-path "${VJEPA21_REPO}" \
   --model-name vjepa2_1_vit_gigantic_384 \
-  --max-samples "${MAX_SAMPLES}" \
+  "${MAX_SAMPLE_ARGS[@]}" \
   --batch-size "${STATS_BATCH_SIZE}" \
   --temporal-downsample "${TEMPORAL_DOWNSAMPLE}" \
   --causal-tubelet-encoding \

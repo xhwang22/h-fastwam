@@ -276,7 +276,12 @@ def main() -> None:
         "--model-name",
         default="vjepa2_1_vit_gigantic_384",
     )
-    parser.add_argument("--max-samples", type=int, default=10000)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum dataset samples across all ranks; omit to scan the full split.",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--spatial-downsample", type=int, default=16)
