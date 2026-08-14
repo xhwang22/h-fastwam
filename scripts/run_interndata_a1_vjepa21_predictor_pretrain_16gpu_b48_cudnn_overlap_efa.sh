@@ -24,18 +24,22 @@ python scripts/build_interndata_a1_manifest.py \
   --output "${INTERN_A1_MANIFEST_DIR}" \
   --target-control-hz 30
 
-export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_30hz_global_stats.pt}"
-if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
-  echo "[interndata-a1] ERROR: V-JEPA global stats do not exist: ${VJEPA21_NORMALISE_STATS_PATH}" >&2
-  echo "Run scripts/precompute_interndata_vjepa21_global_stats_single8.sh first." >&2
-  exit 1
+if [[ -n "${VJEPA21_NORMALISE_STATS_PATH:-}" ]]; then
+  if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
+    echo "[interndata-a1] ERROR: V-JEPA global stats do not exist: ${VJEPA21_NORMALISE_STATS_PATH}" >&2
+    exit 1
+  fi
+  python scripts/check_vjepa_stats_compat.py \
+    --stats "${VJEPA21_NORMALISE_STATS_PATH}" \
+    --data-config interndata_a1_v3_30hz \
+    --model-name vjepa2_1_vit_gigantic_384 \
+    --temporal-downsample 4 \
+    --causal-tubelet-encoding
+  NORMALISATION_LABEL=globalnorm
+else
+  unset VJEPA21_NORMALISE_STATS_PATH
+  NORMALISATION_LABEL=localnorm
 fi
-python scripts/check_vjepa_stats_compat.py \
-  --stats "${VJEPA21_NORMALISE_STATS_PATH}" \
-  --data-config interndata_a1_v3_30hz \
-  --model-name vjepa2_1_vit_gigantic_384 \
-  --temporal-downsample 4 \
-  --causal-tubelet-encoding
 export STANDARDISE_OUTPUT=true
 
 DATA_GATE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
@@ -64,10 +68,10 @@ export LOG_EVERY=1
 export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-1}"
-export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_30hz_globalnorm_16gpu_b48}"
+export RUN_NAME="${RUN_NAME:-interndata_a1_vjepa21_predictor_pretrain_30hz_${NORMALISATION_LABEL}_16gpu_b48}"
 export WANDB="${WANDB:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-interndata-a1}"
-export WANDB_GROUP="${WANDB_GROUP:-vjepa21-predictor-pretrain-globalnorm}"
+export WANDB_GROUP="${WANDB_GROUP:-vjepa21-predictor-pretrain-${NORMALISATION_LABEL}}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
 exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor_causal_tubelet_aws.sh" \
