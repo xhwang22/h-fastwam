@@ -19,7 +19,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 
-MANIFEST_VERSION = 4
+MANIFEST_VERSION = 5
 WINDOW_SECONDS = 3.2
 ROUTE_FULL = 0
 ROUTE_VIDEO_ONLY = 1
@@ -488,6 +488,9 @@ def build_manifest(
         task_to_id: dict[str, int] = {}
         excluded = []
         shard_to_id: dict[tuple, int] = {}
+        video_exists_cache: dict[str, bool] = {}
+        missing_video_files: set[str] = set()
+        missing_video_episode_count = 0
 
         for source_config in registry["sources"]:
             if not bool(source_config.get("enabled", True)):
@@ -598,6 +601,29 @@ def build_manifest(
                         for role in ("head", "left", "right")
                     }
                     if not _keep_episode(family, camera_values):
+                        continue
+                    episode_video_missing = False
+                    for role, camera_key in camera_keys.items():
+                        if camera_key is None:
+                            continue
+                        chunk, file_index, _ = camera_values[role]
+                        video_path = dataset_root / (
+                            f"videos/{camera_key}/chunk-{chunk:03d}/"
+                            f"file-{file_index:03d}.mp4"
+                        )
+                        cache_key = str(video_path)
+                        exists = video_exists_cache.get(cache_key)
+                        if exists is None:
+                            exists = video_path.is_file()
+                            video_exists_cache[cache_key] = exists
+                        if not exists:
+                            episode_video_missing = True
+                            missing_video_files.add(
+                                f"{source_name}/"
+                                f"{video_path.relative_to(source_root)}"
+                            )
+                    if episode_video_missing:
+                        missing_video_episode_count += 1
                         continue
                     data_chunk, data_file, data_file_from = _resolve_data_file(
                         dataset_from_index=int(row["dataset_from_index"]),
@@ -766,6 +792,9 @@ def build_manifest(
             "source_route_native_start_counts": source_route_clip_counts,
             "excluded_dataset_count": len(excluded),
             "excluded_datasets": excluded,
+            "missing_video_episode_count": missing_video_episode_count,
+            "missing_video_file_count": len(missing_video_files),
+            "missing_video_files": sorted(missing_video_files)[:1000],
         }
         with (tmp_dir / "done.json").open("w", encoding="utf-8") as handle:
             json.dump(done, handle, ensure_ascii=True, indent=2)

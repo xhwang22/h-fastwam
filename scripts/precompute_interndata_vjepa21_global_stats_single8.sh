@@ -20,7 +20,7 @@ if [[ -f "${CONDA_ACTIVATE}" ]]; then
 fi
 
 export INTERN_A1_ROOT="${INTERN_A1_ROOT:-/fsx/pretrain_data/InternData-A1}"
-export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v4_10hz}"
+export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v5_10hz}"
 if [[ ! -d "${INTERN_A1_ROOT}" ]]; then
   echo "[vjepa21-stats] ERROR: InternData root does not exist: ${INTERN_A1_ROOT}" >&2
   exit 1

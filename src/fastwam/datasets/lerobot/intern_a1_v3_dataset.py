@@ -277,7 +277,7 @@ class InternDataA1V3Dataset(Dataset):
         self.manifest_dir = (
             Path(manifest_dir).expanduser().resolve()
             if manifest_dir is not None
-            else self.root / ".fastwam_intern_a1" / "manifest_v4_10hz"
+            else self.root / ".fastwam_intern_a1" / "manifest_v5_10hz"
         )
         done_path = self.manifest_dir / "done.json"
         if not done_path.is_file():
@@ -287,9 +287,9 @@ class InternDataA1V3Dataset(Dataset):
             )
         with done_path.open("r", encoding="utf-8") as handle:
             self.manifest = json.load(handle)
-        if int(self.manifest.get("version", -1)) != 4:
+        if int(self.manifest.get("version", -1)) != 5:
             raise ValueError(
-                "InternData 10Hz pretraining requires manifest version 4. "
+                "InternData 10Hz pretraining requires manifest version 5. "
                 "Rebuild it with scripts/build_interndata_a1_manifest.py."
             )
         with (self.manifest_dir / "datasets.json").open("r", encoding="utf-8") as handle:

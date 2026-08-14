@@ -298,7 +298,7 @@ class CanonicalLeRobotV3Dataset(Dataset):
             )
         with done_path.open("r", encoding="utf-8") as handle:
             self.manifest = json.load(handle)
-        if int(self.manifest.get("version", -1)) != 4:
+        if int(self.manifest.get("version", -1)) != 5:
             raise ValueError(
                 "Unsupported multisource video manifest version: "
                 f"{self.manifest.get('version')}. Rebuild the manifest."
@@ -394,6 +394,7 @@ class CanonicalLeRobotV3Dataset(Dataset):
         self.dataset_id_offset = 0
 
         self._parquet_cache = _ParquetShardCache(max_open_parquet_shards)
+        self._parquet_schema_cache: dict[str, set[str]] = {}
         self._video_decoder = _PyAVShardDecoder(
             max_open_videos=max_open_video_shards,
             decode_threads=video_decode_threads,
@@ -565,6 +566,36 @@ class CanonicalLeRobotV3Dataset(Dataset):
             f"data/chunk-{data_chunk:03d}/file-{data_file:03d}.parquet"
         )
         columns = self._adapter_columns(metadata)
+        adapter_type = metadata["adapter"]["type"]
+        if adapter_type == "robocoin_eef":
+            import pyarrow.parquet as pq
+
+            cache_key = str(data_path)
+            available = self._parquet_schema_cache.get(cache_key)
+            if available is None:
+                available = set(
+                    pq.ParquetFile(data_path).schema_arrow.names
+                )
+                self._parquet_schema_cache[cache_key] = available
+            optional = {
+                "gripper_open_scale_state",
+                "gripper_open_scale_action",
+            }
+            required_missing = [
+                column
+                for column in columns
+                if column not in available and column not in optional
+            ]
+            if required_missing:
+                raise ValueError(
+                    f"RoboCOIN parquet {data_path} is missing required "
+                    f"canonical columns: {required_missing}."
+                )
+            columns = [
+                column
+                for column in columns
+                if column in available
+            ]
         payload = self._parquet_cache.get(data_path, columns)
         fps = float(metadata["fps"])
         native_count = int(np.ceil(3.2 * fps)) + 1
@@ -749,7 +780,12 @@ class CanonicalLeRobotV3Dataset(Dataset):
                 source_times,
                 _ACTION_OFFSETS_SECONDS,
             )
-            if adapter.get("has_gripper", False):
+            has_gripper = (
+                adapter.get("has_gripper", False)
+                and "gripper_open_scale_state" in payload
+                and "gripper_open_scale_action" in payload
+            )
+            if has_gripper:
                 state_gripper = np.asarray(
                     payload["gripper_open_scale_state"][native_slice],
                     dtype=np.float32,

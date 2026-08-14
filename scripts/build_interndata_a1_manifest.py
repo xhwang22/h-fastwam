@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 
-MANIFEST_VERSION = 4
+MANIFEST_VERSION = 5
 NATIVE_WINDOW_FRAMES = 97
 MIN_EPISODE_FRAMES = NATIVE_WINDOW_FRAMES
 
@@ -236,6 +236,9 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
         tasks: list[str] = []
         shard_to_id: dict[tuple, int] = {}
         excluded = []
+        video_exists_cache: dict[str, bool] = {}
+        missing_video_files: set[str] = set()
+        missing_video_episode_count = 0
 
         for source_root in dataset_roots:
             with (source_root / "meta" / "info.json").open("r", encoding="utf-8") as handle:
@@ -287,6 +290,28 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
                         int(row[f"videos/{camera_key}/file_index"]),
                         float(row[f"videos/{camera_key}/from_timestamp"]),
                     )
+                episode_video_missing = False
+                for role, camera_key in schema["camera_keys"].items():
+                    if camera_key is None:
+                        continue
+                    chunk, file_index, _ = camera_values[role]
+                    video_path = source_root / (
+                        f"videos/{camera_key}/chunk-{chunk:03d}/"
+                        f"file-{file_index:03d}.mp4"
+                    )
+                    cache_key = str(video_path)
+                    exists = video_exists_cache.get(cache_key)
+                    if exists is None:
+                        exists = video_path.is_file()
+                        video_exists_cache[cache_key] = exists
+                    if not exists:
+                        episode_video_missing = True
+                        missing_video_files.add(
+                            str(video_path.relative_to(root))
+                        )
+                if episode_video_missing:
+                    missing_video_episode_count += 1
+                    continue
 
                 data_chunk, data_file, data_file_from = _resolve_data_file(
                     dataset_from_index=int(row["dataset_from_index"]),
@@ -376,6 +401,9 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
             "shard_count": len(shard_to_id),
             "excluded_dataset_count": len(excluded),
             "excluded_datasets": excluded,
+            "missing_video_episode_count": missing_video_episode_count,
+            "missing_video_file_count": len(missing_video_files),
+            "missing_video_files": sorted(missing_video_files)[:1000],
         }
         with (tmp_dir / "done.json").open("w", encoding="utf-8") as handle:
             json.dump(done, handle, ensure_ascii=True, indent=2)
@@ -397,7 +425,7 @@ def main() -> None:
     output = (
         Path(args.output)
         if args.output is not None
-        else root / ".fastwam_intern_a1" / "manifest_v4_10hz"
+        else root / ".fastwam_intern_a1" / "manifest_v5_10hz"
     )
     build_manifest(root=root, output_dir=output, force=args.force)
 

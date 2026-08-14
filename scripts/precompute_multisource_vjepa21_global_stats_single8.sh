@@ -40,8 +40,8 @@ for variable in \
   fi
 done
 
-export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v4_10hz}"
-export MULTISOURCE_VIDEO_MANIFEST_DIR="${MULTISOURCE_VIDEO_MANIFEST_DIR:-${PRETRAIN_DATA_ROOT}/.fastwam_multisource/canonical_manifest_v4}"
+export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v5_10hz}"
+export MULTISOURCE_VIDEO_MANIFEST_DIR="${MULTISOURCE_VIDEO_MANIFEST_DIR:-${PRETRAIN_DATA_ROOT}/.fastwam_multisource/canonical_manifest_v5}"
 MULTISOURCE_REGISTRY="${MULTISOURCE_REGISTRY:-configs/data/multisource_robot_v3_registry.yaml}"
 python scripts/build_interndata_a1_manifest.py \
   --root "${INTERN_A1_ROOT}" \
