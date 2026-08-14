@@ -24,22 +24,64 @@ _EPISODE_ROW_MASK = (1 << 30) - 1
 _START_MASK = (1 << 32) - 1
 NATIVE_FPS = 30
 TARGET_CONTROL_HZ = 10
-NATIVE_CONTROL_STRIDE = NATIVE_FPS // TARGET_CONTROL_HZ
-NATIVE_WINDOW_FRAMES = 97
-NATIVE_HORIZON = NATIVE_WINDOW_FRAMES - 1
-STATE_NATIVE_INDICES = np.arange(0, NATIVE_HORIZON, NATIVE_CONTROL_STRIDE, dtype=np.int64)
-ACTION_NATIVE_INDICES = np.arange(
-    NATIVE_CONTROL_STRIDE - 1,
-    NATIVE_HORIZON,
-    NATIVE_CONTROL_STRIDE,
-    dtype=np.int64,
-)
-VIDEO_NATIVE_INDICES = np.arange(
-    0,
-    NATIVE_WINDOW_FRAMES,
-    NATIVE_CONTROL_STRIDE * 4,
-    dtype=np.int64,
-)
+
+
+def build_temporal_contract(target_control_hz: int) -> dict:
+    target_control_hz = int(target_control_hz)
+    if target_control_hz <= 0 or NATIVE_FPS % target_control_hz != 0:
+        raise ValueError(
+            f"InternData target_control_hz must divide {NATIVE_FPS}, "
+            f"got {target_control_hz}."
+        )
+    control_stride = NATIVE_FPS // target_control_hz
+    native_horizon = 32 * control_stride
+    native_window_frames = native_horizon + 1
+    state_indices = np.arange(
+        0,
+        native_horizon,
+        control_stride,
+        dtype=np.int64,
+    )
+    action_indices = np.arange(
+        control_stride - 1,
+        native_horizon,
+        control_stride,
+        dtype=np.int64,
+    )
+    video_indices = np.arange(
+        0,
+        native_window_frames,
+        control_stride * 4,
+        dtype=np.int64,
+    )
+    if (
+        state_indices.size != 32
+        or action_indices.size != 32
+        or video_indices.size != 9
+    ):
+        raise ValueError(
+            "InternData temporal contract must produce 32 states/actions "
+            f"and 9 video frames, got {state_indices.size}/"
+            f"{action_indices.size}/{video_indices.size}."
+        )
+    return {
+        "target_control_hz": target_control_hz,
+        "control_stride": control_stride,
+        "native_horizon": native_horizon,
+        "native_window_frames": native_window_frames,
+        "state_indices": state_indices,
+        "action_indices": action_indices,
+        "video_indices": video_indices,
+    }
+
+
+_DEFAULT_TEMPORAL_CONTRACT = build_temporal_contract(TARGET_CONTROL_HZ)
+NATIVE_CONTROL_STRIDE = _DEFAULT_TEMPORAL_CONTRACT["control_stride"]
+NATIVE_WINDOW_FRAMES = _DEFAULT_TEMPORAL_CONTRACT["native_window_frames"]
+NATIVE_HORIZON = _DEFAULT_TEMPORAL_CONTRACT["native_horizon"]
+STATE_NATIVE_INDICES = _DEFAULT_TEMPORAL_CONTRACT["state_indices"]
+ACTION_NATIVE_INDICES = _DEFAULT_TEMPORAL_CONTRACT["action_indices"]
+VIDEO_NATIVE_INDICES = _DEFAULT_TEMPORAL_CONTRACT["video_indices"]
 
 
 def _quaternion_wxyz_to_matrix(quaternion: np.ndarray) -> np.ndarray:
@@ -259,6 +301,7 @@ class InternDataA1V3Dataset(Dataset):
         seed: int = 42,
         num_frames: int = 33,
         action_video_freq_ratio: int = 4,
+        target_control_hz: int = TARGET_CONTROL_HZ,
         video_size: tuple[int, int] | list[int] = (384, 320),
         clips_per_episode: int = 8,
         locality_stride: int = 12,
@@ -291,6 +334,29 @@ class InternDataA1V3Dataset(Dataset):
             raise ValueError(
                 "InternData 10Hz pretraining requires manifest version 5. "
                 "Rebuild it with scripts/build_interndata_a1_manifest.py."
+            )
+        temporal_contract = build_temporal_contract(target_control_hz)
+        self.target_control_hz = temporal_contract["target_control_hz"]
+        self.native_control_stride = temporal_contract["control_stride"]
+        self.native_horizon = temporal_contract["native_horizon"]
+        self.native_window_frames = temporal_contract["native_window_frames"]
+        self.state_native_indices = temporal_contract["state_indices"]
+        self.action_native_indices = temporal_contract["action_indices"]
+        self.video_indices = temporal_contract["video_indices"]
+        if int(self.manifest.get("target_control_hz", -1)) != self.target_control_hz:
+            raise ValueError(
+                "InternData manifest/control-rate mismatch: "
+                f"manifest={self.manifest.get('target_control_hz')}Hz, "
+                f"dataset={self.target_control_hz}Hz."
+            )
+        if (
+            int(self.manifest.get("native_window_frames", -1))
+            != self.native_window_frames
+        ):
+            raise ValueError(
+                "InternData manifest/window mismatch: "
+                f"manifest={self.manifest.get('native_window_frames')}, "
+                f"dataset={self.native_window_frames}."
             )
         with (self.manifest_dir / "datasets.json").open("r", encoding="utf-8") as handle:
             self.datasets = json.load(handle)
@@ -337,7 +403,6 @@ class InternDataA1V3Dataset(Dataset):
         self.is_training_set = bool(is_training_set)
         self.val_set_proportion = float(val_set_proportion)
         self.seed = int(seed)
-        self.video_indices = VIDEO_NATIVE_INDICES
         self.clips_per_episode = max(int(clips_per_episode), 1)
         self.locality_stride = max(int(locality_stride), 1)
         self.max_retries = max(int(max_retries), 0)
@@ -357,7 +422,7 @@ class InternDataA1V3Dataset(Dataset):
         self.full_epoch_clip_count = int(
             np.maximum(
                 self.arrays["length"][self.episode_rows].astype(np.int64)
-                - NATIVE_HORIZON,
+                - self.native_horizon,
                 0,
             ).sum()
         )
@@ -409,7 +474,9 @@ class InternDataA1V3Dataset(Dataset):
 
         rng = np.random.default_rng(self.seed + int(index))
         episode_row = int(self.episode_rows[int(rng.integers(self.episode_rows.size))])
-        clip_count = int(self.arrays["length"][episode_row]) - NATIVE_HORIZON
+        clip_count = (
+            int(self.arrays["length"][episode_row]) - self.native_horizon
+        )
         start = int(rng.integers(max(clip_count, 1)))
         return episode_row, start
 
@@ -427,10 +494,13 @@ class InternDataA1V3Dataset(Dataset):
             [
                 int(row),
                 0,
-                max(int(self.arrays["length"][row]) - NATIVE_HORIZON, 0),
+                max(
+                    int(self.arrays["length"][row]) - self.native_horizon,
+                    0,
+                ),
             ]
             for row in rows
-            if int(self.arrays["length"][row]) > NATIVE_HORIZON
+            if int(self.arrays["length"][row]) > self.native_horizon
         ]
         cursor = 0
         batch = []
@@ -518,7 +588,8 @@ class InternDataA1V3Dataset(Dataset):
                 rng.shuffle(rows)
                 for episode_row in rows:
                     clip_count = (
-                        int(self.arrays["length"][episode_row]) - NATIVE_HORIZON
+                        int(self.arrays["length"][episode_row])
+                        - self.native_horizon
                     )
                     if clip_count <= 0:
                         continue
@@ -566,8 +637,8 @@ class InternDataA1V3Dataset(Dataset):
             - int(self.arrays["data_file_from"][episode_row])
             + int(clip_start)
         )
-        state_indices = local_start + STATE_NATIVE_INDICES
-        action_indices = local_start + ACTION_NATIVE_INDICES
+        state_indices = local_start + self.state_native_indices
+        action_indices = local_start + self.action_native_indices
 
         arm_count = 2 if metadata["family"] == "dual" else 1
         state_pose = np.stack(
@@ -593,7 +664,9 @@ class InternDataA1V3Dataset(Dataset):
         )
         state_gripper = np.zeros_like(action_gripper)
         if clip_start > 0:
-            state_gripper_indices = local_start + STATE_NATIVE_INDICES - 1
+            state_gripper_indices = (
+                local_start + self.state_native_indices - 1
+            )
             state_gripper = np.stack(
                 [
                     _canonical_gripper_open(
@@ -610,7 +683,7 @@ class InternDataA1V3Dataset(Dataset):
             # half-open proprio value.
             state_gripper[0] = action_gripper[0]
             initial_episode_state_indices = (
-                local_start + STATE_NATIVE_INDICES[1:] - 1
+                local_start + self.state_native_indices[1:] - 1
             )
             state_gripper[1:] = np.stack(
                 [
@@ -882,7 +955,8 @@ class InternDataA1V3Dataset(Dataset):
                     self.episode_rows[fallback % int(self.episode_rows.size)]
                 )
                 clip_count = (
-                    int(self.arrays["length"][episode_row]) - NATIVE_HORIZON
+                    int(self.arrays["length"][episode_row])
+                    - self.native_horizon
                 )
                 clip_start = (fallback >> 32) % max(clip_count, 1)
                 logger.warning(

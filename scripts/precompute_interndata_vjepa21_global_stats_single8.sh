@@ -20,7 +20,8 @@ if [[ -f "${CONDA_ACTIVATE}" ]]; then
 fi
 
 export INTERN_A1_ROOT="${INTERN_A1_ROOT:-/fsx/pretrain_data/InternData-A1}"
-export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v5_10hz}"
+export INTERN_A1_TARGET_CONTROL_HZ="${INTERN_A1_TARGET_CONTROL_HZ:-10}"
+export INTERN_A1_MANIFEST_DIR="${INTERN_A1_MANIFEST_DIR:-${INTERN_A1_ROOT}/.fastwam_intern_a1/manifest_v5_${INTERN_A1_TARGET_CONTROL_HZ}hz}"
 if [[ ! -d "${INTERN_A1_ROOT}" ]]; then
   echo "[vjepa21-stats] ERROR: InternData root does not exist: ${INTERN_A1_ROOT}" >&2
   exit 1
@@ -28,7 +29,8 @@ fi
 
 python scripts/build_interndata_a1_manifest.py \
   --root "${INTERN_A1_ROOT}" \
-  --output "${INTERN_A1_MANIFEST_DIR}"
+  --output "${INTERN_A1_MANIFEST_DIR}" \
+  --target-control-hz "${INTERN_A1_TARGET_CONTROL_HZ}"
 
 export TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/checkpoints/torch_hub}"
 VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
@@ -49,11 +51,19 @@ STATS_NUM_WORKERS="${STATS_NUM_WORKERS:-8}"
 STATS_PREFETCH_FACTOR="${STATS_PREFETCH_FACTOR:-2}"
 STATS_MULTIPROCESSING_CONTEXT="${STATS_MULTIPROCESSING_CONTEXT:-spawn}"
 TEMPORAL_DOWNSAMPLE="${TEMPORAL_DOWNSAMPLE:-4}"
-OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_10hz_global_stats.pt}"
+OUTPUT_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${INTERN_A1_MANIFEST_DIR}/vjepa21_vitG_causal_tubelet_${INTERN_A1_TARGET_CONTROL_HZ}hz_global_stats.pt}"
 STATS_MASTER_PORT="${VJEPA21_STATS_MASTER_PORT:-29547}"
 MAX_SAMPLE_ARGS=()
 if [[ -n "${MAX_SAMPLES:-}" && "${MAX_SAMPLES}" != "all" ]]; then
   MAX_SAMPLE_ARGS=(--max-samples "${MAX_SAMPLES}")
+fi
+if [[ "${INTERN_A1_TARGET_CONTROL_HZ}" == "30" ]]; then
+  INTERN_A1_DATA_CONFIG=interndata_a1_v3_30hz
+elif [[ "${INTERN_A1_TARGET_CONTROL_HZ}" == "10" ]]; then
+  INTERN_A1_DATA_CONFIG=interndata_a1_v3
+else
+  echo "[vjepa21-stats] ERROR: supported target rates are 10 or 30 Hz." >&2
+  exit 1
 fi
 
 exec torchrun \
@@ -63,7 +73,7 @@ exec torchrun \
   --master_addr=127.0.0.1 \
   --master_port="${STATS_MASTER_PORT}" \
   scripts/precompute_vjepa21_stats.py \
-  --data-config interndata_a1_v3 \
+  --data-config "${INTERN_A1_DATA_CONFIG}" \
   --output-path "${OUTPUT_PATH}" \
   --checkpoint-path "${VJEPA21_CHECKPOINT}" \
   --repo-path "${VJEPA21_REPO}" \

@@ -16,8 +16,18 @@ import numpy as np
 
 
 MANIFEST_VERSION = 5
-NATIVE_WINDOW_FRAMES = 97
-MIN_EPISODE_FRAMES = NATIVE_WINDOW_FRAMES
+NATIVE_FPS = 30
+
+
+def _temporal_contract(target_control_hz: int) -> tuple[int, int]:
+    target_control_hz = int(target_control_hz)
+    if target_control_hz <= 0 or NATIVE_FPS % target_control_hz != 0:
+        raise ValueError(
+            f"target_control_hz must divide {NATIVE_FPS}, "
+            f"got {target_control_hz}."
+        )
+    native_window_frames = 32 * (NATIVE_FPS // target_control_hz) + 1
+    return target_control_hz, native_window_frames
 
 
 def _discover_dataset_roots(root: Path) -> list[Path]:
@@ -207,9 +217,17 @@ def _write_array(output_dir: Path, name: str, values, dtype) -> None:
     np.save(output_dir / f"{name}.npy", np.asarray(values, dtype=dtype))
 
 
-def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
+def build_manifest(
+    root: Path,
+    output_dir: Path,
+    force: bool = False,
+    target_control_hz: int = 10,
+) -> None:
     root = root.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
+    target_control_hz, native_window_frames = _temporal_contract(
+        target_control_hz
+    )
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
     lock_path = output_dir.with_name(output_dir.name + ".lock")
@@ -222,6 +240,10 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
             if (
                 int(done.get("version", -1)) == MANIFEST_VERSION
                 and Path(done.get("source_root", "")).resolve() == root
+                and int(done.get("target_control_hz", -1))
+                == target_control_hz
+                and int(done.get("native_window_frames", -1))
+                == native_window_frames
             ):
                 print(f"InternData manifest already exists: {output_dir}")
                 return
@@ -270,7 +292,7 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
             valid_episodes = 0
             for row in episode_rows:
                 length = int(row["length"])
-                if length < MIN_EPISODE_FRAMES:
+                if length < native_window_frames:
                     continue
                 task_values = row["tasks"] or [source_root.name.replace("_", " ")]
                 task = str(task_values[0])
@@ -390,13 +412,13 @@ def build_manifest(root: Path, output_dir: Path, force: bool = False) -> None:
         done = {
             "version": MANIFEST_VERSION,
             "source_root": str(root),
-            "native_fps": 30,
-            "target_control_hz": 10,
-            "native_window_frames": NATIVE_WINDOW_FRAMES,
+            "native_fps": NATIVE_FPS,
+            "target_control_hz": target_control_hz,
+            "native_window_frames": native_window_frames,
             "dataset_count": len(datasets),
             "episode_count": int(lengths.size),
             "clip_count_full_horizon": int(
-                np.maximum(lengths - (NATIVE_WINDOW_FRAMES - 1), 0).sum()
+                np.maximum(lengths - (native_window_frames - 1), 0).sum()
             ),
             "shard_count": len(shard_to_id),
             "excluded_dataset_count": len(excluded),
@@ -418,6 +440,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--target-control-hz", type=int, default=10)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -425,9 +448,16 @@ def main() -> None:
     output = (
         Path(args.output)
         if args.output is not None
-        else root / ".fastwam_intern_a1" / "manifest_v5_10hz"
+        else root
+        / ".fastwam_intern_a1"
+        / f"manifest_v5_{args.target_control_hz}hz"
     )
-    build_manifest(root=root, output_dir=output, force=args.force)
+    build_manifest(
+        root=root,
+        output_dir=output,
+        force=args.force,
+        target_control_hz=args.target_control_hz,
+    )
 
 
 if __name__ == "__main__":

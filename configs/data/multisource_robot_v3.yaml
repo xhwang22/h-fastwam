@@ -18,6 +18,7 @@ train:
     val_set_proportion: 0.01
     seed: ${seed}
     # InternData native 30Hz is converted to the common 10Hz contract.
+    target_control_hz: 10
     num_frames: 33
     action_video_freq_ratio: 4
     video_size: [384, 320]

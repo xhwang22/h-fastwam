@@ -1,0 +1,30 @@
+train:
+  _target_: fastwam.datasets.lerobot.intern_a1_v3_dataset.InternDataA1V3Dataset
+  root: ${oc.env:INTERN_A1_ROOT}
+  manifest_dir: ${oc.env:INTERN_A1_MANIFEST_DIR}
+  samples_per_epoch: null
+  epoch_size_multiple: 768
+  is_training_set: true
+  val_set_proportion: 0.01
+  seed: ${seed}
+  # Historical InternData contract: 33 native 30Hz frames, 32 actions
+  # spanning about 1.07 seconds, and video indices 0/4/.../32.
+  target_control_hz: 30
+  num_frames: 33
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  clips_per_episode: 8
+  locality_stride: 4
+  max_open_parquet_shards: 2
+  max_open_video_shards: 6
+  video_decode_threads: 2
+  video_frame_cache_entries: 3
+  video_prefetch_frames: 24
+  resized_frame_cache_entries: 3
+  resized_frames_per_entry: 128
+  max_retries: 3
+  processor:
+    action_output_dim: 20
+    proprio_output_dim: 20
+
+val: null

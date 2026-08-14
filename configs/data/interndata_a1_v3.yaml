@@ -13,6 +13,7 @@ train:
   seed: ${seed}
   # Native 30Hz is resampled to the shared 10Hz action contract:
   # 97 native frames -> 33 control states / 32 actions / 9 video frames.
+  target_control_hz: 10
   num_frames: 33
   action_video_freq_ratio: 4
   video_size: [384, 320]
