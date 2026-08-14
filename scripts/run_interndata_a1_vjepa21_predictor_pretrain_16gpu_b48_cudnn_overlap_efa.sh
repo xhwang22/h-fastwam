@@ -30,6 +30,12 @@ if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
   echo "Run scripts/precompute_interndata_vjepa21_global_stats_single8.sh first." >&2
   exit 1
 fi
+python scripts/check_vjepa_stats_compat.py \
+  --stats "${VJEPA21_NORMALISE_STATS_PATH}" \
+  --data-config interndata_a1_v3_30hz \
+  --model-name vjepa2_1_vit_gigantic_384 \
+  --temporal-downsample 4 \
+  --causal-tubelet-encoding
 export STANDARDISE_OUTPUT=true
 
 DATA_GATE_RANK="${PET_NODE_RANK:-${NODE_RANK:-0}}"
