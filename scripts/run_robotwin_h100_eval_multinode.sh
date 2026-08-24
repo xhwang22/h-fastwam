@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shard RoboTwin tasks over independent H100 nodes (no distributed PyTorch).
+# Shard RoboTwin tasks over independent H100 nodes.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,12 +9,49 @@ CURRENT_USER="${USER:-$(id -un)}"
 
 MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1, MODEL_KIND=idm, or MODEL_KIND=vjepa}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
-NODE_IP_LIST="${NODE_IP_LIST:?Set NODE_IP_LIST=chief_ip,node2_ip,...}"
 EXTRA_ARGS=("$@")
-IFS=',' read -r -a NODES <<< "${NODE_IP_LIST}"
-NODE_COUNT="${#NODES[@]}"
+
+if [[ -n "${PET_NNODES:-}" ]]; then
+  export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-0}"
+  # shellcheck source=_aws_hyperpod_setup.sh
+  source "${SCRIPT_DIR}/_aws_hyperpod_setup.sh"
+  fastwam_prepare_aws_hyperpod_runtime
+fi
+
+MANAGED_LAUNCH=0
+NODE_INDEX=0
+if [[ "${FASTWAM_MANAGED_DISTRIBUTED:-0}" == "1" ]]; then
+  NODE_COUNT="${NNODES:?NNODES is required for a managed multi-node launch}"
+  NODE_INDEX="${NODE_RANK:?NODE_RANK is required for a managed multi-node launch}"
+  : "${MASTER_ADDR:?MASTER_ADDR is required for a managed multi-node launch}"
+  : "${MASTER_PORT:?MASTER_PORT is required for a managed multi-node launch}"
+  MANAGED_LAUNCH=1
+else
+  NODE_IP_LIST="${NODE_IP_LIST:?Set NODE_IP_LIST=chief_ip,node2_ip,... outside HyperPod/PET}"
+  IFS=',' read -r -a NODES <<< "${NODE_IP_LIST}"
+  NODE_COUNT="${#NODES[@]}"
+fi
+if [[ ! "${NODE_COUNT}" =~ ^[0-9]+$ ]] || \
+   [[ ! "${NODE_INDEX}" =~ ^[0-9]+$ ]]; then
+  echo "[h100-multinode] ERROR: node count and index must be non-negative integers." >&2
+  exit 1
+fi
 if (( NODE_COUNT < 2 )); then
-  echo "[h100-multinode] ERROR: NODE_IP_LIST must contain at least two nodes." >&2
+  echo "[h100-multinode] ERROR: at least two nodes are required." >&2
+  exit 1
+fi
+if [[ -n "${EXPECTED_EVAL_NNODES:-}" ]]; then
+  if [[ ! "${EXPECTED_EVAL_NNODES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[h100-multinode] ERROR: EXPECTED_EVAL_NNODES must be a positive integer." >&2
+    exit 1
+  fi
+  if (( NODE_COUNT != EXPECTED_EVAL_NNODES )); then
+    echo "[h100-multinode] ERROR: expected ${EXPECTED_EVAL_NNODES} nodes, got ${NODE_COUNT}." >&2
+    exit 1
+  fi
+fi
+if (( NODE_INDEX >= NODE_COUNT )); then
+  echo "[h100-multinode] ERROR: node index ${NODE_INDEX} is outside ${NODE_COUNT} nodes." >&2
   exit 1
 fi
 
@@ -53,17 +90,40 @@ if [[ -z "${CONDA_SH:-}" ]]; then
   fi
 fi
 
-# Prepare shared config/policy exactly once before remote managers start.
-MODEL_KIND="${MODEL_KIND}" \
-RUN_DIR="${RUN_DIR}" \
-CKPT="${CKPT}" \
-MODE="${MODE}" \
-NUM_GPUS="${NUM_GPUS}" \
-OUTPUT_TAG="${OUTPUT_TAG}" \
-EVAL_CONFIG="${EVAL_CONFIG}" \
-DRY_RUN=1 \
-CHECK_ENV="${CHECK_ENV:-1}" \
-bash "${SCRIPT_DIR}/run_robotwin_h100_eval.sh"
+prepare_shared_eval() {
+  MODEL_KIND="${MODEL_KIND}" \
+  RUN_DIR="${RUN_DIR}" \
+  CKPT="${CKPT}" \
+  MODE="${MODE}" \
+  NUM_GPUS="${NUM_GPUS}" \
+  OUTPUT_TAG="${OUTPUT_TAG}" \
+  EVAL_CONFIG="${EVAL_CONFIG}" \
+  DRY_RUN=1 \
+  CHECK_ENV="${CHECK_ENV:-1}" \
+  bash "${SCRIPT_DIR}/run_robotwin_h100_eval.sh"
+}
+
+merge_shard_summaries() {
+  local ckpt_tag
+  local run_output_dir
+  ckpt_tag="$(python3 - "${CKPT}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]).resolve()
+parts = path.parts
+if "runs" in parts:
+    index = parts.index("runs")
+    print(f"{parts[index + 1]}_{parts[index + 2]}")
+else:
+    print(path.stem)
+PY
+)"
+  run_output_dir="${REPO_ROOT}/evaluate_results/robotwin/${ckpt_tag}/${OUTPUT_TAG}"
+  python3 scripts/merge_robotwin_eval_shards.py \
+    --run-output-dir "${run_output_dir}" \
+    --shard-count "${NODE_COUNT}"
+}
 
 export MODEL_KIND RUN_DIR CKPT MODE NUM_GPUS OUTPUT_TAG EVAL_CONFIG
 export FASTWAM_EVAL_ENV CONDA_SH
@@ -76,6 +136,7 @@ FORWARD_VARS=(
   FASTWAM_EVAL_ENV CONDA_SH MAX_TASKS_PER_GPU SKIP_EVAL_PREPARE CHECK_ENV
   FASTWAM_EVAL_USE_CURRENT_ENV PYTHON_BIN MINIFORGE_ROOT
   SKIP_MODEL_PREFLIGHT QWEN_REVISION
+  EXPECTED_EVAL_NNODES
   TRAIN_CONFIG TASK_NAME
   STATS TRAINING_STATS ROBOTWIN_ROOT QWEN_DIR XR1_CHECKPOINT
   VJEPA21_CHECKPOINT VJEPA21_REPO
@@ -98,6 +159,81 @@ build_env_prefix() {
   done
   printf '%s' "${prefix}"
 }
+
+if (( MANAGED_LAUNCH == 1 )); then
+  if [[ ! "${MASTER_PORT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[h100-multinode] ERROR: MASTER_PORT must be a positive integer." >&2
+    exit 1
+  fi
+  PREPARE_SYNC_PORT="${EVAL_PREPARE_SYNC_PORT:-${MASTER_PORT}}"
+  EVAL_SYNC_PORT="${EVAL_SYNC_PORT:-$((MASTER_PORT + 1))}"
+  if [[ ! "${PREPARE_SYNC_PORT}" =~ ^[1-9][0-9]*$ ]] || \
+     [[ ! "${EVAL_SYNC_PORT}" =~ ^[1-9][0-9]*$ ]] || \
+     (( PREPARE_SYNC_PORT > 65535 || \
+        EVAL_SYNC_PORT < 1 || EVAL_SYNC_PORT > 65535 )); then
+    echo "[h100-multinode] ERROR: synchronization ports must be in [1, 65535]." >&2
+    exit 1
+  fi
+  if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV:-0}" == "1" ]]; then
+    SYNC_PYTHON="${PYTHON_BIN:-/opt/venv/bin/python}"
+  else
+    SYNC_PYTHON="${FASTWAM_EVAL_ENV}/bin/python"
+  fi
+  if [[ ! -x "${SYNC_PYTHON}" ]]; then
+    echo "[h100-multinode] ERROR: synchronization Python not found: ${SYNC_PYTHON}" >&2
+    exit 1
+  fi
+
+  PREPARE_STATUS=0
+  if (( NODE_INDEX == 0 )); then
+    set +e
+    prepare_shared_eval
+    PREPARE_STATUS=$?
+    set -e
+  fi
+  "${SYNC_PYTHON}" scripts/sync_robotwin_eval_nodes.py \
+    --phase prepare \
+    --rank "${NODE_INDEX}" \
+    --world-size "${NODE_COUNT}" \
+    --master-addr "${MASTER_ADDR}" \
+    --master-port "${PREPARE_SYNC_PORT}" \
+    --local-exit-code "${PREPARE_STATUS}" \
+    --timeout-seconds "${PREPARE_SYNC_TIMEOUT_SECONDS:-1800}"
+
+  export SKIP_EVAL_PREPARE=1
+  echo "[h100-multinode] launch managed shard=${NODE_INDEX}/${NODE_COUNT}"
+  set +e
+  bash scripts/run_robotwin_h100_eval.sh \
+    "${EXTRA_ARGS[@]}" \
+    MULTIRUN.task_shard_count="${NODE_COUNT}" \
+    MULTIRUN.task_shard_index="${NODE_INDEX}"
+  LOCAL_STATUS=$?
+  set -e
+
+  "${SYNC_PYTHON}" scripts/sync_robotwin_eval_nodes.py \
+    --phase evaluation \
+    --rank "${NODE_INDEX}" \
+    --world-size "${NODE_COUNT}" \
+    --master-addr "${MASTER_ADDR}" \
+    --master-port "${EVAL_SYNC_PORT}" \
+    --local-exit-code "${LOCAL_STATUS}" \
+    --timeout-seconds "${EVAL_SYNC_TIMEOUT_SECONDS:-604800}"
+
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    if (( NODE_INDEX == 0 )); then
+      echo "[h100-multinode] dry-run completed for all ${NODE_COUNT} task shards."
+    fi
+    exit 0
+  fi
+  if (( NODE_INDEX == 0 )) && [[ "${SKIP_MERGE:-0}" != "1" ]]; then
+    merge_shard_summaries
+  fi
+  echo "[h100-multinode] managed shard=${NODE_INDEX}/${NODE_COUNT} completed."
+  exit 0
+fi
+
+# In SSH mode, prepare shared config/policy once before remote managers start.
+prepare_shared_eval
 
 ENV_PREFIX="$(build_env_prefix)"
 REMOTE_EXTRA_ARGS=""
@@ -149,23 +285,7 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   echo "[h100-multinode] dry-run completed for all ${NODE_COUNT} task shards."
   exit 0
 fi
-CKPT_TAG="$(python3 - "${CKPT}" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1]).resolve()
-parts = path.parts
-if "runs" in parts:
-    index = parts.index("runs")
-    print(f"{parts[index + 1]}_{parts[index + 2]}")
-else:
-    print(path.stem)
-PY
-)"
 if [[ "${SKIP_MERGE:-0}" != "1" ]]; then
-  RUN_OUTPUT_DIR="${REPO_ROOT}/evaluate_results/robotwin/${CKPT_TAG}/${OUTPUT_TAG}"
-  python3 scripts/merge_robotwin_eval_shards.py \
-    --run-output-dir "${RUN_OUTPUT_DIR}" \
-    --shard-count "${NODE_COUNT}"
+  merge_shard_summaries
 fi
 echo "[h100-multinode] all ${NODE_COUNT} task shards completed."

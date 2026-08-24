@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resume an InternData V-JEPA RoboTwin evaluation across independent H100 nodes.
+# Resume an InternData V-JEPA RoboTwin evaluation across H100 nodes.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,12 +7,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 : "${RUN_DIR:?Set RUN_DIR to the completed InternData fine-tune run directory}"
-: "${NODE_IP_LIST:?Set NODE_IP_LIST=local_ip,remote_ip}"
 
 export MODEL_KIND=vjepa
 export MODE="${MODE:-full}"
 export NUM_GPUS="${NUM_GPUS:-8}"
 export MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-2}"
+export EXPECTED_EVAL_NNODES="${EXPECTED_EVAL_NNODES:-2}"
 export FASTWAM_EVAL_USE_CURRENT_ENV="${FASTWAM_EVAL_USE_CURRENT_ENV:-0}"
 export RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 export CHECK_ALIGNMENT="${CHECK_ALIGNMENT:-1}"
