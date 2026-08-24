@@ -294,10 +294,15 @@ curobo_checkout_ready() {
 }
 
 curobo_python_ready() {
-  CUROBO_ROOT="${CUROBO_ROOT}" "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+  local output="/dev/null"
+  if [[ "${1:-}" == "--verbose" ]]; then
+    output="/dev/stderr"
+  fi
+  CUROBO_ROOT="${CUROBO_ROOT}" "${PYTHON_BIN}" - <<'PY' >"${output}" 2>&1
 import os
 from pathlib import Path
 
+import torch
 import curobo
 from curobo.curobolib import (
     geom_cu,
@@ -575,6 +580,7 @@ install_python_dependencies() {
       -e "${CUROBO_ROOT}" --no-build-isolation
     if ! curobo_python_ready; then
       echo "[h100-setup] ERROR: cuRobo compiled modules failed to import after installation." >&2
+      curobo_python_ready --verbose || true
       exit 1
     fi
   else
