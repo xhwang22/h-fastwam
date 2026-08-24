@@ -12,6 +12,9 @@ readonly CUROBO_REVISION="v0.7.8"
 readonly VJEPA21_EXPECTED_SIZE="30238058912"
 readonly VJEPA21_SOURCE_REVISION="204698b45b3712590f06245fbfba32d3be539812"
 readonly QWEN_REVISION="89644892e4d85e24eaac8bacfd4f463576704203"
+readonly CUDA_TOOLKIT_VERSION="12.8"
+readonly CUDA_TOOLKIT_RUNFILE="cuda_12.8.0_570.86.10_linux.run"
+readonly CUDA_TOOLKIT_URL="https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/${CUDA_TOOLKIT_RUNFILE}"
 
 FASTWAM_EVAL_USE_CURRENT_ENV="${FASTWAM_EVAL_USE_CURRENT_ENV:-0}"
 MINIFORGE_ROOT="${MINIFORGE_ROOT:-/fsx/miniforge3}"
@@ -52,6 +55,7 @@ CUROBO_ROOT="${CUROBO_ROOT:-${REPO_ROOT}/external/curobo-v0.7.8}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 DOWNLOAD_ROBOTWIN_ASSETS="${DOWNLOAD_ROBOTWIN_ASSETS:-1}"
 FORCE_EVAL_ENV_INSTALL="${FORCE_EVAL_ENV_INSTALL:-0}"
+INSTALL_CUDA_TOOLKIT="${INSTALL_CUDA_TOOLKIT:-1}"
 USE_SYSTEM_NVIDIA_GRAPHICS="${USE_SYSTEM_NVIDIA_GRAPHICS:-${FASTWAM_EVAL_USE_CURRENT_ENV}}"
 NVIDIA_GRAPHICS_ENV="${NVIDIA_GRAPHICS_ENV:-}"
 PIP_REINSTALL_ARGS=()
@@ -289,6 +293,131 @@ curobo_checkout_ready() {
   [[ -z "$(git -C "${CUROBO_ROOT}" status --porcelain --untracked-files=no)" ]]
 }
 
+curobo_python_ready() {
+  CUROBO_ROOT="${CUROBO_ROOT}" "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import os
+from pathlib import Path
+
+import curobo
+from curobo.curobolib import (
+    geom_cu,
+    kinematics_fused_cu,
+    lbfgs_step_cu,
+    line_search_cu,
+    tensor_step_cu,
+)
+from curobo.types.math import Pose
+from curobo.types.robot import JointState
+from curobo.wrap.reacher.motion_gen import MotionGen
+
+root = Path(os.environ["CUROBO_ROOT"]).resolve()
+assert Path(curobo.__file__).resolve().is_relative_to(root)
+PY
+}
+
+cuda_toolkit_matches_torch() {
+  local cuda_root="$1"
+  [[ -x "${cuda_root}/bin/nvcc" ]] || return 1
+  local torch_cuda
+  local nvcc_cuda
+  torch_cuda="$(
+    "${PYTHON_BIN}" -c 'import torch; print(torch.version.cuda or "")'
+  )"
+  nvcc_cuda="$(
+    "${cuda_root}/bin/nvcc" --version \
+      | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
+      | head -1
+  )"
+  [[ -n "${torch_cuda}" && "${nvcc_cuda}" == "${torch_cuda}" ]]
+}
+
+install_cuda_toolkit_for_torch() {
+  local torch_cuda
+  torch_cuda="$(
+    "${PYTHON_BIN}" -c 'import torch; print(torch.version.cuda or "")'
+  )"
+  if [[ "${torch_cuda}" != "${CUDA_TOOLKIT_VERSION}" ]]; then
+    echo "[h100-setup] ERROR: expected torch CUDA ${CUDA_TOOLKIT_VERSION}, found ${torch_cuda}." >&2
+    exit 1
+  fi
+
+  local explicit_cuda_root="${CUDA_TOOLKIT_ROOT:-}"
+  local nvcc_root=""
+  if command -v nvcc >/dev/null 2>&1; then
+    nvcc_root="$(dirname "$(dirname "$(command -v nvcc)")")"
+  fi
+  local candidates=()
+  if [[ -n "${explicit_cuda_root}" ]]; then
+    candidates+=("${explicit_cuda_root}")
+  else
+    [[ -n "${CUDA_HOME:-}" ]] && candidates+=("${CUDA_HOME}")
+    candidates+=(
+      "/usr/local/cuda-${torch_cuda}"
+      "/usr/local/cuda-${torch_cuda}.0"
+      "/fsx/cuda-toolkit/${torch_cuda}"
+      "/fsx/cuda-toolkit/${torch_cuda}.0"
+      "${REPO_ROOT}/checkpoints/cuda-toolkit/${torch_cuda}.0"
+    )
+    [[ -n "${nvcc_root}" ]] && candidates+=("${nvcc_root}")
+  fi
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if cuda_toolkit_matches_torch "${candidate}"; then
+      CUDA_TOOLKIT_ROOT="${candidate}"
+      break
+    fi
+  done
+
+  if [[ -z "${CUDA_TOOLKIT_ROOT:-}" ]] || \
+      ! cuda_toolkit_matches_torch "${CUDA_TOOLKIT_ROOT}"; then
+    if [[ -n "${explicit_cuda_root}" ]]; then
+      echo "[h100-setup] ERROR: CUDA_TOOLKIT_ROOT does not provide nvcc ${torch_cuda}: ${explicit_cuda_root}" >&2
+      exit 1
+    fi
+    if [[ "${INSTALL_CUDA_TOOLKIT}" != "1" ]]; then
+      echo "[h100-setup] ERROR: CUDA toolkit ${torch_cuda} is required to build cuRobo." >&2
+      echo "Set CUDA_TOOLKIT_ROOT to a matching toolkit or INSTALL_CUDA_TOOLKIT=1." >&2
+      exit 1
+    fi
+
+    CUDA_TOOLKIT_ROOT="${CUDA_TOOLKIT_INSTALL_ROOT:-${REPO_ROOT}/checkpoints/cuda-toolkit/${torch_cuda}.0}"
+    local installer_dir
+    installer_dir="$(dirname "${CUDA_TOOLKIT_ROOT}")/installers"
+    local installer="${installer_dir}/${CUDA_TOOLKIT_RUNFILE}"
+    mkdir -p "${installer_dir}" "${CUDA_TOOLKIT_ROOT}"
+    if [[ ! -f "${installer}" ]]; then
+      echo "[h100-setup] Downloading CUDA toolkit ${torch_cuda} (toolkit only; no driver)."
+      curl --fail --location --retry 5 --continue-at - \
+        "${CUDA_TOOLKIT_URL}" \
+        --output "${installer}"
+    fi
+    echo "[h100-setup] Installing CUDA toolkit ${torch_cuda} into ${CUDA_TOOLKIT_ROOT}."
+    bash "${installer}" \
+      --silent \
+      --toolkit \
+      --toolkitpath="${CUDA_TOOLKIT_ROOT}" \
+      --defaultroot="${CUDA_TOOLKIT_ROOT}" \
+      --no-opengl-libs \
+      --no-man-page \
+      --override
+    if ! cuda_toolkit_matches_torch "${CUDA_TOOLKIT_ROOT}"; then
+      echo "[h100-setup] ERROR: CUDA toolkit ${torch_cuda} installation failed." >&2
+      exit 1
+    fi
+  fi
+
+  export CUDA_HOME="${CUDA_TOOLKIT_ROOT}"
+  export CUDA_PATH="${CUDA_TOOLKIT_ROOT}"
+  export PATH="${CUDA_TOOLKIT_ROOT}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${CUDA_TOOLKIT_ROOT}/lib64:${LD_LIBRARY_PATH:-}"
+  export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
+  export MAX_JOBS="${MAX_JOBS:-8}"
+  printf '%s\n' "${CUDA_TOOLKIT_ROOT}" \
+    > "${PYTHON_ENV_PREFIX}/.fastwam_cuda_toolkit_root"
+  echo "[h100-setup] cuRobo build toolkit: $("${CUDA_HOME}/bin/nvcc" --version | grep release | tail -1)"
+}
+
 install_current_python_dependencies() {
   "${PYTHON_BIN}" -m pip --version >/dev/null
   if ! "${PYTHON_BIN}" -c 'import packaging' >/dev/null 2>&1; then
@@ -381,7 +510,9 @@ install_python_dependencies() {
   local marker="${PYTHON_ENV_PREFIX}/.fastwam_robotwin_h100_eval_v3"
   if [[ "${FORCE_EVAL_ENV_INSTALL}" != "1" && \
         -f "${marker}" ]] && \
-      curobo_checkout_ready && python_environment_ready; then
+      curobo_checkout_ready && \
+      curobo_python_ready && \
+      python_environment_ready; then
     echo "[h100-setup] Reusing Python environment: ${PYTHON_ENV_PREFIX}"
     return
   fi
@@ -437,9 +568,18 @@ install_python_dependencies() {
     echo "[h100-setup] ERROR: cuRobo checkout is not ${CUROBO_REVISION}." >&2
     exit 1
   fi
-  "${PYTHON_BIN}" -m pip install --upgrade setuptools wheel ninja
-  "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" \
-    -e "${CUROBO_ROOT}" --no-build-isolation
+  if [[ "${FORCE_EVAL_ENV_INSTALL}" == "1" ]] || ! curobo_python_ready; then
+    install_cuda_toolkit_for_torch
+    "${PYTHON_BIN}" -m pip install --upgrade setuptools wheel ninja
+    "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" \
+      -e "${CUROBO_ROOT}" --no-build-isolation
+    if ! curobo_python_ready; then
+      echo "[h100-setup] ERROR: cuRobo compiled modules failed to import after installation." >&2
+      exit 1
+    fi
+  else
+    echo "[h100-setup] Reusing cuRobo ${CUROBO_REVISION} from ${CUROBO_ROOT}."
+  fi
 
   "${PYTHON_BIN}" - <<'PY'
 from pathlib import Path

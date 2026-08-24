@@ -126,6 +126,17 @@ export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${CURRENT_USE
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${CURRENT_USER}}"
 export FASTWAM_PYTHON_ENV_PREFIX="${PYTHON_ENV_PREFIX}"
 export LD_LIBRARY_PATH="${PYTHON_ENV_PREFIX}/lib:${PYTHON_ENV_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+CUDA_TOOLKIT_MARKER="${PYTHON_ENV_PREFIX}/.fastwam_cuda_toolkit_root"
+if [[ -z "${CUDA_TOOLKIT_ROOT:-}" && -f "${CUDA_TOOLKIT_MARKER}" ]]; then
+  CUDA_TOOLKIT_ROOT="$(tr -d '[:space:]' < "${CUDA_TOOLKIT_MARKER}")"
+fi
+if [[ -n "${CUDA_TOOLKIT_ROOT:-}" && \
+      -x "${CUDA_TOOLKIT_ROOT}/bin/nvcc" ]]; then
+  export CUDA_HOME="${CUDA_TOOLKIT_ROOT}"
+  export CUDA_PATH="${CUDA_TOOLKIT_ROOT}"
+  export PATH="${CUDA_TOOLKIT_ROOT}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${CUDA_TOOLKIT_ROOT}/lib64:${LD_LIBRARY_PATH}"
+fi
 if [[ "${USE_SYSTEM_NVIDIA_GRAPHICS:-0}" == "1" ]]; then
   SYSTEM_VULKAN_SUMMARY="$(vulkaninfo --summary 2>&1 || true)"
   if ! grep -q "NVIDIA" <<<"${SYSTEM_VULKAN_SUMMARY}"; then
