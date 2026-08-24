@@ -31,6 +31,8 @@ export LATENT_ACTION_PAIR_BATCH_SIZE="${LATENT_ACTION_PAIR_BATCH_SIZE:-1536}"
 export LATENT_ACTION_CACHE_NUM_WORKERS="${LATENT_ACTION_CACHE_NUM_WORKERS:-8}"
 export LATENT_ACTION_CACHE_PREFETCH_FACTOR="${LATENT_ACTION_CACHE_PREFETCH_FACTOR:-1}"
 export LATENT_ACTION_CACHE_MP_CONTEXT="${LATENT_ACTION_CACHE_MP_CONTEXT:-spawn}"
+export LATENT_ACTION_CACHE_MAX_RETRIES="${LATENT_ACTION_CACHE_MAX_RETRIES:-2}"
+export LATENT_ACTION_CACHE_RETRY_DELAY="${LATENT_ACTION_CACHE_RETRY_DELAY:-60}"
 if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
   echo "ERROR: RoboTwin WebDataset is incomplete: ${ROBOTWIN_WEBDATASET_ROOT}" >&2
   exit 1
@@ -77,38 +79,50 @@ run_cache_phase() {
   local cache_dir="$2"
   local port="$3"
   local log_file="${LATENT_ACTION_CACHE_ROOT}/logs/${split}.rank${NODE_RANK}.log"
+  local attempt=0
   local -a normalization_args=()
   if [[ "${split}" == "val" ]]; then
     normalization_args=(
       --normalization-stats-cache "${LATENT_ACTION_TRAIN_CACHE_DIR}"
     )
   fi
-  echo "[latent-cache] split=${split} world=$((NNODES * NPROC_PER_NODE)) cache=${cache_dir}"
-  "${PYTHON_BIN}" -m torch.distributed.run \
-    --nnodes="${NNODES}" \
-    --node_rank="${NODE_RANK}" \
-    --nproc_per_node="${NPROC_PER_NODE}" \
-    --master_addr="${MASTER_ADDR}" \
-    --master_port="${port}" \
-    scripts/precompute_dreamdojo_latent_actions.py \
-    --data-config robotwin_interleaved_webdataset \
-    --split "${split}" \
-    --cache-dir "${cache_dir}" \
-    --dreamdojo-root "${DREAMDOJO_ROOT}" \
-    --checkpoint "${DREAMDOJO_CHECKPOINT}" \
-    --dreamdojo-source-revision "${DREAMDOJO_SOURCE_REVISION}" \
-    --checkpoint-sha256 "${DREAMDOJO_CHECKPOINT_SHA256}" \
-    --shard-size "${LATENT_ACTION_CACHE_SHARD_SIZE}" \
-    --sample-batch-size "${LATENT_ACTION_SAMPLE_BATCH_SIZE}" \
-    --pair-batch-size "${LATENT_ACTION_PAIR_BATCH_SIZE}" \
-    --num-workers "${LATENT_ACTION_CACHE_NUM_WORKERS}" \
-    --prefetch-factor "${LATENT_ACTION_CACHE_PREFETCH_FACTOR}" \
-    --multiprocessing-context "${LATENT_ACTION_CACHE_MP_CONTEXT}" \
-    --cache-dtype bfloat16 \
-    "${normalization_args[@]}" \
-    "data.train.preprocessed_root=${ROBOTWIN_WEBDATASET_ROOT}" \
-    "data.val.preprocessed_root=${ROBOTWIN_WEBDATASET_ROOT}" \
-    2>&1 | tee -a "${log_file}"
+  while true; do
+    echo "[latent-cache] split=${split} world=$((NNODES * NPROC_PER_NODE)) cache=${cache_dir} attempt=$((attempt + 1))"
+    if "${PYTHON_BIN}" -m torch.distributed.run \
+      --nnodes="${NNODES}" \
+      --node_rank="${NODE_RANK}" \
+      --nproc_per_node="${NPROC_PER_NODE}" \
+      --master_addr="${MASTER_ADDR}" \
+      --master_port="${port}" \
+      scripts/precompute_dreamdojo_latent_actions.py \
+      --data-config robotwin_interleaved_webdataset \
+      --split "${split}" \
+      --cache-dir "${cache_dir}" \
+      --dreamdojo-root "${DREAMDOJO_ROOT}" \
+      --checkpoint "${DREAMDOJO_CHECKPOINT}" \
+      --dreamdojo-source-revision "${DREAMDOJO_SOURCE_REVISION}" \
+      --checkpoint-sha256 "${DREAMDOJO_CHECKPOINT_SHA256}" \
+      --shard-size "${LATENT_ACTION_CACHE_SHARD_SIZE}" \
+      --sample-batch-size "${LATENT_ACTION_SAMPLE_BATCH_SIZE}" \
+      --pair-batch-size "${LATENT_ACTION_PAIR_BATCH_SIZE}" \
+      --num-workers "${LATENT_ACTION_CACHE_NUM_WORKERS}" \
+      --prefetch-factor "${LATENT_ACTION_CACHE_PREFETCH_FACTOR}" \
+      --multiprocessing-context "${LATENT_ACTION_CACHE_MP_CONTEXT}" \
+      --cache-dtype bfloat16 \
+      "${normalization_args[@]}" \
+      "data.train.preprocessed_root=${ROBOTWIN_WEBDATASET_ROOT}" \
+      "data.val.preprocessed_root=${ROBOTWIN_WEBDATASET_ROOT}" \
+      2>&1 | tee -a "${log_file}"; then
+      return
+    fi
+    if (( attempt >= LATENT_ACTION_CACHE_MAX_RETRIES )); then
+      echo "[latent-cache] ERROR: split=${split} failed after $((attempt + 1)) attempts." >&2
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    echo "[latent-cache] retrying split=${split} in ${LATENT_ACTION_CACHE_RETRY_DELAY}s; valid shards will be reused."
+    sleep "${LATENT_ACTION_CACHE_RETRY_DELAY}"
+  done
 }
 
 run_cache_phase train "${LATENT_ACTION_TRAIN_CACHE_DIR}" "${CACHE_TRAIN_PORT}"

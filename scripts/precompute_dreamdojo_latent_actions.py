@@ -516,13 +516,6 @@ def main() -> None:
     if dist.is_initialized():
         dist.barrier()
 
-    model = load_dreamdojo_lam(
-        dreamdojo_root,
-        checkpoint,
-        device,
-        expected_source_revision=args.dreamdojo_source_revision,
-        expected_checkpoint_sha256=args.checkpoint_sha256,
-    )
     output_dtype = _cache_dtype(args.cache_dtype)
     assigned_shards = range(rank, num_shards, world_size)
     pending_indices = []
@@ -537,31 +530,48 @@ def main() -> None:
             continue
         pending_indices.extend(range(first, last))
 
-    extraction_dataset = _VideoExtractionDataset(dataset, pending_indices)
-    loader_kwargs = {
-        "batch_size": args.sample_batch_size,
-        "shuffle": False,
-        "num_workers": args.num_workers,
-        "pin_memory": device.type == "cuda",
-        "persistent_workers": args.num_workers > 0,
-    }
-    if args.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-        loader_kwargs["multiprocessing_context"] = (
-            args.multiprocessing_context
-        )
-        if "in_order" in inspect.signature(DataLoader).parameters:
-            loader_kwargs["in_order"] = False
-    extraction_loader = DataLoader(extraction_dataset, **loader_kwargs)
-    sample_iterator = tqdm(
-        extraction_loader,
-        desc=f"{args.split} cache rank0/{world_size}",
-        total=math.ceil(len(pending_indices) / args.sample_batch_size),
-        dynamic_ncols=True,
-        disable=rank != 0,
-        initial=0,
-        unit="batch",
+    pending_shards = sorted({index // args.shard_size for index in pending_indices})
+    print(
+        f"[rank {rank}] pending samples={len(pending_indices)} "
+        f"shards={len(pending_shards)}",
+        flush=True,
     )
+    if pending_indices:
+        model = load_dreamdojo_lam(
+            dreamdojo_root,
+            checkpoint,
+            device,
+            expected_source_revision=args.dreamdojo_source_revision,
+            expected_checkpoint_sha256=args.checkpoint_sha256,
+        )
+        extraction_dataset = _VideoExtractionDataset(dataset, pending_indices)
+        loader_kwargs = {
+            "batch_size": args.sample_batch_size,
+            "shuffle": False,
+            "num_workers": args.num_workers,
+            "pin_memory": device.type == "cuda",
+            "persistent_workers": args.num_workers > 0,
+        }
+        if args.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = args.prefetch_factor
+            loader_kwargs["multiprocessing_context"] = (
+                args.multiprocessing_context
+            )
+            if "in_order" in inspect.signature(DataLoader).parameters:
+                loader_kwargs["in_order"] = False
+        extraction_loader = DataLoader(extraction_dataset, **loader_kwargs)
+        sample_iterator = tqdm(
+            extraction_loader,
+            desc=f"{args.split} cache rank0/{world_size}",
+            total=math.ceil(len(pending_indices) / args.sample_batch_size),
+            dynamic_ncols=True,
+            disable=rank != 0,
+            initial=0,
+            unit="batch",
+        )
+    else:
+        model = None
+        sample_iterator = ()
     shard_buffers: dict[int, dict[str, torch.Tensor]] = {}
     shard_sample_counts: dict[int, int] = {}
 
@@ -617,9 +627,26 @@ def main() -> None:
             "DataLoader ended with incomplete latent-action shard buffers: "
             f"{sorted(shard_buffers)}."
         )
+    print(f"[rank {rank}] extraction complete", flush=True)
 
     if dist.is_initialized():
-        dist.barrier()
+        try:
+            dist.monitored_barrier(
+                timeout=timedelta(minutes=30),
+                wait_all_ranks=True,
+            )
+        except Exception as exc:
+            print(
+                f"[rank {rank}] final synchronization failed: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+            raise
+
     if rank == 0:
         missing = [
             str(latent_action_shard_path(cache_dir, shard_id))
@@ -635,7 +662,8 @@ def main() -> None:
         ]
         if missing:
             raise RuntimeError(
-                f"Cannot finalize cache; incomplete shards: {missing[:20]}"
+                "Cannot finalize cache; incomplete shards: "
+                f"{missing[:20]}."
             )
         normalization_source = None
         checkpoint_sha256 = cache_signature["dreamdojo_checkpoint_sha256"]
@@ -682,7 +710,10 @@ def main() -> None:
         partial_manifest_path.unlink(missing_ok=True)
         print(f"Finalized latent-action cache: {cache_dir}")
     if dist.is_initialized():
-        dist.barrier()
+        dist.monitored_barrier(
+            timeout=timedelta(hours=12),
+            wait_all_ranks=True,
+        )
         dist.destroy_process_group()
     if cache_lock is not None:
         cache_lock.close()
