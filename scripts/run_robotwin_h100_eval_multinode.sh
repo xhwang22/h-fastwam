@@ -7,7 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 CURRENT_USER="${USER:-$(id -un)}"
 
-MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
+MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1, MODEL_KIND=idm, or MODEL_KIND=vjepa}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
 NODE_IP_LIST="${NODE_IP_LIST:?Set NODE_IP_LIST=chief_ip,node2_ip,...}"
 EXTRA_ARGS=("$@")
@@ -34,7 +34,9 @@ fi
 
 MODE="${MODE:-full}"
 CKPT_NAME="$(basename "${CKPT}" .pt)"
-OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2_${NODE_COUNT}node}"
+# Keep the single-node default so rerunning with more nodes resumes existing
+# per-task clean/random results instead of creating a separate output tree.
+OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2}"
 EVAL_CONFIG="${EVAL_CONFIG:-${REPO_ROOT}/checkpoints/h100_eval_configs/${MODEL_KIND}_$(basename "${RUN_DIR}").yaml}"
 if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
   if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
@@ -72,10 +74,13 @@ export CHECK_ENV="${CHECK_ENV:-1}"
 FORWARD_VARS=(
   MODEL_KIND RUN_DIR CKPT MODE NUM_GPUS OUTPUT_TAG EVAL_CONFIG
   FASTWAM_EVAL_ENV CONDA_SH MAX_TASKS_PER_GPU SKIP_EVAL_PREPARE CHECK_ENV
-  SKIP_MODEL_PREFLIGHT
+  FASTWAM_EVAL_USE_CURRENT_ENV PYTHON_BIN MINIFORGE_ROOT
+  SKIP_MODEL_PREFLIGHT QWEN_REVISION
   TRAIN_CONFIG TASK_NAME
   STATS TRAINING_STATS ROBOTWIN_ROOT QWEN_DIR XR1_CHECKPOINT
   VJEPA21_CHECKPOINT VJEPA21_REPO
+  CUDA_TOOLKIT_ROOT USE_SYSTEM_NVIDIA_GRAPHICS
+  NVIDIA_GRAPHICS_ENV NVIDIA_GRAPHICS_ROOT
   HF_HOME HF_HUB_CACHE TORCH_HOME DIFFSYNTH_MODEL_BASE_PATH
   DIFFSYNTH_DOWNLOAD_SOURCE PYTORCH_CUDA_ALLOC_CONF FASTWAM_SDPA_BACKEND
   RENDER_BACKEND CAMERA_TYPE EVAL_EPISODES EVAL_VIDEO_LOG MAX_RETRIES
@@ -107,6 +112,8 @@ for name in "${FORWARD_VARS[@]}"; do
 done
 PIDS=()
 
+echo "[h100-multinode] output_tag=${OUTPUT_TAG}"
+echo "[h100-multinode] existing valid per-task results will be resumed"
 for (( shard_index=1; shard_index<NODE_COUNT; shard_index++ )); do
   host="${NODES[$shard_index]%%:*}"
   remote_cmd="cd $(printf '%q' "${REPO_ROOT}") && ${ENV_PREFIX}bash scripts/run_robotwin_h100_eval.sh${REMOTE_EXTRA_ARGS} MULTIRUN.task_shard_count=${NODE_COUNT} MULTIRUN.task_shard_index=${shard_index}"
