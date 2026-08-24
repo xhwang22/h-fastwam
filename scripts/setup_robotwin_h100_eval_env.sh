@@ -275,12 +275,14 @@ EOF
 EOF
   cat > "${env_file}" <<EOF
 export NVIDIA_GRAPHICS_ROOT="${NVIDIA_GRAPHICS_ROOT}"
-export LD_LIBRARY_PATH="${lib_dir}:\${CONDA_PREFIX}/lib:\${CONDA_PREFIX}/targets/x86_64-linux/lib:/usr/lib64:/lib64:\${LD_LIBRARY_PATH:-}"
+_fastwam_python_env_prefix="\${FASTWAM_PYTHON_ENV_PREFIX:-\${CONDA_PREFIX:-}}"
+export LD_LIBRARY_PATH="${lib_dir}:\${_fastwam_python_env_prefix}/lib:\${_fastwam_python_env_prefix}/targets/x86_64-linux/lib:/usr/lib64:/lib64:\${LD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="${NVIDIA_GRAPHICS_ROOT}/icd/nvidia_icd.json"
 export VK_DRIVER_FILES="${NVIDIA_GRAPHICS_ROOT}/icd/nvidia_icd.json"
 export __EGL_VENDOR_LIBRARY_FILENAMES="${NVIDIA_GRAPHICS_ROOT}/icd/10_nvidia.json"
 export XDG_RUNTIME_DIR=/tmp
 unset FASTWAM_ROBOTWIN_CPU_RENDER
+unset _fastwam_python_env_prefix
 EOF
   # shellcheck disable=SC1090
   source "${env_file}"
@@ -377,7 +379,13 @@ from pathlib import Path
 root = Path(os.environ["QWEN_DIR"])
 revision = os.environ["QWEN_REVISION"]
 marker = root / ".fastwam_hf_revision"
-if not marker.is_file() or marker.read_text(encoding="utf-8").strip() != revision:
+if marker.is_file():
+    actual_revision = marker.read_text(encoding="utf-8").strip()
+elif root.parent.name == "snapshots":
+    actual_revision = root.name
+else:
+    actual_revision = None
+if actual_revision != revision:
     raise SystemExit(1)
 if not (root / "config.json").is_file():
     raise SystemExit(1)

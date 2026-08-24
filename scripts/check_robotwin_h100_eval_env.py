@@ -23,8 +23,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if sys.version_info[:2] != (3, 10):
-        raise RuntimeError(f"Expected Python 3.10, found {sys.version}")
+    if sys.version_info < (3, 10):
+        raise RuntimeError(f"Expected Python >=3.10, found {sys.version}")
 
     import cv2
     import gymnasium

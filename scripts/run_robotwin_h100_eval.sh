@@ -7,32 +7,48 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 CURRENT_USER="${USER:-$(id -un)}"
 
-if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
-  if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
-    FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
-  else
-    FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
+FASTWAM_EVAL_USE_CURRENT_ENV="${FASTWAM_EVAL_USE_CURRENT_ENV:-0}"
+if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python || true)}"
+  if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
+    echo "[h100-eval] ERROR: current Python not found; set PYTHON_BIN." >&2
+    exit 1
   fi
-fi
-if [[ -z "${CONDA_SH:-}" ]]; then
-  if [[ -f "/fsx/miniforge3/etc/profile.d/conda.sh" ]]; then
-    CONDA_SH="/fsx/miniforge3/etc/profile.d/conda.sh"
-  else
-    CONDA_SH="/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh"
+  PYTHON_ENV_PREFIX="$("${PYTHON_BIN}" -c 'import sys; print(sys.prefix)')"
+  export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+else
+  if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
+    if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
+      FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
+    else
+      FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
+    fi
   fi
+  if [[ -z "${CONDA_SH:-}" ]]; then
+    if [[ -n "${MINIFORGE_ROOT:-}" && \
+          -f "${MINIFORGE_ROOT}/etc/profile.d/conda.sh" ]]; then
+      CONDA_SH="${MINIFORGE_ROOT}/etc/profile.d/conda.sh"
+    elif [[ -f "/fsx/miniforge3/etc/profile.d/conda.sh" ]]; then
+      CONDA_SH="/fsx/miniforge3/etc/profile.d/conda.sh"
+    else
+      CONDA_SH="/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh"
+    fi
+  fi
+  if [[ ! -f "${CONDA_SH}" ]]; then
+    echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
+    exit 1
+  fi
+  # Always reactivate so a stale nested virtualenv cannot take precedence.
+  # shellcheck disable=SC1090
+  set +u
+  source "${CONDA_SH}"
+  conda activate "${FASTWAM_EVAL_ENV}"
+  unset VIRTUAL_ENV
+  set -u
+  hash -r
+  PYTHON_ENV_PREFIX="${CONDA_PREFIX}"
+  PYTHON_BIN="${CONDA_PREFIX}/bin/python"
 fi
-if [[ ! -f "${CONDA_SH}" ]]; then
-  echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
-  exit 1
-fi
-# Always reactivate so a stale nested virtualenv cannot take precedence.
-# shellcheck disable=SC1090
-set +u
-source "${CONDA_SH}"
-conda activate "${FASTWAM_EVAL_ENV}"
-unset VIRTUAL_ENV
-set -u
-hash -r
 
 MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1, MODEL_KIND=idm, or MODEL_KIND=vjepa}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
@@ -105,7 +121,8 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/fastwam_torch_extensions_${CURRENT_USER}}"
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${CURRENT_USER}}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${CURRENT_USER}}"
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+export FASTWAM_PYTHON_ENV_PREFIX="${PYTHON_ENV_PREFIX}"
+export LD_LIBRARY_PATH="${PYTHON_ENV_PREFIX}/lib:${PYTHON_ENV_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
 if [[ -z "${NVIDIA_GRAPHICS_ENV:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
   NVIDIA_DRIVER_VERSION="$(
     nvidia-smi --query-gpu=driver_version --format=csv,noheader \
@@ -122,32 +139,55 @@ if [[ -n "${NVIDIA_GRAPHICS_ENV:-}" ]]; then
     exit 1
   fi
   # Source this after conda activation so matching driver libraries stay first.
+  SYNTHETIC_CONDA_PREFIX=0
+  if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" && \
+        -z "${CONDA_PREFIX:-}" ]]; then
+    export CONDA_PREFIX="${PYTHON_ENV_PREFIX}"
+    SYNTHETIC_CONDA_PREFIX=1
+  fi
   # shellcheck disable=SC1090
   source "${NVIDIA_GRAPHICS_ENV}"
+  if [[ "${SYNTHETIC_CONDA_PREFIX}" == "1" ]]; then
+    unset CONDA_PREFIX
+  fi
 fi
 mkdir -p "${TORCH_EXTENSIONS_DIR}" "${WARP_CACHE_PATH}" "${XDG_CACHE_HOME}"
 
 if [[ -z "${QWEN_DIR:-}" ]]; then
   DIRECT_QWEN_DIR="${REPO_ROOT}/checkpoints/Qwen/Qwen3-VL-2B-Instruct"
   SNAPSHOT_ROOT="${HF_HUB_CACHE}/models--Qwen--Qwen3-VL-2B-Instruct/snapshots"
-  if [[ -f "${DIRECT_QWEN_DIR}/config.json" ]]; then
+  DIRECT_QWEN_REVISION=""
+  if [[ -f "${DIRECT_QWEN_DIR}/.fastwam_hf_revision" ]]; then
+    DIRECT_QWEN_REVISION="$(
+      tr -d '[:space:]' < "${DIRECT_QWEN_DIR}/.fastwam_hf_revision"
+    )"
+  fi
+  if [[ -f "${DIRECT_QWEN_DIR}/config.json" && \
+        ( -z "${QWEN_REVISION:-}" || \
+          "${DIRECT_QWEN_REVISION}" == "${QWEN_REVISION}" ) ]]; then
     QWEN_DIR="${DIRECT_QWEN_DIR}"
   elif [[ -d "${SNAPSHOT_ROOT}" ]]; then
-    QWEN_REF="${HF_HUB_CACHE}/models--Qwen--Qwen3-VL-2B-Instruct/refs/main"
-    if [[ -f "${QWEN_REF}" ]]; then
-      QWEN_REVISION="$(tr -d '[:space:]' < "${QWEN_REF}")"
+    if [[ -n "${QWEN_REVISION:-}" && \
+          -f "${SNAPSHOT_ROOT}/${QWEN_REVISION}/config.json" ]]; then
       QWEN_DIR="${SNAPSHOT_ROOT}/${QWEN_REVISION}"
     else
-      mapfile -t QWEN_SNAPSHOTS < <(
-        find -L "${SNAPSHOT_ROOT}" -mindepth 1 -maxdepth 1 \
-          -type d -print 2>/dev/null
-      )
-      if (( ${#QWEN_SNAPSHOTS[@]} == 1 )); then
-        QWEN_DIR="${QWEN_SNAPSHOTS[0]}"
-      elif (( ${#QWEN_SNAPSHOTS[@]} > 1 )); then
-        echo "[h100-eval] ERROR: multiple Qwen snapshots found without refs/main." >&2
-        printf '  %s\n' "${QWEN_SNAPSHOTS[@]}" >&2
-        exit 1
+      QWEN_REF="${HF_HUB_CACHE}/models--Qwen--Qwen3-VL-2B-Instruct/refs/main"
+      if [[ -f "${QWEN_REF}" && -z "${QWEN_REVISION:-}" ]]; then
+        QWEN_REVISION="$(tr -d '[:space:]' < "${QWEN_REF}")"
+        QWEN_DIR="${SNAPSHOT_ROOT}/${QWEN_REVISION}"
+      elif [[ -z "${QWEN_REVISION:-}" ]]; then
+        mapfile -t QWEN_SNAPSHOTS < <(
+          find -L "${SNAPSHOT_ROOT}" -mindepth 1 -maxdepth 1 \
+            -type d -print 2>/dev/null
+        )
+        if (( ${#QWEN_SNAPSHOTS[@]} == 1 )); then
+          QWEN_DIR="${QWEN_SNAPSHOTS[0]}"
+          QWEN_REVISION="$(basename "${QWEN_DIR}")"
+        elif (( ${#QWEN_SNAPSHOTS[@]} > 1 )); then
+          echo "[h100-eval] ERROR: multiple Qwen snapshots found without refs/main." >&2
+          printf '  %s\n' "${QWEN_SNAPSHOTS[@]}" >&2
+          exit 1
+        fi
       fi
     fi
   fi
@@ -158,8 +198,9 @@ if [[ ! -f "${QWEN_DIR}/config.json" ]]; then
   exit 1
 fi
 export QWEN_DIR
+export QWEN_REVISION="${QWEN_REVISION:-}"
 if [[ "${SKIP_MODEL_PREFLIGHT:-0}" != "1" ]]; then
-python - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -176,11 +217,12 @@ root = Path(os.environ["QWEN_DIR"])
 expected_revision = os.environ.get("QWEN_REVISION")
 if expected_revision:
     marker = root / ".fastwam_hf_revision"
-    actual_revision = (
-        marker.read_text(encoding="utf-8").strip()
-        if marker.is_file()
-        else None
-    )
+    if marker.is_file():
+        actual_revision = marker.read_text(encoding="utf-8").strip()
+    elif root.parent.name == "snapshots":
+        actual_revision = root.name
+    else:
+        actual_revision = None
     if actual_revision != expected_revision:
         raise RuntimeError(
             f"Qwen revision mismatch at {root}: "
@@ -239,7 +281,7 @@ else
 fi
 
 if [[ "${SKIP_EVAL_PREPARE:-0}" != "1" ]]; then
-  python scripts/prepare_robotwin_h100_eval_config.py "${PREPARE_ARGS[@]}"
+  "${PYTHON_BIN}" scripts/prepare_robotwin_h100_eval_config.py "${PREPARE_ARGS[@]}"
 
   EXPECTED_POLICY="${REPO_ROOT}/experiments/robotwin/fastwam_policy"
   POLICY_LINK="${ROBOTWIN_ROOT}/policy/fastwam_policy"
@@ -257,7 +299,8 @@ if [[ "${SKIP_EVAL_PREPARE:-0}" != "1" ]]; then
   else
     ln -s "${EXPECTED_POLICY}" "${POLICY_LINK}"
   fi
-  python scripts/patch_robotwin_eval_compat.py --robotwin-root "${ROBOTWIN_ROOT}"
+  "${PYTHON_BIN}" scripts/patch_robotwin_eval_compat.py \
+    --robotwin-root "${ROBOTWIN_ROOT}"
 else
   if [[ ! -f "${EVAL_CONFIG}" ]]; then
     echo "[h100-eval] ERROR: prepared eval config not found: ${EVAL_CONFIG}" >&2
@@ -278,12 +321,12 @@ if [[ "${CHECK_ALIGNMENT:-1}" == "1" ]]; then
   if [[ -n "${TRAINING_STATS:-}" ]]; then
     ALIGN_ARGS+=(--training-stats "${TRAINING_STATS}")
   fi
-  python scripts/check_robotwin_eval_alignment.py "${ALIGN_ARGS[@]}"
+  "${PYTHON_BIN}" scripts/check_robotwin_eval_alignment.py "${ALIGN_ARGS[@]}"
 fi
 
 RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 if [[ "${CHECK_ENV:-1}" == "1" ]]; then
-  python scripts/check_robotwin_h100_eval_env.py \
+  "${PYTHON_BIN}" scripts/check_robotwin_h100_eval_env.py \
     --robotwin-root "${ROBOTWIN_ROOT}" \
     --render-backend "${RENDER_BACKEND}"
 fi
@@ -311,7 +354,7 @@ CKPT_NAME="$(basename "${CKPT}" .pt)"
 OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2}"
 
 CMD=(
-  python experiments/robotwin/run_robotwin_manager.py
+  "${PYTHON_BIN}" experiments/robotwin/run_robotwin_manager.py
   task="${TASK_CONFIG}"
   ckpt="${CKPT}"
   EVALUATION.train_config_path="${EVAL_CONFIG}"

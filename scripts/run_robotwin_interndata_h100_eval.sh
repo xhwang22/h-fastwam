@@ -34,8 +34,15 @@ if [[ -z "${RUN_DIR:-}" ]]; then
   exit 1
 fi
 
-if [[ "${SETUP_EVAL_ENV:-1}" == "1" ]]; then
+SETUP_EVAL_ENV="${SETUP_EVAL_ENV:-1}"
+if [[ "${SETUP_EVAL_ENV}" == "1" ]]; then
   bash "${SCRIPT_DIR}/setup_robotwin_h100_eval_env.sh"
+  export FASTWAM_EVAL_USE_CURRENT_ENV=0
+else
+  export FASTWAM_EVAL_USE_CURRENT_ENV=1
+  if [[ -z "${PYTHON_BIN:-}" && -x "/opt/venv/bin/python" ]]; then
+    export PYTHON_BIN=/opt/venv/bin/python
+  fi
 fi
 
 DRIVER_VERSION="$(
@@ -43,9 +50,9 @@ DRIVER_VERSION="$(
     | head -1
 )"
 NVIDIA_GRAPHICS_ROOT="${NVIDIA_GRAPHICS_ROOT:-/fsx/nvidia-userspace/${DRIVER_VERSION}}"
-export NVIDIA_GRAPHICS_ENV="${NVIDIA_GRAPHICS_ENV:-${NVIDIA_GRAPHICS_ROOT}/activate.sh}"
-if [[ -z "${CONDA_SH:-}" && -n "${MINIFORGE_ROOT:-}" ]]; then
-  export CONDA_SH="${MINIFORGE_ROOT}/etc/profile.d/conda.sh"
+if [[ -z "${NVIDIA_GRAPHICS_ENV:-}" && \
+      -f "${NVIDIA_GRAPHICS_ROOT}/activate.sh" ]]; then
+  export NVIDIA_GRAPHICS_ENV="${NVIDIA_GRAPHICS_ROOT}/activate.sh"
 fi
 export MODEL_KIND=vjepa
 export RUN_DIR
@@ -55,7 +62,6 @@ export MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-1}"
 export RENDER_BACKEND=gpu
 export CHECK_ALIGNMENT=1
 export CHECK_ENV=1
-export QWEN_DIR="${QWEN_DIR:-${REPO_ROOT}/checkpoints/Qwen/Qwen3-VL-2B-Instruct}"
 export QWEN_REVISION="${QWEN_REVISION:-89644892e4d85e24eaac8bacfd4f463576704203}"
 if [[ -z "${STATS:-}" ]]; then
   if [[ -f "/efs/shaunxhwang/robotwin2.0_webdataset/dataset_stats.json" ]]; then
