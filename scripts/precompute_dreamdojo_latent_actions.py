@@ -21,6 +21,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tqdm.auto import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -468,7 +469,15 @@ def main() -> None:
         expected_checkpoint_sha256=args.checkpoint_sha256,
     )
     output_dtype = _cache_dtype(args.cache_dtype)
-    for shard_id in range(rank, num_shards, world_size):
+    assigned_shards = range(rank, num_shards, world_size)
+    shard_iterator = tqdm(
+        assigned_shards,
+        desc=f"{args.split} cache rank0/{world_size}",
+        unit="shard",
+        dynamic_ncols=True,
+        disable=rank != 0,
+    )
+    for shard_id in shard_iterator:
         first = shard_id * args.shard_size
         last = min(first + args.shard_size, dataset_length)
         shard_path = latent_action_shard_path(cache_dir, shard_id)
@@ -477,7 +486,11 @@ def main() -> None:
             first_index=first,
             last_index=last,
         ):
-            print(f"[rank {rank}] keeping complete shard {shard_id}/{num_shards}")
+            if rank != 0:
+                print(
+                    f"[rank {rank}] keeping complete shard "
+                    f"{shard_id}/{num_shards}"
+                )
             continue
         tensors = {}
         for batch_first in range(first, last, args.sample_batch_size):
@@ -513,10 +526,11 @@ def main() -> None:
                 "last_index_exclusive": str(last),
             },
         )
-        print(
-            f"[rank {rank}] wrote shard {shard_id + 1}/{num_shards} "
-            f"samples=[{first},{last})"
-        )
+        if rank != 0:
+            print(
+                f"[rank {rank}] wrote shard {shard_id + 1}/{num_shards} "
+                f"samples=[{first},{last})"
+            )
 
     if dist.is_initialized():
         dist.barrier()
