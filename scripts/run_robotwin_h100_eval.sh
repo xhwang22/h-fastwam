@@ -106,6 +106,25 @@ export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/fastwam_torch_extensio
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${CURRENT_USER}}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${CURRENT_USER}}"
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+if [[ -z "${NVIDIA_GRAPHICS_ENV:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  NVIDIA_DRIVER_VERSION="$(
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader \
+      | head -1
+  )"
+  DEFAULT_NVIDIA_GRAPHICS_ROOT="${NVIDIA_GRAPHICS_ROOT:-/fsx/nvidia-userspace/${NVIDIA_DRIVER_VERSION}}"
+  if [[ -f "${DEFAULT_NVIDIA_GRAPHICS_ROOT}/activate.sh" ]]; then
+    NVIDIA_GRAPHICS_ENV="${DEFAULT_NVIDIA_GRAPHICS_ROOT}/activate.sh"
+  fi
+fi
+if [[ -n "${NVIDIA_GRAPHICS_ENV:-}" ]]; then
+  if [[ ! -f "${NVIDIA_GRAPHICS_ENV}" ]]; then
+    echo "[h100-eval] ERROR: NVIDIA graphics environment not found: ${NVIDIA_GRAPHICS_ENV}" >&2
+    exit 1
+  fi
+  # Source this after conda activation so matching driver libraries stay first.
+  # shellcheck disable=SC1090
+  source "${NVIDIA_GRAPHICS_ENV}"
+fi
 mkdir -p "${TORCH_EXTENSIONS_DIR}" "${WARP_CACHE_PATH}" "${XDG_CACHE_HOME}"
 
 if [[ -z "${QWEN_DIR:-}" ]]; then
@@ -114,8 +133,23 @@ if [[ -z "${QWEN_DIR:-}" ]]; then
   if [[ -f "${DIRECT_QWEN_DIR}/config.json" ]]; then
     QWEN_DIR="${DIRECT_QWEN_DIR}"
   elif [[ -d "${SNAPSHOT_ROOT}" ]]; then
-    QWEN_DIR="$(find -L "${SNAPSHOT_ROOT}" \
-      -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null || true)"
+    QWEN_REF="${HF_HUB_CACHE}/models--Qwen--Qwen3-VL-2B-Instruct/refs/main"
+    if [[ -f "${QWEN_REF}" ]]; then
+      QWEN_REVISION="$(tr -d '[:space:]' < "${QWEN_REF}")"
+      QWEN_DIR="${SNAPSHOT_ROOT}/${QWEN_REVISION}"
+    else
+      mapfile -t QWEN_SNAPSHOTS < <(
+        find -L "${SNAPSHOT_ROOT}" -mindepth 1 -maxdepth 1 \
+          -type d -print 2>/dev/null
+      )
+      if (( ${#QWEN_SNAPSHOTS[@]} == 1 )); then
+        QWEN_DIR="${QWEN_SNAPSHOTS[0]}"
+      elif (( ${#QWEN_SNAPSHOTS[@]} > 1 )); then
+        echo "[h100-eval] ERROR: multiple Qwen snapshots found without refs/main." >&2
+        printf '  %s\n' "${QWEN_SNAPSHOTS[@]}" >&2
+        exit 1
+      fi
+    fi
   fi
 fi
 QWEN_DIR="${QWEN_DIR:-}"
@@ -123,8 +157,13 @@ if [[ ! -f "${QWEN_DIR}/config.json" ]]; then
   echo "[h100-eval] ERROR: complete Qwen3-VL-2B snapshot not found: ${QWEN_DIR}" >&2
   exit 1
 fi
+export QWEN_DIR
 if [[ "${SKIP_MODEL_PREFLIGHT:-0}" != "1" ]]; then
 python - <<'PY'
+import json
+import os
+from pathlib import Path
+
 from packaging.version import Version
 import transformers
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
@@ -133,6 +172,37 @@ if Version(transformers.__version__) < Version("4.57.0"):
     raise RuntimeError(
         f"transformers>=4.57.0 is required, found {transformers.__version__}"
     )
+root = Path(os.environ["QWEN_DIR"])
+expected_revision = os.environ.get("QWEN_REVISION")
+if expected_revision:
+    marker = root / ".fastwam_hf_revision"
+    actual_revision = (
+        marker.read_text(encoding="utf-8").strip()
+        if marker.is_file()
+        else None
+    )
+    if actual_revision != expected_revision:
+        raise RuntimeError(
+            f"Qwen revision mismatch at {root}: "
+            f"expected={expected_revision}, actual={actual_revision}"
+        )
+index = root / "model.safetensors.index.json"
+single = root / "model.safetensors"
+if index.is_file():
+    with index.open("r", encoding="utf-8") as handle:
+        weight_map = json.load(handle).get("weight_map", {})
+    missing = sorted(
+        filename
+        for filename in set(weight_map.values())
+        if not (root / filename).is_file()
+    )
+    if not weight_map or missing:
+        raise RuntimeError(
+            f"Incomplete Qwen sharded checkpoint at {root}; "
+            f"missing={missing[:20]}"
+        )
+elif not single.is_file():
+    raise RuntimeError(f"Qwen safetensors weights are missing from {root}")
 print(f"[h100-eval] transformers={transformers.__version__} Qwen3-VL=OK")
 PY
 fi
@@ -211,8 +281,11 @@ if [[ "${CHECK_ALIGNMENT:-1}" == "1" ]]; then
   python scripts/check_robotwin_eval_alignment.py "${ALIGN_ARGS[@]}"
 fi
 
+RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 if [[ "${CHECK_ENV:-1}" == "1" ]]; then
-  python scripts/check_robotwin_h100_eval_env.py --robotwin-root "${ROBOTWIN_ROOT}"
+  python scripts/check_robotwin_h100_eval_env.py \
+    --robotwin-root "${ROBOTWIN_ROOT}" \
+    --render-backend "${RENDER_BACKEND}"
 fi
 
 MODE="${MODE:-smoke}"
@@ -234,7 +307,6 @@ MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-1}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 REPLAN_STEPS="${REPLAN_STEPS:-24}"
-RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 CKPT_NAME="$(basename "${CKPT}" .pt)"
 OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2}"
 

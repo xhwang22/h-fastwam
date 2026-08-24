@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,11 @@ EXPECTED_ROBOTWIN_REVISION = "bf44be51cf5717a5595ce59447f2cf5263d2aa95"
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--robotwin-root", default="checkpoints/RoboTwin")
+    parser.add_argument(
+        "--render-backend",
+        choices=("gpu", "cpu"),
+        default="gpu",
+    )
     args = parser.parse_args()
 
     if sys.version_info[:2] != (3, 10):
@@ -68,6 +74,37 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(f"Missing RoboTwin asset/path: {path}")
 
+    if args.render_backend == "gpu":
+        vulkan = subprocess.run(
+            ["vulkaninfo", "--summary"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=os.environ.copy(),
+        )
+        vulkan_output = f"{vulkan.stdout}\n{vulkan.stderr}"
+        if vulkan.returncode != 0 or "NVIDIA" not in vulkan_output:
+            raise RuntimeError(
+                "Vulkan failed to enumerate an NVIDIA GPU:\n"
+                f"{vulkan_output[-4000:]}"
+            )
+        render = subprocess.run(
+            [sys.executable, "script/test_render.py"],
+            cwd=robotwin_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=os.environ.copy(),
+        )
+        render_output = f"{render.stdout}\n{render.stderr}"
+        if render.returncode != 0 or "Render Well" not in render_output:
+            raise RuntimeError(
+                "RoboTwin SAPIEN GPU renderer preflight failed:\n"
+                f"{render_output[-4000:]}"
+            )
+
     print(f"python={sys.version.split()[0]}")
     print(f"torch={torch.__version__}")
     print(f"transformers={transformers.__version__}")
@@ -83,6 +120,7 @@ def main() -> None:
             f"gpu[{device_index}]={torch.cuda.get_device_name(device_index)} "
             f"capability={torch.cuda.get_device_capability(device_index)}"
         )
+    print(f"render_backend={args.render_backend}")
     print("H100 RoboTwin evaluation environment: OK")
 
 
