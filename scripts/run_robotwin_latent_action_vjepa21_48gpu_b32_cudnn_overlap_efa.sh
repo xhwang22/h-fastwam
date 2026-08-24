@@ -3,18 +3,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-: "${LATENT_ACTION_TRAIN_CACHE_DIR:?Set LATENT_ACTION_TRAIN_CACHE_DIR to the completed training cache.}"
-: "${LATENT_ACTION_VAL_CACHE_DIR:?Set LATENT_ACTION_VAL_CACHE_DIR to the completed validation cache.}"
-export LATENT_ACTION_TRAIN_CACHE_DIR LATENT_ACTION_VAL_CACHE_DIR
-for cache_dir in \
-  "${LATENT_ACTION_TRAIN_CACHE_DIR}" \
-  "${LATENT_ACTION_VAL_CACHE_DIR}"; do
-  if [[ ! -f "${cache_dir}/manifest.json" ]]; then
-    echo "ERROR: latent-action cache manifest not found: ${cache_dir}/manifest.json" >&2
-    exit 1
-  fi
-done
+export DREAMDOJO_ROOT="${DREAMDOJO_ROOT:-${REPO_ROOT}/external/DreamDojo}"
+export DREAMDOJO_CHECKPOINT="${DREAMDOJO_CHECKPOINT:-${DREAMDOJO_ROOT}/checkpoints/DreamDojo/LAM_400k.ckpt}"
+if [[ ! -f "${DREAMDOJO_ROOT}/external/lam/modules/lam.py" ]]; then
+  echo "ERROR: DreamDojo LAM source not found under ${DREAMDOJO_ROOT}." >&2
+  exit 1
+fi
+if [[ ! -f "${DREAMDOJO_CHECKPOINT}" ]]; then
+  echo "ERROR: DreamDojo checkpoint not found: ${DREAMDOJO_CHECKPOINT}" >&2
+  exit 1
+fi
+
+# This launcher always computes targets online, even if the shell previously
+# exported variables used by the legacy cache route.
+unset LATENT_ACTION_CACHE_ROOT LATENT_ACTION_CACHE_SIGNATURE
 
 export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export FASTWAM_EXPECTED_WORLD_SIZE=48

@@ -16,7 +16,6 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
@@ -27,6 +26,10 @@ from safetensors.torch import save_file
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from fastwam.models.dreamdojo_lam import (  # noqa: E402
+    encode_dreamdojo_latent_actions,
+    load_dreamdojo_lam,
+)
 from fastwam.utils.latent_action_cache import (  # noqa: E402
     CACHE_FORMAT,
     CACHE_VERSION,
@@ -144,75 +147,6 @@ def _build_dataset(args: argparse.Namespace):
     )
 
 
-def _load_lam(
-    dreamdojo_root: Path,
-    checkpoint: Path,
-    device: torch.device,
-) -> torch.nn.Module:
-    if not dreamdojo_root.is_dir():
-        raise FileNotFoundError(f"DreamDojo checkout not found: {dreamdojo_root}")
-    if not (
-        dreamdojo_root / "external" / "lam" / "modules" / "lam.py"
-    ).is_file():
-        raise FileNotFoundError(
-            "DreamDojo checkout is missing external/lam/modules/lam.py: "
-            f"{dreamdojo_root}"
-        )
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"DreamDojo LAM checkpoint not found: {checkpoint}")
-    sys.path.insert(0, str(dreamdojo_root))
-    from external.lam.modules.lam import LatentActionModel
-
-    model = LatentActionModel(
-        in_dim=3,
-        model_dim=1024,
-        latent_dim=32,
-        patch_size=16,
-        enc_blocks=24,
-        dec_blocks=24,
-        num_heads=16,
-        dropout=0.0,
-    )
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or not isinstance(
-        payload.get("state_dict"),
-        dict,
-    ):
-        raise ValueError(
-            "DreamDojo LAM checkpoint must contain a `state_dict` mapping."
-        )
-    wrapper_state = payload["state_dict"]
-    non_lam_keys = [
-        key for key in wrapper_state if not key.startswith("lam.")
-    ]
-    if non_lam_keys:
-        raise ValueError(
-            "DreamDojo checkpoint contains unexpected non-LAM state keys: "
-            f"{non_lam_keys[:20]}."
-        )
-    lam_state = {
-        key.removeprefix("lam."): value
-        for key, value in wrapper_state.items()
-    }
-    missing, unexpected = model.load_state_dict(
-        lam_state,
-        strict=False,
-        assign=True,
-    )
-    if missing or unexpected:
-        raise ValueError(
-            "DreamDojo LAM checkpoint does not exactly match the official "
-            f"1024D/24+24/32D architecture: missing={missing[:20]}, "
-            f"unexpected={unexpected[:20]}."
-        )
-    del model.patch_up
-    del model.action_up
-    del model.decoder
-    model.eval()
-    model.requires_grad_(False)
-    return model.to(device=device, dtype=torch.bfloat16)
-
-
 def _extract_full_video(
     dataset,
     index: int,
@@ -246,50 +180,6 @@ def _extract_full_video(
             f"normalization, got {getattr(action_is_pad, 'shape', None)}."
         )
     return video, ~action_is_pad.to(dtype=torch.bool)
-
-
-@torch.inference_mode()
-def _encode_video_pairs(
-    model: torch.nn.Module,
-    video: torch.Tensor,
-    *,
-    pair_batch_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    frames = video.float().clamp(-1.0, 1.0)
-    frames = F.interpolate(
-        frames.permute(1, 0, 2, 3),
-        size=(240, 320),
-        mode="bilinear",
-        align_corners=False,
-        antialias=True,
-    )
-    frames = ((frames + 1.0) * 0.5).permute(0, 2, 3, 1).contiguous()
-    pairs = torch.stack((frames[:-1], frames[1:]), dim=1)
-    outputs = []
-    for start in range(0, pairs.shape[0], pair_batch_size):
-        pair_batch = pairs[start : start + pair_batch_size].to(
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            encoded = model.encode(pair_batch)
-        z_rep = encoded.get("z_rep")
-        if not torch.is_tensor(z_rep) or z_rep.shape[1:] != (1, 1, 32):
-            raise ValueError(
-                "DreamDojo LAM must return z_rep [B,1,1,32], "
-                f"got {type(z_rep)} with shape {getattr(z_rep, 'shape', None)}."
-            )
-        outputs.append(z_rep[:, 0, 0].float().cpu())
-    latent_actions = torch.cat(outputs, dim=0)
-    if latent_actions.shape != (32, 32):
-        raise ValueError(
-            f"Expected latent-action target [32,32], got "
-            f"{tuple(latent_actions.shape)}."
-        )
-    if not bool(torch.isfinite(latent_actions).all().item()):
-        raise ValueError("DreamDojo LAM produced non-finite latent actions.")
-    return latent_actions
 
 
 def _cache_dtype(name: str) -> torch.dtype:
@@ -525,7 +415,7 @@ def main() -> None:
     if dist.is_initialized():
         dist.barrier()
 
-    model = _load_lam(dreamdojo_root, checkpoint, device)
+    model = load_dreamdojo_lam(dreamdojo_root, checkpoint, device)
     num_shards = math.ceil(dataset_length / args.shard_size)
     output_dtype = _cache_dtype(args.cache_dtype)
     for shard_id in range(rank, num_shards, world_size):
@@ -542,12 +432,12 @@ def main() -> None:
         tensors = {}
         for index in range(first, last):
             video, valid = _extract_full_video(dataset, index)
-            latent_action = _encode_video_pairs(
+            latent_action = encode_dreamdojo_latent_actions(
                 model,
-                video,
+                video.unsqueeze(0),
                 pair_batch_size=args.pair_batch_size,
                 device=device,
-            )
+            )[0].cpu()
             tensors[latent_action_tensor_key(index)] = latent_action.to(
                 dtype=output_dtype
             )

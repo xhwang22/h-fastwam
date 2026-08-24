@@ -3394,6 +3394,15 @@ class HFastWAM(nn.Module):
                     metadata[key] = self.latent_action_config[key]
         return metadata
 
+    def _validate_checkpoint_metadata(
+        self,
+        metadata: Optional[dict],
+        *,
+        strict: bool,
+        path: str,
+    ) -> None:
+        del metadata, strict, path
+
     def save_checkpoint(self, path: str, optimizer=None, step=None):
         payload = {
             "language_expert": self.language_expert.state_dict(),
@@ -3464,6 +3473,11 @@ class HFastWAM(nn.Module):
                     "Latent cache signature mismatch: "
                     f"checkpoint={actual_signature!r}, expected={expected_signature!r}."
                 )
+        self._validate_checkpoint_metadata(
+            metadata,
+            strict=strict,
+            path=path,
+        )
 
         def _validate(name, missing, unexpected, allowed_missing=()):
             allowed_missing = set(allowed_missing)

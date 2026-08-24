@@ -1501,6 +1501,10 @@ class Wan22Trainer:
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
+        model = self.accelerator.unwrap_model(self.model)
+        checkpoint_metadata = getattr(model, "_checkpoint_metadata", None)
+        if callable(checkpoint_metadata):
+            payload["model_checkpoint_metadata"] = checkpoint_metadata()
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -1639,12 +1643,26 @@ class Wan22Trainer:
         )
 
     def load_training_state(self, state_dir: str):
-        self._patch_scheduler_for_legacy_resume(state_dir)
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        payload = None
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            model = self.accelerator.unwrap_model(self.model)
+            validate_metadata = getattr(
+                model,
+                "_validate_checkpoint_metadata",
+                None,
+            )
+            if callable(validate_metadata):
+                validate_metadata(
+                    payload.get("model_checkpoint_metadata"),
+                    strict=True,
+                    path=str(state_file),
+                )
+        self._patch_scheduler_for_legacy_resume(state_dir)
+        self.accelerator.load_state(input_dir=state_dir)
+        if payload is not None:
             self.global_step = int(payload["global_step"])
 
             if "epoch" in payload and "batch_in_epoch" in payload:

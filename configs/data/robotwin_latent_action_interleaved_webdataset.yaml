@@ -3,11 +3,11 @@ defaults:
   - _self_
 
 train:
-  action_video_freq_ratio: 32
-  latent_action_cache_dir: ${oc.env:LATENT_ACTION_TRAIN_CACHE_DIR}
-  normalize_latent_actions: true
+  action_video_freq_ratio: 1
+  latent_action_cache_dir: null
+  normalize_latent_actions: false
 
 val:
   action_video_freq_ratio: ${data.train.action_video_freq_ratio}
-  latent_action_cache_dir: ${oc.env:LATENT_ACTION_VAL_CACHE_DIR}
-  normalize_latent_actions: true
+  latent_action_cache_dir: null
+  normalize_latent_actions: false

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
+from fastwam.models.dreamdojo_lam import encode_dreamdojo_latent_actions
 from fastwam.models.hfastwam.hfastwam import HFastWAM
 from fastwam.models.hfastwam.hfastwam_latent_action import HFastWAMLatentAction
 from fastwam.models.hfastwam.language_expert import LanguageExpert
@@ -112,6 +113,30 @@ def test_latent_action_cache_loads_and_normalizes(tmp_path):
         latent_action - torch.tensor(manifest["mean"])
     ) / torch.tensor(manifest["std"])
     torch.testing.assert_close(loaded, expected)
+
+
+class _FakeDreamDojo(nn.Module):
+    def encode(self, pairs):
+        delta = pairs[:, 1].mean(dim=(1, 2, 3))
+        delta = delta - pairs[:, 0].mean(dim=(1, 2, 3))
+        return {"z_rep": delta[:, None, None, None].expand(-1, 1, 1, 32)}
+
+
+def test_online_dreamdojo_encoding_preserves_transition_order():
+    frame_values = torch.linspace(-1.0, 1.0, 33)
+    video = frame_values[None, None, :, None, None].expand(2, 3, 33, 8, 8)
+    latent_actions = encode_dreamdojo_latent_actions(
+        _FakeDreamDojo(),
+        video,
+        pair_batch_size=13,
+        device=torch.device("cpu"),
+        model_dtype=torch.float32,
+    )
+
+    assert latent_actions.shape == (2, 32, 32)
+    expected_delta = ((frame_values[1:] - frame_values[:-1]) * 0.5)
+    torch.testing.assert_close(latent_actions[0, :, 0], expected_delta)
+    torch.testing.assert_close(latent_actions[1], latent_actions[0])
 
 
 class _FakeVisualEncoder(BaseVisualEncoder):

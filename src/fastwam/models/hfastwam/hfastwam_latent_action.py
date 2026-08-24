@@ -5,6 +5,10 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
+from fastwam.models.dreamdojo_lam import (
+    encode_dreamdojo_latent_actions,
+    load_dreamdojo_lam,
+)
 from fastwam.models.wan22.latent_action_dit import LatentActionDiT
 
 from .hfastwam import HFastWAM
@@ -15,6 +19,10 @@ class HFastWAMLatentAction(HFastWAM):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_dreamdojo_lam", None)
+        self.dreamdojo_pair_batch_size = 32
+        self.dreamdojo_model_dtype = torch.bfloat16
+        self.dreamdojo_provenance = None
         if not isinstance(self.video_expert, LatentActionDiT):
             raise TypeError(
                 "HFastWAMLatentAction requires video_expert=LatentActionDiT, "
@@ -29,6 +37,181 @@ class HFastWAMLatentAction(HFastWAM):
             raise ValueError(
                 "HFastWAMLatentAction requires visual_encoder.freeze_backbone=true."
             )
+
+    @classmethod
+    def from_pretrained_fastwam(
+        cls,
+        dreamdojo_config: Optional[dict] = None,
+        **kwargs,
+    ):
+        model = super(HFastWAMLatentAction, cls).from_pretrained_fastwam(
+            **kwargs
+        )
+        config = dict(dreamdojo_config or {})
+        enabled = bool(config.pop("enabled", False))
+        if not enabled:
+            if config:
+                raise ValueError(
+                    "DreamDojo settings were provided while "
+                    "`dreamdojo_config.enabled=false`."
+                )
+            return model
+
+        root = config.pop("root", None)
+        checkpoint = config.pop("checkpoint", None)
+        pair_batch_size = int(config.pop("pair_batch_size", 32))
+        dtype_name = str(config.pop("dtype", "bfloat16"))
+        checkpoint_sha256 = config.pop("checkpoint_sha256", None)
+        source_revision = config.pop("source_revision", None)
+        if config:
+            raise ValueError(
+                f"Unknown DreamDojo config fields: {sorted(config)}."
+            )
+        if root is None or checkpoint is None:
+            raise ValueError(
+                "Online DreamDojo targets require both "
+                "`dreamdojo_config.root` and `dreamdojo_config.checkpoint`."
+            )
+        if checkpoint_sha256 in (None, "") or source_revision in (None, ""):
+            raise ValueError(
+                "Online DreamDojo targets require `checkpoint_sha256` and "
+                "`source_revision` provenance."
+            )
+        if pair_batch_size <= 0:
+            raise ValueError(
+                "`dreamdojo_config.pair_batch_size` must be positive."
+            )
+        dtype_by_name = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }
+        if dtype_name not in dtype_by_name:
+            raise ValueError(
+                "`dreamdojo_config.dtype` must be one of "
+                f"{sorted(dtype_by_name)}, got {dtype_name!r}."
+            )
+        dreamdojo_dtype = dtype_by_name[dtype_name]
+        lam = load_dreamdojo_lam(
+            root,
+            checkpoint,
+            device=torch.device(model.device),
+            dtype=dreamdojo_dtype,
+            expected_checkpoint_sha256=str(checkpoint_sha256),
+            expected_source_revision=str(source_revision),
+        )
+        # Keep the frozen target encoder outside the registered module tree so
+        # ZeRO and FastWAM checkpoints do not replicate/save its 8.5 GB weights.
+        object.__setattr__(model, "_dreamdojo_lam", lam)
+        model.dreamdojo_pair_batch_size = pair_batch_size
+        model.dreamdojo_model_dtype = dreamdojo_dtype
+        model.dreamdojo_provenance = {
+            "checkpoint_sha256": str(checkpoint_sha256),
+            "source_revision": str(source_revision),
+            "target_mode": "online_adjacent_pairs",
+            "normalization": "none",
+        }
+        initialization_checkpoint = (
+            kwargs.get("fastwam_checkpoint")
+            or kwargs.get("pretrain_checkpoint")
+        )
+        if initialization_checkpoint is not None:
+            payload = torch.load(
+                initialization_checkpoint,
+                map_location="cpu",
+                mmap=True,
+                weights_only=True,
+            )
+            metadata = payload.get("checkpoint_metadata")
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("video_target_representation") is not None
+            ):
+                model._validate_checkpoint_metadata(
+                    metadata,
+                    strict=False,
+                    path=str(initialization_checkpoint),
+                )
+            mot_state = payload.get("mot")
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("video_target_representation") is None
+            ) and isinstance(mot_state, dict) and any(
+                key.startswith("mixtures.video.action_encoder.")
+                for key in mot_state
+            ):
+                raise ValueError(
+                    "Cannot initialize online DreamDojo training from a "
+                    "latent-action checkpoint without target-space provenance. "
+                    "Use the original VAE-DiT H-FastWAM checkpoint instead."
+                )
+        return model
+
+    def _checkpoint_metadata(self) -> dict:
+        metadata = super()._checkpoint_metadata()
+        if self.dreamdojo_provenance is not None:
+            metadata["video_target_representation"] = "dreamdojo_latent_action"
+            metadata["dreamdojo_target"] = dict(self.dreamdojo_provenance)
+        return metadata
+
+    def _validate_checkpoint_metadata(
+        self,
+        metadata: Optional[dict],
+        *,
+        strict: bool,
+        path: str,
+    ) -> None:
+        del strict
+        if self.dreamdojo_provenance is None:
+            return
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Online DreamDojo resume requires checkpoint metadata: "
+                f"{path}"
+            )
+        if (
+            metadata.get("video_target_representation")
+            != "dreamdojo_latent_action"
+        ):
+            raise ValueError(
+                "Checkpoint was not trained with online DreamDojo latent "
+                f"targets: {path}"
+            )
+        actual = metadata.get("dreamdojo_target")
+        if actual != self.dreamdojo_provenance:
+            raise ValueError(
+                "DreamDojo target provenance mismatch while resuming: "
+                f"checkpoint={actual!r}, configured={self.dreamdojo_provenance!r}."
+            )
+
+    def _encode_online_latent_actions(
+        self,
+        video: torch.Tensor,
+    ) -> torch.Tensor:
+        lam = self.__dict__.get("_dreamdojo_lam")
+        if lam is None:
+            raise RuntimeError(
+                "The sample has no cached `latent_actions`, and the online "
+                "DreamDojo LAM is not configured."
+            )
+        if (
+            self.video_expert.latent_horizon != 32
+            or self.video_expert.latent_dim != 32
+        ):
+            raise ValueError(
+                "Online DreamDojo targets require a [32,32] latent expert."
+            )
+        latent_actions = encode_dreamdojo_latent_actions(
+            lam,
+            video,
+            pair_batch_size=self.dreamdojo_pair_batch_size,
+            device=torch.device(self.device),
+            model_dtype=self.dreamdojo_model_dtype,
+        )
+        return latent_actions.to(
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
 
     def _validate_latent_actions(
         self,
@@ -176,17 +359,35 @@ class HFastWAMLatentAction(HFastWAM):
         self,
         sample: dict,
     ) -> tuple[torch.Tensor, dict]:
-        latent_actions = self._validate_latent_actions(
-            sample.get("latent_actions"),
-            source="sample['latent_actions']",
-        )
-        batch_size = int(latent_actions.shape[0])
         video = sample.get("video")
-        if video is None or int(video.shape[0]) != batch_size:
+        if not torch.is_tensor(video) or video.ndim != 5:
             raise ValueError(
-                "Latent-action training requires raw video with the same batch "
-                "size as `latent_actions`."
+                "Latent-action training requires raw video [B,3,T,H,W], "
+                f"got {type(video)} with shape "
+                f"{getattr(video, 'shape', None)}."
             )
+        batch_size = int(video.shape[0])
+        latent_actions = sample.get("latent_actions")
+        if (
+            latent_actions is not None
+            and self.__dict__.get("_dreamdojo_lam") is not None
+        ):
+            raise ValueError(
+                "Online DreamDojo training does not accept cached "
+                "`latent_actions`; remove the latent-action cache override."
+            )
+        if latent_actions is None:
+            latent_actions = self._encode_online_latent_actions(video)
+        else:
+            latent_actions = self._validate_latent_actions(
+                latent_actions,
+                source="sample['latent_actions']",
+            )
+            if int(latent_actions.shape[0]) != batch_size:
+                raise ValueError(
+                    "Raw video and latent-action batch sizes differ: "
+                    f"{batch_size} vs {int(latent_actions.shape[0])}."
+                )
         visual_context = self._prepare_first_frame_context(
             video,
             source="sample['video']",
@@ -373,37 +574,48 @@ class HFastWAMLatentAction(HFastWAM):
         if not isinstance(segments, dict):
             raise TypeError("`sample['segments']` must be a dict or list[dict].")
 
-        latent_actions = segments.get("latent_actions")
         video = segments.get("video")
-        if not torch.is_tensor(latent_actions) or not torch.is_tensor(video):
+        if not torch.is_tensor(video):
             raise ValueError(
                 "Interleaved latent-action training requires "
-                "`segments['latent_actions']` and `segments['video']`."
+                "`segments['video']`."
             )
-        if latent_actions.ndim == 3:
-            latent_actions = latent_actions.unsqueeze(0)
+        latent_actions = segments.get("latent_actions")
+        if video.ndim == 5:
             video = video.unsqueeze(0)
+            num_segments = int(video.shape[1])
             segments = {
                 key: (
                     value.unsqueeze(0)
                     if torch.is_tensor(value)
                     and value.ndim >= 1
-                    and value.shape[0] == latent_actions.shape[1]
+                    and value.shape[0] == num_segments
                     else value
                 )
                 for key, value in segments.items()
             }
-            segments["latent_actions"] = latent_actions
             segments["video"] = video
-        if latent_actions.ndim != 4 or video.ndim != 6:
+            latent_actions = segments.get("latent_actions")
+        if video.ndim != 6:
             raise ValueError(
-                "Interleaved tensors must be latent_actions=[B,N,T,D] and "
-                f"video=[B,N,3,T,H,W], got {tuple(latent_actions.shape)} and "
-                f"{tuple(video.shape)}."
+                "Interleaved video must be [B,N,3,T,H,W], "
+                f"got {tuple(video.shape)}."
             )
-        batch_size, num_segments = latent_actions.shape[:2]
-        if tuple(video.shape[:2]) != (batch_size, num_segments):
-            raise ValueError("Interleaved video/latent-action leading dims differ.")
+        batch_size, num_segments = video.shape[:2]
+        if latent_actions is not None:
+            if not torch.is_tensor(latent_actions) or latent_actions.ndim != 4:
+                raise ValueError(
+                    "Cached interleaved latent actions must be [B,N,T,D], "
+                    f"got {type(latent_actions)} with shape "
+                    f"{getattr(latent_actions, 'shape', None)}."
+                )
+            if tuple(latent_actions.shape[:2]) != (
+                batch_size,
+                num_segments,
+            ):
+                raise ValueError(
+                    "Interleaved video/latent-action leading dims differ."
+                )
         segment_mask = segments.get("segment_mask")
         if segment_mask is not None:
             segment_mask = segment_mask.to(dtype=torch.bool)
