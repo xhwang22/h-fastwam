@@ -13,24 +13,52 @@ readonly VJEPA21_EXPECTED_SIZE="30238058912"
 readonly VJEPA21_SOURCE_REVISION="204698b45b3712590f06245fbfba32d3be539812"
 readonly QWEN_REVISION="89644892e4d85e24eaac8bacfd4f463576704203"
 
+FASTWAM_EVAL_USE_CURRENT_ENV="${FASTWAM_EVAL_USE_CURRENT_ENV:-0}"
 MINIFORGE_ROOT="${MINIFORGE_ROOT:-/fsx/miniforge3}"
 if [[ ! -d "$(dirname "${MINIFORGE_ROOT}")" ]]; then
   MINIFORGE_ROOT="/fsx/${CURRENT_USER}/miniforge3"
 fi
-FASTWAM_EVAL_ENV="${FASTWAM_EVAL_ENV:-/fsx/conda-envs/fastwam-eval}"
-if [[ ! -d "$(dirname "${FASTWAM_EVAL_ENV}")" ]]; then
-  FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
+if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" ]]; then
+  if [[ -z "${PYTHON_BIN:-}" && -x "/opt/venv/bin/python" ]]; then
+    PYTHON_BIN=/opt/venv/bin/python
+  fi
+  PYTHON_BIN="${PYTHON_BIN:-$(command -v python || true)}"
+  if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
+    echo "[h100-setup] ERROR: current Python not found; set PYTHON_BIN." >&2
+    exit 1
+  fi
+  PYTHON_ENV_PREFIX="$("${PYTHON_BIN}" -c 'import sys; print(sys.prefix)')"
+  FASTWAM_EVAL_ENV="${PYTHON_ENV_PREFIX}"
+else
+  FASTWAM_EVAL_ENV="${FASTWAM_EVAL_ENV:-/fsx/conda-envs/fastwam-eval}"
+  if [[ ! -d "$(dirname "${FASTWAM_EVAL_ENV}")" ]]; then
+    FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
+  fi
 fi
 ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-${REPO_ROOT}/checkpoints/RoboTwin}"
 HF_HOME="${HF_HOME:-${REPO_ROOT}/checkpoints/hf_cache}"
 TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/checkpoints/torch_hub}"
 VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
 VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
-QWEN_DIR="${QWEN_DIR:-${REPO_ROOT}/checkpoints/Qwen/Qwen3-VL-2B-Instruct}"
+if [[ -z "${QWEN_DIR:-}" ]]; then
+  CACHED_QWEN_DIR="${HF_HOME}/hub/models--Qwen--Qwen3-VL-2B-Instruct/snapshots/${QWEN_REVISION}"
+  if [[ -f "${CACHED_QWEN_DIR}/config.json" ]]; then
+    QWEN_DIR="${CACHED_QWEN_DIR}"
+  else
+    QWEN_DIR="${REPO_ROOT}/checkpoints/Qwen/Qwen3-VL-2B-Instruct"
+  fi
+fi
 CUROBO_ROOT="${CUROBO_ROOT:-${REPO_ROOT}/external/curobo-v0.7.8}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 DOWNLOAD_ROBOTWIN_ASSETS="${DOWNLOAD_ROBOTWIN_ASSETS:-1}"
 FORCE_EVAL_ENV_INSTALL="${FORCE_EVAL_ENV_INSTALL:-0}"
+USE_SYSTEM_NVIDIA_GRAPHICS="${USE_SYSTEM_NVIDIA_GRAPHICS:-${FASTWAM_EVAL_USE_CURRENT_ENV}}"
+NVIDIA_GRAPHICS_ENV="${NVIDIA_GRAPHICS_ENV:-}"
+PIP_REINSTALL_ARGS=()
+if [[ "${FORCE_EVAL_ENV_INSTALL}" == "1" ]]; then
+  PIP_REINSTALL_ARGS=(--force-reinstall)
+fi
+export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}:${PYTHONPATH:-}"
 
 run_as_root() {
   if [[ "$(id -u)" == "0" ]]; then
@@ -94,6 +122,12 @@ install_miniforge() {
 }
 
 activate_eval_environment() {
+  if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" ]]; then
+    export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+    export FASTWAM_PYTHON_ENV_PREFIX="${PYTHON_ENV_PREFIX}"
+    return
+  fi
+
   local conda_sh="${MINIFORGE_ROOT}/etc/profile.d/conda.sh"
   if [[ ! -f "${conda_sh}" ]]; then
     echo "[h100-setup] ERROR: conda activation script missing: ${conda_sh}" >&2
@@ -108,47 +142,288 @@ activate_eval_environment() {
   conda activate "${FASTWAM_EVAL_ENV}"
   set -u
   hash -r
+  PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+  PYTHON_ENV_PREFIX="${CONDA_PREFIX}"
+  export FASTWAM_PYTHON_ENV_PREFIX="${PYTHON_ENV_PREFIX}"
+}
+
+python_environment_ready() {
+  CUROBO_ROOT="${CUROBO_ROOT}" "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import importlib.metadata
+import os
+import sys
+from pathlib import Path
+
+from packaging.requirements import Requirement
+from packaging.version import Version
+
+import accelerate
+import av
+import boto3
+import cv2
+import curobo
+import datasets
+import einops
+import ffmpeg
+import git
+import gymnasium
+import h5py
+import huggingface_hub
+import hydra
+import imageio
+import imageio_ffmpeg
+import jsonlines
+import mplib
+import moviepy.editor
+import numpy
+import omegaconf
+import open3d
+import PIL
+import pyglet
+import pyarrow
+import rich
+import safetensors
+import sapien
+import scipy
+import termcolor
+import timm
+import torch
+import torchvision
+import transformers
+import transforms3d
+import trimesh
+import tqdm
+import warp
+import yaml
+import zarr
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+from experiments.robotwin.fastwam_policy.deploy_policy import (
+    WorldActionRobotWinPolicy,
+)
+
+assert torch.__version__.startswith("2.7.1+cu128")
+assert torchvision.__version__.startswith("0.22.1+cu128")
+assert Version(transformers.__version__) >= Version("4.57.0")
+assert str(warp.__version__) == "1.12.1"
+requirements = [
+    "accelerate==1.12.0",
+    "av==16.0.1",
+    "boto3==1.35.99",
+    "datasets==3.6.0",
+    "einops==0.8.1",
+    "gitpython==3.1.45",
+    "transforms3d==0.4.2",
+    "sapien==3.0.0b1",
+    "mplib==0.2.1",
+    "gymnasium==0.29.1",
+    "hydra-core==1.3.2",
+    "huggingface-hub>=0.34.0",
+    "jsonlines==4.0.0",
+    "numpy==1.26.4",
+    "pillow==12.0.0",
+    "pyarrow==23.0.0",
+    "rich==14.2.0",
+    "safetensors>=0.5.3",
+    "termcolor==2.5.0",
+    "trimesh==4.4.3",
+    "imageio==2.34.2",
+    "moviepy==1.0.3",
+    "omegaconf==2.3.0",
+    "tqdm==4.66.5",
+    "warp-lang==1.12.1",
+    "zarr<3",
+    "pyglet<2",
+    "opencv-python-headless==4.10.0.84",
+]
+requirements.extend(
+    ["scipy>=1.11.4,<1.14", "open3d>=0.19,<0.20"]
+    if sys.version_info >= (3, 12)
+    else ["scipy==1.10.1", "open3d==0.18.0"]
+)
+for requirement_text in requirements:
+    requirement = Requirement(requirement_text)
+    installed = importlib.metadata.version(requirement.name)
+    assert installed in requirement.specifier
+curobo_path = Path(curobo.__file__).resolve()
+curobo_root = Path(os.environ["CUROBO_ROOT"]).resolve()
+assert curobo_path.is_relative_to(curobo_root)
+PY
+}
+
+ensure_python_requirement() {
+  local module="$1"
+  local requirement="$2"
+  shift
+  shift
+  if [[ "${FORCE_EVAL_ENV_INSTALL}" != "1" ]] && \
+      MODULE="${module}" REQUIREMENT="${requirement}" \
+      "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import importlib
+import importlib.metadata
+import os
+
+from packaging.requirements import Requirement
+
+module = os.environ["MODULE"]
+requirement = Requirement(os.environ["REQUIREMENT"])
+importlib.import_module(module)
+version = importlib.metadata.version(requirement.name)
+assert version in requirement.specifier
+PY
+  then
+    return
+  fi
+  "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
+    "${PIP_REINSTALL_ARGS[@]}" "${requirement}" "$@"
+}
+
+curobo_checkout_ready() {
+  [[ -d "${CUROBO_ROOT}/.git" ]] || return 1
+  local curobo_head
+  local curobo_expected
+  curobo_head="$(git -C "${CUROBO_ROOT}" rev-parse HEAD 2>/dev/null)" || return 1
+  curobo_expected="$(
+    git -C "${CUROBO_ROOT}" rev-parse "${CUROBO_REVISION}^{commit}" 2>/dev/null
+  )" || return 1
+  [[ "${curobo_head}" == "${curobo_expected}" ]] || return 1
+  [[ -z "$(git -C "${CUROBO_ROOT}" status --porcelain --untracked-files=no)" ]]
+}
+
+install_current_python_dependencies() {
+  "${PYTHON_BIN}" -m pip --version >/dev/null
+  if ! "${PYTHON_BIN}" -c 'import packaging' >/dev/null 2>&1; then
+    "${PYTHON_BIN}" -m pip install "packaging==25.0"
+  fi
+  "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" \
+    -e "${REPO_ROOT}" \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+
+  if [[ "${FORCE_EVAL_ENV_INSTALL}" == "1" ]] || \
+      ! "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+import torch
+import torchvision
+
+assert torch.__version__.startswith("2.7.1+cu128")
+assert torchvision.__version__.startswith("0.22.1+cu128")
+PY
+  then
+    "${PYTHON_BIN}" -m pip install \
+      --upgrade \
+      "${PIP_REINSTALL_ARGS[@]}" \
+      torch==2.7.1+cu128 \
+      torchvision==0.22.1+cu128 \
+      --extra-index-url https://download.pytorch.org/whl/cu128
+  fi
+
+  if [[ "${FORCE_EVAL_ENV_INSTALL}" == "1" ]] || \
+      ! "${PYTHON_BIN}" - <<'PY' >/dev/null 2>&1
+from packaging.version import Version
+import transformers
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+assert Version(transformers.__version__) >= Version("4.57.0")
+PY
+  then
+    "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
+      "${PIP_REINSTALL_ARGS[@]}" \
+      "transformers==5.12.1" \
+      "huggingface-hub>=0.34.0" \
+      "safetensors>=0.5.3" \
+      "timm>=1.0.19"
+  fi
+
+  local scipy_spec="scipy==1.10.1"
+  local open3d_spec="open3d==0.18.0"
+  if "${PYTHON_BIN}" -c \
+      'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)'; then
+    scipy_spec="scipy>=1.11.4,<1.14"
+    open3d_spec="open3d>=0.19,<0.20"
+  fi
+
+  ensure_python_requirement transforms3d "transforms3d==0.4.2"
+  ensure_python_requirement accelerate "accelerate==1.12.0"
+  ensure_python_requirement av "av==16.0.1"
+  ensure_python_requirement boto3 "boto3==1.35.99"
+  ensure_python_requirement datasets "datasets==3.6.0"
+  ensure_python_requirement einops "einops==0.8.1"
+  ensure_python_requirement git "gitpython==3.1.45"
+  ensure_python_requirement sapien "sapien==3.0.0b1"
+  ensure_python_requirement scipy "${scipy_spec}"
+  ensure_python_requirement mplib "mplib==0.2.1"
+  ensure_python_requirement gymnasium "gymnasium==0.29.1"
+  ensure_python_requirement hydra "hydra-core==1.3.2"
+  ensure_python_requirement huggingface_hub "huggingface-hub>=0.34.0"
+  ensure_python_requirement jsonlines "jsonlines==4.0.0"
+  ensure_python_requirement numpy "numpy==1.26.4"
+  ensure_python_requirement omegaconf "omegaconf==2.3.0"
+  ensure_python_requirement PIL "pillow==12.0.0"
+  ensure_python_requirement pyarrow "pyarrow==23.0.0"
+  ensure_python_requirement rich "rich==14.2.0"
+  ensure_python_requirement safetensors "safetensors>=0.5.3"
+  ensure_python_requirement termcolor "termcolor==2.5.0"
+  ensure_python_requirement yaml PyYAML
+  ensure_python_requirement trimesh "trimesh==4.4.3"
+  ensure_python_requirement open3d "${open3d_spec}"
+  ensure_python_requirement imageio "imageio==2.34.2"
+  ensure_python_requirement moviepy.editor "moviepy==1.0.3"
+  ensure_python_requirement warp "warp-lang==1.12.1"
+  ensure_python_requirement zarr "zarr<3"
+  ensure_python_requirement h5py h5py
+  ensure_python_requirement pyglet "pyglet<2"
+  ensure_python_requirement cv2 "opencv-python-headless==4.10.0.84"
+  ensure_python_requirement ffmpeg ffmpeg-python
+  ensure_python_requirement imageio_ffmpeg imageio-ffmpeg
+  ensure_python_requirement timm "timm>=1.0.19"
+  ensure_python_requirement tqdm "tqdm==4.66.5"
 }
 
 install_python_dependencies() {
-  local marker="${FASTWAM_EVAL_ENV}/.fastwam_robotwin_h100_eval_v2"
-  if ! command -v ffmpeg >/dev/null 2>&1; then
-    conda install -y -p "${FASTWAM_EVAL_ENV}" -c conda-forge "ffmpeg=7.1"
-  fi
-  if [[ "${FORCE_EVAL_ENV_INSTALL}" != "1" && -f "${marker}" ]]; then
-    echo "[h100-setup] Reusing Python environment: ${FASTWAM_EVAL_ENV}"
+  local marker="${PYTHON_ENV_PREFIX}/.fastwam_robotwin_h100_eval_v3"
+  if [[ "${FORCE_EVAL_ENV_INSTALL}" != "1" && \
+        -f "${marker}" ]] && \
+      curobo_checkout_ready && python_environment_ready; then
+    echo "[h100-setup] Reusing Python environment: ${PYTHON_ENV_PREFIX}"
     return
   fi
 
-  python -m pip install --upgrade pip setuptools wheel ninja
-  python -m pip install \
-    torch==2.7.1+cu128 \
-    torchvision==0.22.1+cu128 \
-    --extra-index-url https://download.pytorch.org/whl/cu128
-  python -m pip install -e "${REPO_ROOT}"
-  python -m pip install --no-cache-dir --upgrade \
-    "transformers==5.12.1" \
-    "huggingface-hub>=0.34.0" \
-    "safetensors>=0.5.3" \
-    "timm>=1.0.19"
-  python -m pip uninstall -y torchaudio || true
-
-  python -m pip install --no-cache-dir \
-    "transforms3d==0.4.2" \
-    "sapien==3.0.0b1" \
-    "scipy==1.10.1" \
-    "mplib==0.2.1" \
-    "gymnasium==0.29.1" \
-    "trimesh==4.4.3" \
-    "open3d==0.18.0" \
-    "imageio==2.34.2" \
-    "moviepy==1.0.3" \
-    "warp-lang==1.12.1" \
-    "zarr<3" \
-    "h5py" \
-    "pyglet<2" \
-    "opencv-python-headless==4.10.0.84" \
-    "ffmpeg-python"
+  if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" ]]; then
+    install_current_python_dependencies
+  else
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+      conda install -y -p "${FASTWAM_EVAL_ENV}" -c conda-forge "ffmpeg=7.1"
+    fi
+    "${PYTHON_BIN}" -m pip install --upgrade pip setuptools wheel ninja
+    "${PYTHON_BIN}" -m pip install \
+      "${PIP_REINSTALL_ARGS[@]}" \
+      torch==2.7.1+cu128 \
+      torchvision==0.22.1+cu128 \
+      --extra-index-url https://download.pytorch.org/whl/cu128
+    "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" -e "${REPO_ROOT}"
+    "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade \
+      "${PIP_REINSTALL_ARGS[@]}" \
+      "transformers==5.12.1" \
+      "huggingface-hub>=0.34.0" \
+      "safetensors>=0.5.3" \
+      "timm>=1.0.19"
+    "${PYTHON_BIN}" -m pip uninstall -y torchaudio || true
+    "${PYTHON_BIN}" -m pip install --no-cache-dir \
+      "${PIP_REINSTALL_ARGS[@]}" \
+      "transforms3d==0.4.2" \
+      "sapien==3.0.0b1" \
+      "scipy==1.10.1" \
+      "mplib==0.2.1" \
+      "gymnasium==0.29.1" \
+      "trimesh==4.4.3" \
+      "open3d==0.18.0" \
+      "imageio==2.34.2" \
+      "moviepy==1.0.3" \
+      "warp-lang==1.12.1" \
+      "zarr<3" \
+      "h5py" \
+      "pyglet<2" \
+      "opencv-python-headless==4.10.0.84" \
+      "ffmpeg-python"
+  fi
 
   if [[ ! -d "${CUROBO_ROOT}/.git" ]]; then
     if [[ -e "${CUROBO_ROOT}" ]]; then
@@ -158,17 +433,15 @@ install_python_dependencies() {
     git clone --branch "${CUROBO_REVISION}" --depth 1 \
       https://github.com/NVlabs/curobo.git "${CUROBO_ROOT}"
   fi
-  local curobo_head
-  local curobo_expected
-  curobo_head="$(git -C "${CUROBO_ROOT}" rev-parse HEAD)"
-  curobo_expected="$(git -C "${CUROBO_ROOT}" rev-parse "${CUROBO_REVISION}^{commit}")"
-  if [[ "${curobo_head}" != "${curobo_expected}" ]]; then
+  if ! curobo_checkout_ready; then
     echo "[h100-setup] ERROR: cuRobo checkout is not ${CUROBO_REVISION}." >&2
     exit 1
   fi
-  python -m pip install -e "${CUROBO_ROOT}" --no-build-isolation
+  "${PYTHON_BIN}" -m pip install --upgrade setuptools wheel ninja
+  "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" \
+    -e "${CUROBO_ROOT}" --no-build-isolation
 
-  python - <<'PY'
+  "${PYTHON_BIN}" - <<'PY'
 from pathlib import Path
 
 import mplib
@@ -207,6 +480,16 @@ setup_nvidia_graphics() {
     echo "[h100-setup] ERROR: nvidia-smi is unavailable." >&2
     exit 1
   fi
+  if [[ "${USE_SYSTEM_NVIDIA_GRAPHICS}" == "1" ]]; then
+    local system_vulkan
+    if system_vulkan="$(vulkaninfo --summary 2>&1)" && \
+        grep -q "NVIDIA" <<<"${system_vulkan}"; then
+      echo "[h100-setup] Reusing the system NVIDIA Vulkan/EGL stack."
+      return
+    fi
+    echo "[h100-setup] System Vulkan is unavailable; preparing matching NVIDIA userspace libraries."
+  fi
+
   local host_version
   host_version="$(
     nvidia-smi --query-gpu=driver_version --format=csv,noheader \
@@ -371,7 +654,8 @@ download_model_assets() {
     exit 1
   fi
 
-  if ! QWEN_DIR="${QWEN_DIR}" QWEN_REVISION="${QWEN_REVISION}" python - <<'PY'
+  export QWEN_DIR QWEN_REVISION
+  if ! "${PYTHON_BIN}" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -403,7 +687,7 @@ if any(not (root / filename).is_file() for filename in set(weight_map.values()))
     raise SystemExit(1)
 PY
   then
-    QWEN_DIR="${QWEN_DIR}" QWEN_REVISION="${QWEN_REVISION}" python - <<'PY'
+    "${PYTHON_BIN}" - <<'PY'
 import os
 
 from huggingface_hub import snapshot_download
@@ -422,7 +706,9 @@ PY
 }
 
 install_system_dependencies
-install_miniforge
+if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" != "1" ]]; then
+  install_miniforge
+fi
 activate_eval_environment
 install_python_dependencies
 setup_nvidia_graphics
@@ -430,12 +716,13 @@ setup_robotwin
 download_model_assets
 
 export HF_HOME TORCH_HOME ROBOTWIN_ROOT VJEPA21_CHECKPOINT VJEPA21_REPO QWEN_DIR
-python scripts/check_robotwin_h100_eval_env.py \
+"${PYTHON_BIN}" scripts/check_robotwin_h100_eval_env.py \
   --robotwin-root "${ROBOTWIN_ROOT}" \
   --render-backend gpu
 
 cat <<EOF
 [h100-setup] Environment is ready.
+PYTHON_BIN=${PYTHON_BIN}
 FASTWAM_EVAL_ENV=${FASTWAM_EVAL_ENV}
 ROBOTWIN_ROOT=${ROBOTWIN_ROOT}
 VJEPA21_CHECKPOINT=${VJEPA21_CHECKPOINT}

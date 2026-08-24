@@ -38,6 +38,9 @@ def main() -> None:
     from curobo.types.math import Pose  # noqa: F401
     from curobo.types.robot import JointState  # noqa: F401
     from curobo.wrap.reacher.motion_gen import MotionGen  # noqa: F401
+    from experiments.robotwin.fastwam_policy.deploy_policy import (  # noqa: F401
+        WorldActionRobotWinPolicy,
+    )
 
     if not torch.__version__.startswith("2.7.1+cu128"):
         raise RuntimeError(f"Expected torch 2.7.1+cu128, found {torch.__version__}")

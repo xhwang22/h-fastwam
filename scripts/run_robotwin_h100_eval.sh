@@ -9,6 +9,9 @@ CURRENT_USER="${USER:-$(id -un)}"
 
 FASTWAM_EVAL_USE_CURRENT_ENV="${FASTWAM_EVAL_USE_CURRENT_ENV:-0}"
 if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" ]]; then
+  if [[ -z "${PYTHON_BIN:-}" && -x "/opt/venv/bin/python" ]]; then
+    PYTHON_BIN=/opt/venv/bin/python
+  fi
   PYTHON_BIN="${PYTHON_BIN:-$(command -v python || true)}"
   if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
     echo "[h100-eval] ERROR: current Python not found; set PYTHON_BIN." >&2
@@ -123,7 +126,15 @@ export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${CURRENT_USE
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${CURRENT_USER}}"
 export FASTWAM_PYTHON_ENV_PREFIX="${PYTHON_ENV_PREFIX}"
 export LD_LIBRARY_PATH="${PYTHON_ENV_PREFIX}/lib:${PYTHON_ENV_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
-if [[ -z "${NVIDIA_GRAPHICS_ENV:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+if [[ "${USE_SYSTEM_NVIDIA_GRAPHICS:-0}" == "1" ]]; then
+  SYSTEM_VULKAN_SUMMARY="$(vulkaninfo --summary 2>&1 || true)"
+  if ! grep -q "NVIDIA" <<<"${SYSTEM_VULKAN_SUMMARY}"; then
+    USE_SYSTEM_NVIDIA_GRAPHICS=0
+  fi
+fi
+if [[ "${USE_SYSTEM_NVIDIA_GRAPHICS:-0}" != "1" && \
+      -z "${NVIDIA_GRAPHICS_ENV:-}" ]] && \
+    command -v nvidia-smi >/dev/null 2>&1; then
   NVIDIA_DRIVER_VERSION="$(
     nvidia-smi --query-gpu=driver_version --format=csv,noheader \
       | head -1

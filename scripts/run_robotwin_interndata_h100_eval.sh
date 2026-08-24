@@ -35,22 +35,29 @@ if [[ -z "${RUN_DIR:-}" ]]; then
 fi
 
 SETUP_EVAL_ENV="${SETUP_EVAL_ENV:-1}"
-if [[ "${SETUP_EVAL_ENV}" == "1" ]]; then
-  bash "${SCRIPT_DIR}/setup_robotwin_h100_eval_env.sh"
-  export FASTWAM_EVAL_USE_CURRENT_ENV=0
-else
-  export FASTWAM_EVAL_USE_CURRENT_ENV=1
-  if [[ -z "${PYTHON_BIN:-}" && -x "/opt/venv/bin/python" ]]; then
-    export PYTHON_BIN=/opt/venv/bin/python
+if [[ -z "${FASTWAM_EVAL_USE_CURRENT_ENV:-}" ]]; then
+  if [[ "${SETUP_EVAL_ENV}" == "0" || -n "${PYTHON_BIN:-}" ]]; then
+    export FASTWAM_EVAL_USE_CURRENT_ENV=1
+  else
+    export FASTWAM_EVAL_USE_CURRENT_ENV=0
   fi
 fi
+if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" && \
+      -z "${PYTHON_BIN:-}" && -x "/opt/venv/bin/python" ]]; then
+  export PYTHON_BIN=/opt/venv/bin/python
+fi
+if [[ "${SETUP_EVAL_ENV}" == "1" ]]; then
+  bash "${SCRIPT_DIR}/setup_robotwin_h100_eval_env.sh"
+fi
+export USE_SYSTEM_NVIDIA_GRAPHICS="${USE_SYSTEM_NVIDIA_GRAPHICS:-${FASTWAM_EVAL_USE_CURRENT_ENV}}"
 
 DRIVER_VERSION="$(
   nvidia-smi --query-gpu=driver_version --format=csv,noheader \
     | head -1
 )"
 NVIDIA_GRAPHICS_ROOT="${NVIDIA_GRAPHICS_ROOT:-/fsx/nvidia-userspace/${DRIVER_VERSION}}"
-if [[ -z "${NVIDIA_GRAPHICS_ENV:-}" && \
+if [[ "${USE_SYSTEM_NVIDIA_GRAPHICS}" != "1" && \
+      -z "${NVIDIA_GRAPHICS_ENV:-}" && \
       -f "${NVIDIA_GRAPHICS_ROOT}/activate.sh" ]]; then
   export NVIDIA_GRAPHICS_ENV="${NVIDIA_GRAPHICS_ROOT}/activate.sh"
 fi
