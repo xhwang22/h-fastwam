@@ -1,22 +1,19 @@
-# H-FastWAM SMALL latent-action training with the causal V-JEPA 2.1
-# predictor architecture. V-JEPA and Qwen stay frozen; the predictor,
-# latent ActionDiT, and physical-action decoder start from scratch.
+# DreamDojo latent actions replace the video reconstruction target. The raw
+# ActionDiT remains a separate MoT expert and attends to all latent-action tokens.
 
-_target_: fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam
+_target_: fastwam.models.hfastwam.hfastwam_latent_action.HFastWAMLatentAction.from_pretrained_fastwam
 
 fastwam_checkpoint: null
-fastwam_checkpoint_strict: false
-fixed_target_encoder: false
 
 model_id: Wan-AI/Wan2.2-TI2V-5B
 tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
 tokenizer_max_len: 128
 proprio_dim: ${data.train.processor.proprio_output_dim}
 
-video_expert_type: jepa_predictor
+video_expert_type: latent_action_dit
 skip_video_dit_load_from_pretrain: true
 skip_dit_load_from_pretrain: true
-mot_checkpoint_mixed_attn: false
+fixed_target_encoder: false
 
 visual_encoder_config:
   encoder_type: vjepa2_1
@@ -26,7 +23,6 @@ visual_encoder_config:
   repo_path: checkpoints/torch_hub/hub/facebookresearch_vjepa2_main
   skip_projection: true
   freeze_backbone: true
-  use_activation_checkpointing: false
   spatial_downsample: 16
   temporal_downsample: 4
   standardise_output: true
@@ -43,35 +39,34 @@ knowledge_insulation: false
 action_loss_detach_video_expert: false
 
 strict_expert_compat: false
-layer_alignment_mode: "tail_overlap"
-shared_attention_expert: "video"
+layer_alignment_mode: tail_overlap
+shared_attention_expert: video
 
 freeze_language_expert: true
 freeze_video_expert: false
 freeze_action_expert: false
 
-language_backend: "qwen3"
-language_model_id: "Qwen/Qwen3-VL-2B-Instruct"
+language_backend: qwen3
+language_model_id: Qwen/Qwen3-VL-2B-Instruct
 language_local_files_only: true
 
 video_dit_config:
-  patch_size: [1, 2, 2]
-  in_dim: 1664
-  out_dim: 1664
+  latent_dim: 32
+  latent_horizon: 32
+  context_dim: 1664
+  context_spatial_pool: 2
   hidden_dim: 2048
   ffn_dim: 8192
-  text_dim: 4096
+  text_dim: 1664
   num_heads: 16
   attn_head_dim: 128
   num_layers: 28
+  freq_dim: 256
   eps: 1.0e-06
-  video_attention_mask_mode: "per_frame_causal"
-  action_group_causal_mask_mode: "group_diagonal"
   use_gradient_checkpointing: true
-  use_text_context: true
 
 action_dit_config:
-  action_dim: 32
+  action_dim: ${data.train.processor.action_output_dim}
   hidden_dim: 2048
   ffn_dim: 8192
   num_heads: 16
@@ -83,35 +78,6 @@ action_dit_config:
   use_gradient_checkpointing: true
 
 action_dit_pretrained_path: null
-
-latent_action_config:
-  enabled: true
-  latent_horizon: 8
-  latent_dim: 32
-  physical_action_horizon: 32
-  physical_action_dim: 14
-  actions_per_latent: 4
-  oracle_probabilities: [1.0, 0.75, 0.5, 0.25, 0.0]
-  decoder_loss_type: smooth_l1
-  decoder_loss_beta: 0.1
-  latent_cache_signature: ${oc.env:ROBOTWIN_LATENT_ACTION_CACHE_SIGNATURE}
-  dreamdojo_code_revision: 02f119b759d5c7f84a399fdeea3c6e82e7ed6cff
-  dreamdojo_checkpoint_revision: 89d029e10816d2995d700cb8ba06f171e0504203
-  dreamdojo_checkpoint_hash: d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f
-
-latent_action_decoder_config:
-  latent_dim: 32
-  proprio_dim: ${data.train.processor.proprio_output_dim}
-  visual_dim: 1664
-  num_latents: 8
-  substeps_per_latent: 4
-  action_dim: 14
-  d_model: 512
-  nhead: 8
-  num_layers: 4
-  dim_feedforward: 2048
-  dropout: 0.1
-  activation: "gelu"
 
 video_scheduler:
   train_shift: 5.0
@@ -133,4 +99,3 @@ loss_config:
   lambda_language: 0.0
   lambda_video: 1.0
   lambda_action: 1.0
-  lambda_latent_action_decoder: 1.0

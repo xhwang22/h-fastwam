@@ -28,6 +28,7 @@ Training phases::
 
 from .hfastwam import HFastWAM
 from .hfastwam_idm import HFastWAMFullConditionIDM, HFastWAMIDM
+from .hfastwam_latent_action import HFastWAMLatentAction
 from .language_expert import LanguageExpert
 from .qwen_language_expert import QwenLanguageExpert
 
@@ -35,6 +36,7 @@ __all__ = [
     "HFastWAM",
     "HFastWAMIDM",
     "HFastWAMFullConditionIDM",
+    "HFastWAMLatentAction",
     "LanguageExpert",
     "QwenLanguageExpert",
 ]

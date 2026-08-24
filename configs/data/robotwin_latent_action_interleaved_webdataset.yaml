@@ -1,0 +1,13 @@
+defaults:
+  - robotwin_interleaved_webdataset
+  - _self_
+
+train:
+  action_video_freq_ratio: 32
+  latent_action_cache_dir: ${oc.env:LATENT_ACTION_TRAIN_CACHE_DIR}
+  normalize_latent_actions: true
+
+val:
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  latent_action_cache_dir: ${oc.env:LATENT_ACTION_VAL_CACHE_DIR}
+  normalize_latent_actions: true

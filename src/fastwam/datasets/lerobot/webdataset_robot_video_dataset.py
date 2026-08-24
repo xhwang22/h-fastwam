@@ -58,7 +58,7 @@ class IndexedWebDatasetRobotVideoDataset(RobotVideoDataset):
         num_segments: int = 1,
         segment_stride: Optional[int] = None,
         latent_action_cache_dir: Optional[str] = None,
-        latent_action_cache_expected_signature: Optional[str] = None,
+        normalize_latent_actions: bool = True,
     ):
         self.preprocessed_root = Path(preprocessed_root).expanduser().resolve()
         manifest_path = self.preprocessed_root / "manifest.json"
@@ -80,6 +80,7 @@ class IndexedWebDatasetRobotVideoDataset(RobotVideoDataset):
             )
 
         self.num_frames = int(num_frames)
+        self.is_training_set = bool(is_training_set)
         self.action_video_freq_ratio = int(action_video_freq_ratio)
         if self.num_frames <= 1:
             raise ValueError(f"`num_frames` must be greater than 1, got {num_frames}")
@@ -268,6 +269,7 @@ class IndexedWebDatasetRobotVideoDataset(RobotVideoDataset):
         self.drop_video_when_cached = False
         self.latent_action_cache_dir = None
         self.latent_action_cache_manifest = None
+        self.normalize_latent_actions = bool(normalize_latent_actions)
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
         )
@@ -307,6 +309,12 @@ class IndexedWebDatasetRobotVideoDataset(RobotVideoDataset):
             processor.eval()
         self.processor = processor
 
+        if latent_action_cache_dir is not None:
+            self.set_latent_action_cache(
+                cache_dir=latent_action_cache_dir,
+                expected_length=len(self),
+            )
+
         self.num_segments = int(num_segments)
         if self.num_segments <= 0:
             raise ValueError(f"`num_segments` must be positive, got {num_segments}")
@@ -321,12 +329,6 @@ class IndexedWebDatasetRobotVideoDataset(RobotVideoDataset):
             )
 
         self._runtime_shards: OrderedDict[int, dict[str, Any]] = OrderedDict()
-        if latent_action_cache_dir is not None:
-            self.set_latent_action_cache(
-                cache_dir=latent_action_cache_dir,
-                expected_length=len(self),
-                expected_signature=latent_action_cache_expected_signature,
-            )
         logger.info(
             "Indexed WebDataset split: root=%s episodes=%d frames=%d "
             "shards=%d image_frames=%d",
