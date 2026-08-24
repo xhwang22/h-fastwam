@@ -47,6 +47,10 @@ class HFastWAMLatentAction(HFastWAM):
         model = super(HFastWAMLatentAction, cls).from_pretrained_fastwam(
             **kwargs
         )
+        model._initialization_checkpoint_path = (
+            kwargs.get("fastwam_checkpoint")
+            or kwargs.get("pretrain_checkpoint")
+        )
         config = dict(dreamdojo_config or {})
         enabled = bool(config.pop("enabled", False))
         if not enabled:
@@ -111,41 +115,46 @@ class HFastWAMLatentAction(HFastWAM):
             "target_mode": "online_adjacent_pairs",
             "normalization": "none",
         }
-        initialization_checkpoint = (
-            kwargs.get("fastwam_checkpoint")
-            or kwargs.get("pretrain_checkpoint")
-        )
-        if initialization_checkpoint is not None:
-            payload = torch.load(
-                initialization_checkpoint,
-                map_location="cpu",
-                mmap=True,
-                weights_only=True,
-            )
-            metadata = payload.get("checkpoint_metadata")
-            if (
-                isinstance(metadata, dict)
-                and metadata.get("video_target_representation") is not None
-            ):
-                model._validate_checkpoint_metadata(
-                    metadata,
-                    strict=False,
-                    path=str(initialization_checkpoint),
-                )
-            mot_state = payload.get("mot")
-            if (
-                not isinstance(metadata, dict)
-                or metadata.get("video_target_representation") is None
-            ) and isinstance(mot_state, dict) and any(
-                key.startswith("mixtures.video.action_encoder.")
-                for key in mot_state
-            ):
-                raise ValueError(
-                    "Cannot initialize online DreamDojo training from a "
-                    "latent-action checkpoint without target-space provenance. "
-                    "Use the original VAE-DiT H-FastWAM checkpoint instead."
-                )
+        model._validate_initialization_checkpoint()
         return model
+
+    def _validate_initialization_checkpoint(self) -> None:
+        initialization_checkpoint = getattr(
+            self,
+            "_initialization_checkpoint_path",
+            None,
+        )
+        if initialization_checkpoint is None or self.dreamdojo_provenance is None:
+            return
+        payload = torch.load(
+            initialization_checkpoint,
+            map_location="cpu",
+            mmap=True,
+            weights_only=True,
+        )
+        metadata = payload.get("checkpoint_metadata")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("video_target_representation") is not None
+        ):
+            self._validate_checkpoint_metadata(
+                metadata,
+                strict=False,
+                path=str(initialization_checkpoint),
+            )
+        mot_state = payload.get("mot")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("video_target_representation") is None
+        ) and isinstance(mot_state, dict) and any(
+            key.startswith("mixtures.video.action_encoder.")
+            for key in mot_state
+        ):
+            raise ValueError(
+                "Cannot initialize DreamDojo training from a latent-action "
+                "checkpoint without target-space provenance. Use the original "
+                "VAE-DiT H-FastWAM checkpoint instead."
+            )
 
     def _checkpoint_metadata(self) -> dict:
         metadata = super()._checkpoint_metadata()
@@ -153,6 +162,49 @@ class HFastWAMLatentAction(HFastWAM):
             metadata["video_target_representation"] = "dreamdojo_latent_action"
             metadata["dreamdojo_target"] = dict(self.dreamdojo_provenance)
         return metadata
+
+    def set_latent_action_cache_manifest(self, manifest: dict) -> None:
+        if not isinstance(manifest, dict):
+            raise TypeError("Latent-action cache manifest must be a dict.")
+        if (
+            int(manifest.get("latent_horizon", -1)) != 32
+            or int(manifest.get("latent_dim", -1)) != 32
+        ):
+            raise ValueError(
+                "HFastWAMLatentAction requires cached targets with shape "
+                "[32,32]."
+            )
+        required = (
+            "dreamdojo_checkpoint_sha256",
+            "dreamdojo_source_sha256",
+            "implementation_sha256",
+            "dataset_manifest_sha256",
+            "dataset_index_fingerprint",
+            "mean",
+            "std",
+        )
+        missing = [key for key in required if manifest.get(key) is None]
+        if missing:
+            raise ValueError(
+                "Latent-action cache manifest is missing provenance fields: "
+                f"{missing}."
+            )
+        self.dreamdojo_provenance = {
+            "checkpoint_sha256": manifest["dreamdojo_checkpoint_sha256"],
+            "source_revision": manifest.get("dreamdojo_source_revision"),
+            "source_sha256": manifest["dreamdojo_source_sha256"],
+            "implementation_sha256": manifest["implementation_sha256"],
+            "dataset_manifest_sha256": manifest["dataset_manifest_sha256"],
+            "dataset_index_fingerprint": manifest[
+                "dataset_index_fingerprint"
+            ],
+            "target_mode": "cached_normalized_adjacent_pairs",
+            "normalization": {
+                "mean": manifest["mean"],
+                "std": manifest["std"],
+            },
+        }
+        self._validate_initialization_checkpoint()
 
     def _validate_checkpoint_metadata(
         self,

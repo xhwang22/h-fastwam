@@ -47,6 +47,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--dreamdojo-root", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--dreamdojo-source-revision", default=None)
+    parser.add_argument("--checkpoint-sha256", default=None)
     parser.add_argument(
         "--normalization-stats-cache",
         default=None,
@@ -57,6 +59,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--shard-size", type=int, default=128)
     parser.add_argument("--pair-batch-size", type=int, default=32)
+    parser.add_argument("--sample-batch-size", type=int, default=1)
     parser.add_argument(
         "--cache-dtype",
         choices=("float32", "float16", "bfloat16"),
@@ -261,12 +264,26 @@ def _compute_cache_stats(
 
 def main() -> None:
     args = _parse_args()
-    if args.shard_size <= 0 or args.pair_batch_size <= 0:
-        raise ValueError("shard-size and pair-batch-size must be positive.")
+    if (
+        args.shard_size <= 0
+        or args.pair_batch_size <= 0
+        or args.sample_batch_size <= 0
+    ):
+        raise ValueError(
+            "shard-size, pair-batch-size, and sample-batch-size must be "
+            "positive."
+        )
     if args.split == "val" and args.normalization_stats_cache is None:
         raise ValueError(
             "--split val requires --normalization-stats-cache pointing to "
             "the completed training cache."
+        )
+    if (args.dreamdojo_source_revision is None) != (
+        args.checkpoint_sha256 is None
+    ):
+        raise ValueError(
+            "--dreamdojo-source-revision and --checkpoint-sha256 must be "
+            "provided together."
         )
     rank, world_size, device = _init_distributed()
     cache_dir = Path(args.cache_dir).expanduser().resolve()
@@ -294,6 +311,7 @@ def main() -> None:
 
     dataset, data_cfg = _build_dataset(args)
     dataset_length = len(dataset)
+    num_shards = math.ceil(dataset_length / args.shard_size)
     manifest_path = cache_dir / MANIFEST_FILENAME
     partial_manifest_path = cache_dir / "manifest.partial.json"
     cache_signature = None
@@ -325,7 +343,14 @@ def main() -> None:
                 "latent_horizon": 32,
                 "latent_dim": 32,
                 "cache_dtype": args.cache_dtype,
-                "dreamdojo_checkpoint_sha256": _sha256(checkpoint),
+                "dreamdojo_checkpoint_sha256": (
+                    args.checkpoint_sha256
+                    if args.checkpoint_sha256 is not None
+                    else _sha256(checkpoint)
+                ),
+                "dreamdojo_source_revision": (
+                    args.dreamdojo_source_revision
+                ),
                 "dreamdojo_source_sha256": {
                     str(path.relative_to(dreamdojo_root)): _sha256(path)
                     for path in dreamdojo_sources
@@ -374,7 +399,27 @@ def main() -> None:
                         "requested checkpoint, dataset, configuration, or "
                         f"implementation; mismatched fields={mismatched_fields}."
                     )
-                setup_status[0] = {"complete": True, "error": None}
+                invalid_shards = [
+                    shard_id
+                    for shard_id in range(num_shards)
+                    if not _valid_existing_shard(
+                        latent_action_shard_path(cache_dir, shard_id),
+                        first_index=shard_id * args.shard_size,
+                        last_index=min(
+                            (shard_id + 1) * args.shard_size,
+                            dataset_length,
+                        ),
+                    )
+                ]
+                setup_status[0] = {
+                    "complete": not invalid_shards,
+                    "error": None,
+                }
+                if invalid_shards:
+                    print(
+                        "Repairing incomplete latent-action cache shards: "
+                        f"{invalid_shards[:20]}"
+                    )
             else:
                 if partial_manifest_path.is_file():
                     with partial_manifest_path.open(
@@ -415,8 +460,13 @@ def main() -> None:
     if dist.is_initialized():
         dist.barrier()
 
-    model = load_dreamdojo_lam(dreamdojo_root, checkpoint, device)
-    num_shards = math.ceil(dataset_length / args.shard_size)
+    model = load_dreamdojo_lam(
+        dreamdojo_root,
+        checkpoint,
+        device,
+        expected_source_revision=args.dreamdojo_source_revision,
+        expected_checkpoint_sha256=args.checkpoint_sha256,
+    )
     output_dtype = _cache_dtype(args.cache_dtype)
     for shard_id in range(rank, num_shards, world_size):
         first = shard_id * args.shard_size
@@ -430,18 +480,29 @@ def main() -> None:
             print(f"[rank {rank}] keeping complete shard {shard_id}/{num_shards}")
             continue
         tensors = {}
-        for index in range(first, last):
-            video, valid = _extract_full_video(dataset, index)
-            latent_action = encode_dreamdojo_latent_actions(
+        for batch_first in range(first, last, args.sample_batch_size):
+            batch_last = min(
+                batch_first + args.sample_batch_size,
+                last,
+            )
+            batch_indices = list(range(batch_first, batch_last))
+            videos = []
+            valid_masks = []
+            for index in batch_indices:
+                video, valid = _extract_full_video(dataset, index)
+                videos.append(video)
+                valid_masks.append(valid)
+            latent_actions = encode_dreamdojo_latent_actions(
                 model,
-                video.unsqueeze(0),
+                torch.stack(videos, dim=0),
                 pair_batch_size=args.pair_batch_size,
                 device=device,
-            )[0].cpu()
-            tensors[latent_action_tensor_key(index)] = latent_action.to(
-                dtype=output_dtype
-            )
-            tensors[f"valid_{index:012d}"] = valid
+            ).cpu()
+            for offset, index in enumerate(batch_indices):
+                tensors[latent_action_tensor_key(index)] = latent_actions[
+                    offset
+                ].to(dtype=output_dtype)
+                tensors[f"valid_{index:012d}"] = valid_masks[offset]
         _write_shard(
             shard_path,
             tensors,
@@ -518,7 +579,7 @@ def main() -> None:
             "dreamdojo_checkpoint_sha256": checkpoint_sha256,
         }
         _atomic_json_dump(manifest, manifest_path)
-        partial_manifest_path.unlink()
+        partial_manifest_path.unlink(missing_ok=True)
         print(f"Finalized latent-action cache: {cache_dir}")
     if dist.is_initialized():
         dist.barrier()

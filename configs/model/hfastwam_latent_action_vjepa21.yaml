@@ -32,13 +32,7 @@ visual_encoder_config:
 visual_encoder: null
 
 dreamdojo_config:
-  enabled: true
-  root: ${oc.env:DREAMDOJO_ROOT,external/DreamDojo}
-  checkpoint: ${oc.env:DREAMDOJO_CHECKPOINT,external/DreamDojo/checkpoints/DreamDojo/LAM_400k.ckpt}
-  checkpoint_sha256: d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f
-  source_revision: 02f119b759d5c7f84a399fdeea3c6e82e7ed6cff
-  pair_batch_size: 32
-  dtype: bfloat16
+  enabled: false
 
 language_vocab_size: 32000
 language_max_task_len: 128
