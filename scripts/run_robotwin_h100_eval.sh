@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generic H100 RoboTwin evaluation launcher for XR-1 and V-JEPA21 IDM.
+# Generic H100 RoboTwin evaluation launcher for XR-1 and V-JEPA2.1 models.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,7 +34,7 @@ unset VIRTUAL_ENV
 set -u
 hash -r
 
-MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
+MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1, MODEL_KIND=idm, or MODEL_KIND=vjepa}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
 CAMERA_TYPE="${CAMERA_TYPE:-Large_D435}"
 for override in "$@"; do
@@ -151,16 +151,20 @@ if [[ "${MODEL_KIND}" == "xr1" ]]; then
   XR1_CHECKPOINT="${XR1_CHECKPOINT:-${REPO_ROOT}/checkpoints/XiaomiRobotics/Xiaomi-Robotics-1-5B}"
   PREPARE_ARGS+=(--xr1-checkpoint "${XR1_CHECKPOINT}")
   TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
-elif [[ "${MODEL_KIND}" == "idm" ]]; then
+elif [[ "${MODEL_KIND}" == "idm" || "${MODEL_KIND}" == "vjepa" ]]; then
   VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
   VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
   PREPARE_ARGS+=(
     --vjepa-checkpoint "${VJEPA21_CHECKPOINT}"
     --vjepa-repo "${VJEPA21_REPO}"
   )
-  TASK_CONFIG=robotwin_idm_3cam_384_1e-4
+  if [[ "${MODEL_KIND}" == "idm" ]]; then
+    TASK_CONFIG=robotwin_idm_3cam_384_1e-4
+  else
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+  fi
 else
-  echo "[h100-eval] ERROR: MODEL_KIND must be xr1 or idm." >&2
+  echo "[h100-eval] ERROR: MODEL_KIND must be xr1, idm, or vjepa." >&2
   exit 1
 fi
 

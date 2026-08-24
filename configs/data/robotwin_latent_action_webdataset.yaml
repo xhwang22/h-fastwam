@@ -1,0 +1,11 @@
+defaults:
+  - robotwin_interleaved_webdataset
+  - _self_
+
+train:
+  latent_action_cache_dir: ${oc.env:ROBOTWIN_LATENT_ACTION_CACHE_ROOT}/train
+  latent_action_cache_expected_signature: ${oc.env:ROBOTWIN_LATENT_ACTION_CACHE_SIGNATURE}
+
+val:
+  latent_action_cache_dir: ${oc.env:ROBOTWIN_LATENT_ACTION_CACHE_ROOT}/val
+  latent_action_cache_expected_signature: ${oc.env:ROBOTWIN_LATENT_ACTION_CACHE_SIGNATURE}

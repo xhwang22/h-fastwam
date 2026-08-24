@@ -170,6 +170,26 @@ if [[ -n "${FASTWAM_CHECKPOINT:-}" ]]; then
   )
 fi
 
+TRAINING_COMPONENT_OVERRIDES=()
+[[ -n "${TRAINABLE_COMPONENTS:-}" ]] && TRAINING_COMPONENT_OVERRIDES+=(
+  "trainable_components=${TRAINABLE_COMPONENTS}"
+)
+[[ -n "${VISUAL_ENCODER_LR_MULTIPLIER:-}" ]] && TRAINING_COMPONENT_OVERRIDES+=(
+  "visual_encoder_lr_multiplier=${VISUAL_ENCODER_LR_MULTIPLIER}"
+)
+[[ -n "${FIXED_TARGET_ENCODER:-}" ]] && TRAINING_COMPONENT_OVERRIDES+=(
+  "model.fixed_target_encoder=${FIXED_TARGET_ENCODER}"
+)
+[[ -n "${FASTWAM_CHECKPOINT_STRICT:-}" ]] && TRAINING_COMPONENT_OVERRIDES+=(
+  "model.fastwam_checkpoint_strict=${FASTWAM_CHECKPOINT_STRICT}"
+)
+[[ -n "${VISUAL_ENCODER_FREEZE_BACKBONE:-}" ]] && TRAINING_COMPONENT_OVERRIDES+=(
+  "model.visual_encoder_config.freeze_backbone=${VISUAL_ENCODER_FREEZE_BACKBONE}"
+)
+[[ -n "${VISUAL_ENCODER_ACTIVATION_CHECKPOINTING:-}" ]] && TRAINING_COMPONENT_OVERRIDES+=(
+  "model.visual_encoder_config.use_activation_checkpointing=${VISUAL_ENCODER_ACTIVATION_CHECKPOINTING}"
+)
+
 STANDARDISE_OVERRIDES=()
 if [[ -n "${STANDARDISE_OUTPUT:-}" ]]; then
   STANDARDISE_OVERRIDES=(
@@ -209,6 +229,22 @@ if [[ "${USE_ROBOTWIN_DATA_OVERRIDES:-1}" == "1" ]]; then
   DATA_SOURCE_OVERRIDES=("${ROBOTWIN_DATA_OVERRIDES[@]}")
 fi
 
+LATENT_ACTION_CACHE_OVERRIDES=()
+if [[ -n "${LATENT_ACTION_CACHE_ROOT:-}" ]]; then
+  export ROBOTWIN_LATENT_ACTION_CACHE_ROOT="${LATENT_ACTION_CACHE_ROOT%/}"
+  LATENT_ACTION_CACHE_OVERRIDES=(
+    "data.train.latent_action_cache_dir=${ROBOTWIN_LATENT_ACTION_CACHE_ROOT}/train"
+    "data.val.latent_action_cache_dir=${ROBOTWIN_LATENT_ACTION_CACHE_ROOT}/val"
+  )
+  if [[ -n "${LATENT_ACTION_CACHE_SIGNATURE:-}" ]]; then
+    export ROBOTWIN_LATENT_ACTION_CACHE_SIGNATURE="${LATENT_ACTION_CACHE_SIGNATURE}"
+    LATENT_ACTION_CACHE_OVERRIDES+=(
+      "data.train.latent_action_cache_expected_signature=${LATENT_ACTION_CACHE_SIGNATURE}"
+      "data.val.latent_action_cache_expected_signature=${LATENT_ACTION_CACHE_SIGNATURE}"
+    )
+  fi
+fi
+
 SEGMENT_OVERRIDES=()
 if [[ "${SET_NUM_SEGMENTS:-1}" == "1" ]]; then
   SEGMENT_OVERRIDES=(
@@ -241,6 +277,7 @@ CMD=(
       dataloader_timeout=0
       "${SEGMENT_OVERRIDES[@]}"
       "${DATA_SOURCE_OVERRIDES[@]}"
+      "${LATENT_ACTION_CACHE_OVERRIDES[@]}"
       num_epochs="${NUM_EPOCHS}"
       max_steps="${MAX_STEPS}"
       save_every="${SAVE_EVERY}"
@@ -253,6 +290,7 @@ CMD=(
       model.visual_encoder_config.checkpoint_path="${VJEPA21_CHECKPOINT}"
       model.visual_encoder_config.repo_path="${VJEPA21_REPO}"
       "${PRETRAIN_OVERRIDES[@]}"
+      "${TRAINING_COMPONENT_OVERRIDES[@]}"
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
       "${NORMALISE_STATS_OVERRIDES[@]}"
@@ -266,5 +304,14 @@ CMD=(
 echo "[robotwin-small-vjepa21-predictor] task=${TASK_CONFIG} model=${MODEL_CONFIG}"
 echo "[robotwin-small-vjepa21-predictor] global_batch=${GLOBAL_BATCH_SIZE} world_size=${WORLD_SIZE} batch_size=${BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
 echo "[robotwin-small-vjepa21-predictor] checkpoint=${VJEPA21_CHECKPOINT}"
+if (( ${#PRETRAIN_OVERRIDES[@]} > 0 )); then
+  echo "[robotwin-small-vjepa21-predictor] pretrain_override=${PRETRAIN_OVERRIDES[*]}"
+fi
+if (( ${#TRAINING_COMPONENT_OVERRIDES[@]} > 0 )); then
+  echo "[robotwin-small-vjepa21-predictor] training_overrides=${TRAINING_COMPONENT_OVERRIDES[*]}"
+fi
+if (( ${#LATENT_ACTION_CACHE_OVERRIDES[@]} > 0 )); then
+  echo "[robotwin-small-vjepa21-predictor] latent_action_cache_root=${LATENT_ACTION_CACHE_ROOT%/}"
+fi
 echo "[robotwin-small-vjepa21-predictor] master=${MASTER_ADDR}:${MASTER_PORT} log=${LOG_FILE}"
 "${CMD[@]}" 2>&1 | tee "${LOG_FILE}"

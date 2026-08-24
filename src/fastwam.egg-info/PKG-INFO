@@ -27,6 +27,7 @@ Requires-Dist: regex==2025.11.3
 Requires-Dist: rich==14.2.0
 Requires-Dist: safetensors==0.5.3
 Requires-Dist: termcolor==2.5.0
+Requires-Dist: timm>=1.0.19
 Requires-Dist: torch==2.7.1+cu128
 Requires-Dist: torchcodec==0.5
 Requires-Dist: torchvision==0.22.1+cu128

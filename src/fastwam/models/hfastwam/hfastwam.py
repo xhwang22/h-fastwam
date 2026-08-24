@@ -65,7 +65,9 @@ Training phases::
 
 from __future__ import annotations
 
+import copy
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -83,13 +85,35 @@ from fastwam.models.wan22.visual_encoder import BaseVisualEncoder, build_visual_
 from fastwam.utils.pytorch_utils import optimizer_to
 
 from .language_expert import CROSS_ENTROPY_IGNORE_INDEX, LanguageExpert
+from .latent_action_decoder import LatentActionDecoder
 from .qwen_language_expert import QwenLanguageExpert
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _FrozenTeacherHandle:
+    """Keep the target encoder outside nn.Module registration/checkpointing."""
+
+    encoder: BaseVisualEncoder
+    source_checkpoint: Optional[str]
+
+
 class HFastWAM(nn.Module):
     """Hierarchical Fast World-Action Model (3-expert MoT)."""
+
+    CHECKPOINT_SCHEMA_VERSION = 2
+    LATENT_ACTION_CONTRACT = {
+        "latent_horizon": 8,
+        "latent_dim": 32,
+        "physical_action_horizon": 32,
+        "physical_action_dim": 14,
+        "actions_per_latent": 4,
+    }
+    ACTION_HEAD_CHECKPOINT_PREFIXES = (
+        "mixtures.action.action_encoder.",
+        "mixtures.action.head.",
+    )
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -126,6 +150,10 @@ class HFastWAM(nn.Module):
         loss_lambda_language: float = 1.0,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_latent_action_decoder: float = 1.0,
+        latent_action_decoder: Optional[LatentActionDecoder] = None,
+        latent_action_config: Optional[dict] = None,
+        latent_action_decoder_config: Optional[dict] = None,
         # Training phase & gradient policy
         training_phase: str = "full",
         knowledge_insulation: bool = True,
@@ -138,6 +166,7 @@ class HFastWAM(nn.Module):
         # JEPA predictor vs flow-matching video expert
         video_loss_type: str = "flow_matching",
         visual_encoder=None,
+        fixed_target_encoder: bool = False,
     ):
         super().__init__()
         self.strict_expert_compat = bool(strict_expert_compat)
@@ -160,6 +189,8 @@ class HFastWAM(nn.Module):
         # Video-expert visual encoder (DINO / V-JEPA2) or VAE fallback
         self.use_visual_encoder = isinstance(visual_encoder, BaseVisualEncoder)
         self.visual_encoder = visual_encoder if self.use_visual_encoder else vae
+        self.fixed_target_encoder_enabled = bool(fixed_target_encoder)
+        self.__dict__["_fixed_teacher_handle"] = None
 
         # Proprio → video/action context via a learned token
         self.proprio_dim = None if proprio_dim is None else int(proprio_dim)
@@ -216,6 +247,12 @@ class HFastWAM(nn.Module):
         self.loss_lambda_language = float(loss_lambda_language)
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_latent_action_decoder = float(loss_lambda_latent_action_decoder)
+        self.latent_action_decoder = latent_action_decoder
+        self.latent_action_config = dict(latent_action_config or {})
+        self.latent_action_decoder_config = dict(latent_action_decoder_config or {})
+        self.latent_action_enabled = self.latent_action_decoder is not None
+        self._training_epoch = 0
         self._training_phase = training_phase
         self.knowledge_insulation = bool(knowledge_insulation)
         self.action_loss_detach_video_expert = bool(action_loss_detach_video_expert)
@@ -267,6 +304,66 @@ class HFastWAM(nn.Module):
     # ------------------------------------------------------------------ #
     # Validators
     # ------------------------------------------------------------------ #
+    @classmethod
+    def _validate_latent_action_configs(
+        cls,
+        latent_action_config: Optional[dict],
+        decoder_config: Optional[dict],
+        action_dit_config: dict,
+        proprio_dim: Optional[int],
+        visual_dim: int,
+    ) -> tuple[dict, dict]:
+        if isinstance(latent_action_config, DictConfig):
+            latent_action_config = OmegaConf.to_container(
+                latent_action_config, resolve=True
+            )
+        if isinstance(decoder_config, DictConfig):
+            decoder_config = OmegaConf.to_container(decoder_config, resolve=True)
+        config = dict(latent_action_config or {})
+        if not bool(config.get("enabled", False)):
+            return {}, {}
+        for key, expected in cls.LATENT_ACTION_CONTRACT.items():
+            actual = config.get(key)
+            if actual is None or int(actual) != expected:
+                raise ValueError(
+                    f"Latent-action contract requires `{key}={expected}`, got {actual!r}."
+                )
+        probabilities = config.get("oracle_probabilities")
+        if probabilities is None or list(map(float, probabilities)) != [1.0, 0.75, 0.5, 0.25, 0.0]:
+            raise ValueError(
+                "Latent-action oracle probabilities must be [1, 0.75, 0.5, 0.25, 0]."
+            )
+        if str(config.get("decoder_loss_type", "smooth_l1")) != "smooth_l1":
+            raise ValueError("Latent-action decoder_loss_type must be 'smooth_l1'.")
+        beta = float(config.get("decoder_loss_beta", 1.0))
+        if beta <= 0:
+            raise ValueError("Latent-action decoder_loss_beta must be positive.")
+        config["decoder_loss_beta"] = beta
+        config["oracle_probabilities"] = list(map(float, probabilities))
+        if int(action_dit_config.get("action_dim", -1)) != 32:
+            raise ValueError("Latent-action ActionDiT must use action_dim=32.")
+
+        if not isinstance(decoder_config, dict):
+            raise ValueError("Latent-action mode requires `latent_action_decoder_config` as a dict.")
+        decoder = dict(decoder_config)
+        expected_decoder = {
+            "latent_dim": 32,
+            "num_latents": 8,
+            "substeps_per_latent": 4,
+            "action_dim": 14,
+            "visual_dim": int(visual_dim),
+        }
+        if proprio_dim is None:
+            raise ValueError("Latent-action decoding requires a configured proprio_dim.")
+        expected_decoder["proprio_dim"] = int(proprio_dim)
+        for key, expected in expected_decoder.items():
+            actual = decoder.get(key)
+            if actual is None or int(actual) != expected:
+                raise ValueError(
+                    f"Latent-action decoder requires `{key}={expected}`, got {actual!r}."
+                )
+        return config, decoder
+
     @staticmethod
     def _validate_expert_shapes(lang, video, action):
         # All three experts MUST share attn-space shape or MoT can't concat.
@@ -317,37 +414,177 @@ class HFastWAM(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    @property
+    def fixed_target_encoder(self) -> Optional[BaseVisualEncoder]:
+        handle = self.__dict__.get("_fixed_teacher_handle")
+        return None if handle is None else handle.encoder
+
+    def set_training_epoch(self, epoch: int) -> None:
+        epoch = int(epoch)
+        if epoch < 0:
+            raise ValueError(f"`epoch` must be non-negative, got {epoch}.")
+        self._training_epoch = epoch
+
+    def _latent_action_oracle_probability(self, epoch: Optional[int] = None) -> float:
+        if not self.latent_action_enabled:
+            return 0.0
+        if self.latent_action_decoder is None or not self.latent_action_decoder.training:
+            return 0.0
+        probabilities = self.latent_action_config["oracle_probabilities"]
+        index = min(self._training_epoch if epoch is None else int(epoch), len(probabilities) - 1)
+        if index < 0:
+            raise ValueError(f"`epoch` must be non-negative, got {index}.")
+        return float(probabilities[index])
+
+    @staticmethod
+    def _estimate_clean_latent(
+        noisy_latent: torch.Tensor,
+        predicted_velocity: torch.Tensor,
+        timestep: torch.Tensor,
+        num_train_timesteps: int,
+    ) -> torch.Tensor:
+        if noisy_latent.shape != predicted_velocity.shape:
+            raise ValueError(
+                "Noisy latent and predicted velocity shapes must match: "
+                f"{tuple(noisy_latent.shape)} vs {tuple(predicted_velocity.shape)}."
+            )
+        sigma = timestep.to(device=noisy_latent.device, dtype=noisy_latent.dtype)
+        if sigma.ndim == 0:
+            sigma = sigma.reshape(1)
+        if sigma.ndim != 1 or sigma.shape[0] != noisy_latent.shape[0]:
+            raise ValueError(
+                f"`timestep` must be scalar or [B], got {tuple(timestep.shape)} for B={noisy_latent.shape[0]}."
+            )
+        sigma = sigma / float(num_train_timesteps)
+        sigma = sigma.view(-1, *([1] * (noisy_latent.ndim - 1)))
+        return noisy_latent - sigma * predicted_velocity
+
+    @staticmethod
+    def _select_decoder_latent(
+        oracle_latent: torch.Tensor,
+        generated_latent: torch.Tensor,
+        oracle_probability: float,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if oracle_latent.shape != generated_latent.shape:
+            raise ValueError(
+                "Oracle/generated latent shapes must match: "
+                f"{tuple(oracle_latent.shape)} vs {tuple(generated_latent.shape)}."
+            )
+        probability = float(oracle_probability)
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"`oracle_probability` must be in [0,1], got {probability}.")
+        oracle_mask = torch.rand(
+            (oracle_latent.shape[0],),
+            device=oracle_latent.device,
+            generator=generator,
+        ) < probability
+        selected = torch.where(
+            oracle_mask.view(-1, *([1] * (oracle_latent.ndim - 1))),
+            oracle_latent.detach(),
+            generated_latent.detach(),
+        )
+        return selected, oracle_mask
+
+    @staticmethod
+    def _compute_latent_action_decoder_loss(
+        predicted_action: torch.Tensor,
+        physical_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+        beta: float,
+    ) -> torch.Tensor:
+        if predicted_action.shape != physical_action.shape:
+            raise ValueError(
+                "Decoded/physical action shapes must match: "
+                f"{tuple(predicted_action.shape)} vs {tuple(physical_action.shape)}."
+            )
+        element_loss = F.smooth_l1_loss(
+            predicted_action.float(),
+            physical_action.float(),
+            reduction="none",
+            beta=float(beta),
+        )
+        if action_is_pad is None:
+            return element_loss.mean()
+        action_is_pad = action_is_pad.to(device=element_loss.device, dtype=torch.bool)
+        if action_is_pad.shape != element_loss.shape[:2]:
+            raise ValueError(
+                "Physical `action_is_pad` must match [B,T]: "
+                f"got {tuple(action_is_pad.shape)}, expected {tuple(element_loss.shape[:2])}."
+            )
+        valid = (~action_is_pad).unsqueeze(-1).expand_as(element_loss)
+        denominator = valid.sum().clamp_min(1)
+        return (element_loss * valid).sum() / denominator
+
+    def _initialize_fixed_target_encoder(self, source_checkpoint: Optional[str]) -> None:
+        if not self.fixed_target_encoder_enabled:
+            return
+        if not self.is_jepa_predictor or not self.use_visual_encoder:
+            raise ValueError("fixed_target_encoder requires a JEPA predictor with a visual encoder.")
+        teacher = copy.deepcopy(self.visual_encoder)
+        teacher.eval()
+        teacher.requires_grad_(False)
+        if hasattr(teacher, "_freeze_backbone"):
+            teacher._freeze_backbone = True
+        if hasattr(teacher, "use_activation_checkpointing"):
+            teacher.use_activation_checkpointing = False
+        backbone = getattr(teacher, "backbone", None)
+        if backbone is not None and hasattr(backbone, "use_activation_checkpointing"):
+            backbone.use_activation_checkpointing = False
+        self.__dict__["_fixed_teacher_handle"] = _FrozenTeacherHandle(
+            encoder=teacher,
+            source_checkpoint=source_checkpoint,
+        )
+        logger.info("Initialized frozen target encoder from %s.", source_checkpoint or "online initialization")
+
     # ------------------------------------------------------------------ #
     # Encoders
     # ------------------------------------------------------------------ #
     def _encode_video_latents(self, video: torch.Tensor, tiled: bool = False):
         """Encode [B, 3, T, H, W] → video-expert latents."""
         if self.use_visual_encoder:
-            causal_tubelets = bool(
-                getattr(self.visual_encoder, "causal_tubelet_encoding", False)
-            )
-            causal_prefixes = bool(
-                getattr(self.visual_encoder, "causal_prefix_encoding", False)
-            )
-            if causal_tubelets and causal_prefixes:
-                raise ValueError(
-                    "causal_tubelet_encoding and causal_prefix_encoding are mutually exclusive."
-                )
-            if causal_prefixes:
-                return self._encode_causal_visual_prefixes(video)
-            if causal_tubelets:
-                return self._encode_causal_visual_states(video)
-            return self.visual_encoder.encode(video, device=self.device)
+            return self._encode_video_with_visual_encoder(video, self.visual_encoder)
         with torch.no_grad():
             return self.vae.encode(video, device=self.device, tiled=tiled)
 
-    @torch.no_grad()
-    def _encode_causal_visual_prefixes(self, video: torch.Tensor) -> torch.Tensor:
+    def _encode_video_with_visual_encoder(
+        self,
+        video: torch.Tensor,
+        encoder: BaseVisualEncoder,
+        *,
+        state_indices: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        causal_tubelets = bool(getattr(encoder, "causal_tubelet_encoding", False))
+        causal_prefixes = bool(getattr(encoder, "causal_prefix_encoding", False))
+        if causal_tubelets and causal_prefixes:
+            raise ValueError(
+                "causal_tubelet_encoding and causal_prefix_encoding are mutually exclusive."
+            )
+        if causal_prefixes:
+            return self._encode_causal_visual_prefixes(
+                video, encoder=encoder, state_indices=state_indices,
+            )
+        if causal_tubelets:
+            return self._encode_causal_visual_states(
+                video, encoder=encoder, state_indices=state_indices,
+            )
+        if state_indices is not None:
+            raise ValueError("state_indices are only supported for causal visual encoding.")
+        return encoder.encode(video, device=self.device)
+
+    def _encode_causal_visual_prefixes(
+        self,
+        video: torch.Tensor,
+        *,
+        encoder: Optional[BaseVisualEncoder] = None,
+        state_indices: Optional[list[int]] = None,
+    ) -> torch.Tensor:
         """Encode prefixes ending at each latent-state anchor without future frames."""
         if video.ndim != 5 or video.shape[1] != 3:
             raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
 
-        encoder = self.visual_encoder
+        encoder = self.visual_encoder if encoder is None else encoder
         temporal_patch = int(getattr(encoder, "_temporal_patch", 1))
         temporal_stride = int(getattr(encoder, "temporal_downsample_factor", 1))
         if temporal_patch < 1 or temporal_stride < 1:
@@ -362,8 +599,16 @@ class HFastWAM(nn.Module):
                 f"num_frames={num_frames}, temporal_stride={temporal_stride}."
             )
 
+        indices = (
+            list(range(0, num_frames, temporal_stride))
+            if state_indices is None
+            else list(state_indices)
+        )
+        if not indices or any(index < 0 or index >= num_frames for index in indices):
+            raise ValueError(f"Invalid causal prefix state indices {indices} for {num_frames} frames.")
+
         states = []
-        for frame_index in range(0, num_frames, temporal_stride):
+        for frame_index in indices:
             prefix = video[:, :, : frame_index + 1]
             pad_frames = (-prefix.shape[2]) % temporal_patch
             if pad_frames:
@@ -380,13 +625,18 @@ class HFastWAM(nn.Module):
 
         return torch.cat(states, dim=2)
 
-    @torch.no_grad()
-    def _encode_causal_visual_states(self, video: torch.Tensor) -> torch.Tensor:
-        """Encode each state from only the frames available at that state."""
+    def _encode_causal_visual_states(
+        self,
+        video: torch.Tensor,
+        *,
+        encoder: Optional[BaseVisualEncoder] = None,
+        state_indices: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        """Encode selected states from only the frames available at each state."""
         if video.ndim != 5 or video.shape[1] != 3:
             raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
 
-        encoder = self.visual_encoder
+        encoder = self.visual_encoder if encoder is None else encoder
         temporal_patch = int(getattr(encoder, "_temporal_patch", 1))
         temporal_stride = int(getattr(encoder, "temporal_downsample_factor", 1))
         if temporal_patch < 1 or temporal_stride < 1:
@@ -395,9 +645,15 @@ class HFastWAM(nn.Module):
         batch_size, channels, num_frames, height, width = video.shape
         if num_frames < 1:
             raise ValueError("video must contain at least one frame.")
-        state_indices = range(0, num_frames, temporal_stride)
+        indices = (
+            list(range(0, num_frames, temporal_stride))
+            if state_indices is None
+            else list(state_indices)
+        )
+        if not indices or any(index < 0 or index >= num_frames for index in indices):
+            raise ValueError(f"Invalid causal tubelet state indices {indices} for {num_frames} frames.")
         clips = []
-        for frame_index in state_indices:
+        for frame_index in indices:
             start = frame_index - temporal_patch + 1
             if start < 0:
                 padding = video[:, :, 0:1].expand(
@@ -441,22 +697,24 @@ class HFastWAM(nn.Module):
             latent_w,
         ).permute(0, 2, 1, 3, 4).contiguous()
 
-    @torch.no_grad()
     def _align_first_conditioning_latent(
         self,
         video: torch.Tensor,
         latents: torch.Tensor,
+        *,
+        encoder: Optional[BaseVisualEncoder] = None,
     ) -> torch.Tensor:
         """Match training's clean first latent to single-frame inference."""
+        encoder = self.visual_encoder if encoder is None else encoder
         if (
-            not self.use_visual_encoder
-            or bool(getattr(self.visual_encoder, "causal_tubelet_encoding", False))
-            or bool(getattr(self.visual_encoder, "causal_prefix_encoding", False))
-            or not bool(getattr(self.visual_encoder, "requires_independent_first_frame", False))
+            not isinstance(encoder, BaseVisualEncoder)
+            or bool(getattr(encoder, "causal_tubelet_encoding", False))
+            or bool(getattr(encoder, "causal_prefix_encoding", False))
+            or not bool(getattr(encoder, "requires_independent_first_frame", False))
         ):
             return latents
 
-        first_latent = self._encode_first_frame(video[:, :, 0])
+        first_latent = self._encode_first_frame(video[:, :, 0], encoder=encoder)
         if first_latent.shape[1:] != latents[:, :, 0:1].shape[1:]:
             raise ValueError(
                 "Single-frame and full-video visual latents have incompatible shapes: "
@@ -466,16 +724,23 @@ class HFastWAM(nn.Module):
         aligned[:, :, 0:1] = first_latent.to(device=latents.device, dtype=latents.dtype)
         return aligned
 
-    @torch.no_grad()
-    def _encode_first_frame(self, image: torch.Tensor, tiled: bool = False) -> torch.Tensor:
+    def _encode_first_frame(
+        self,
+        image: torch.Tensor,
+        tiled: bool = False,
+        *,
+        encoder: Optional[BaseVisualEncoder] = None,
+    ) -> torch.Tensor:
         if image.ndim == 3:
             image = image.unsqueeze(0)
         if image.ndim != 4 or image.shape[1] != 3:
             raise ValueError(f"image must be [B, 3, H, W], got {tuple(image.shape)}")
         video = image.to(device=self.device, dtype=self.torch_dtype).unsqueeze(2)
         if self.use_visual_encoder:
-            return self.visual_encoder.encode(video, device=self.device)
-        return self.vae.encode(video, device=self.device, tiled=tiled)
+            encoder = self.visual_encoder if encoder is None else encoder
+            return encoder.encode(video, device=self.device)
+        with torch.no_grad():
+            return self.vae.encode(video, device=self.device, tiled=tiled)
 
     def _decode_latents(self, latents: torch.Tensor, tiled: bool = False) -> list[Image.Image]:
         if self.use_visual_encoder:
@@ -527,6 +792,83 @@ class HFastWAM(nn.Module):
             raise ValueError(f"{source} video must be [B,3,T,H,W], got {tuple(video.shape)}")
         latents = self._encode_video_latents(video, tiled=tiled)
         return self._align_first_conditioning_latent(video, latents)
+
+    def _prepare_jepa_context_target_latents(
+        self,
+        *,
+        video: Optional[torch.Tensor],
+        cached_latents: Optional[torch.Tensor],
+        tiled: bool = False,
+        source: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        teacher = self.fixed_target_encoder
+        if teacher is None:
+            latents = self._prepare_training_video_latents(
+                video=video,
+                cached_latents=cached_latents,
+                tiled=tiled,
+                source=source,
+            )
+            if latents.shape[2] < 2:
+                raise ValueError(
+                    f"JEPA predictor {source} requires at least 2 temporal latent states; "
+                    f"got {latents.shape[2]}."
+                )
+            return latents[:, :, :-1], latents[:, :, 1:]
+
+        if cached_latents is not None:
+            raise ValueError(
+                f"{source} cannot use cached video latents with fixed_target_encoder; "
+                "raw video is required for separate online/teacher encoding."
+            )
+        if video is None:
+            raise ValueError(f"{source} requires raw video with fixed_target_encoder.")
+        video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+        if video.ndim != 5 or video.shape[1] != 3:
+            raise ValueError(f"{source} video must be [B,3,T,H,W], got {tuple(video.shape)}")
+
+        online = self.visual_encoder
+        causal = bool(
+            getattr(online, "causal_tubelet_encoding", False)
+            or getattr(online, "causal_prefix_encoding", False)
+        )
+        if causal:
+            temporal_stride = int(getattr(online, "temporal_downsample_factor", 1))
+            anchors = list(range(0, int(video.shape[2]), temporal_stride))
+            if len(anchors) < 2:
+                raise ValueError(
+                    f"JEPA predictor {source} requires at least 2 causal anchors; got {anchors}."
+                )
+            with torch.no_grad():
+                target = self._encode_video_with_visual_encoder(
+                    video,
+                    teacher,
+                    state_indices=anchors[1:],
+                ).detach()
+            context = self._encode_video_with_visual_encoder(
+                video,
+                online,
+                state_indices=anchors[:-1],
+            )
+        else:
+            with torch.no_grad():
+                teacher_latents = self._encode_video_with_visual_encoder(video, teacher)
+                teacher_latents = self._align_first_conditioning_latent(
+                    video, teacher_latents, encoder=teacher,
+                )
+                target = teacher_latents[:, :, 1:].detach()
+            online_latents = self._encode_video_with_visual_encoder(video, online)
+            online_latents = self._align_first_conditioning_latent(
+                video, online_latents, encoder=online,
+            )
+            context = online_latents[:, :, :-1]
+
+        if context.shape != target.shape:
+            raise ValueError(
+                f"Online context and teacher target shapes differ: {tuple(context.shape)} "
+                f"vs {tuple(target.shape)}."
+            )
+        return context, target
 
     # ------------------------------------------------------------------ #
     # Cross-attention context for video/action pre_dit
@@ -1308,6 +1650,15 @@ class HFastWAM(nn.Module):
         return route, modality_mask
 
     def _validate_sample(self, sample: dict) -> tuple[str, dict[str, bool]]:
+        if self.latent_action_enabled:
+            missing = [
+                key for key in ("action", "latent_action", "latent_action_is_pad", "proprio")
+                if sample.get(key) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"Latent-action training sample is missing required keys: {missing}."
+                )
         if "video" not in sample and "video_latents" not in sample:
             raise ValueError(
                 "H-FastWAM training needs sample['video'] or sample['video_latents']."
@@ -1345,7 +1696,11 @@ class HFastWAM(nn.Module):
         )
 
         if lang_pre is not None and action_pre is not None:
-            detach_set = {"language"} if self.knowledge_insulation else None
+            detach_set = set()
+            if self.knowledge_insulation:
+                detach_set.add("language")
+            if self.action_loss_detach_video_expert:
+                detach_set.add("video")
             return self.mot(
                 embeds_all={
                     "language": lang_pre["tokens"],
@@ -1368,7 +1723,7 @@ class HFastWAM(nn.Module):
                     "video": video_pre["t_mod"],
                     "action": action_pre["t_mod"],
                 },
-                detach_kv_experts=detach_set,
+                detach_kv_experts=detach_set or None,
             )
 
         if lang_pre is not None:
@@ -1540,6 +1895,16 @@ class HFastWAM(nn.Module):
             D, T_lat, H_lat, W_lat = cached_latents.shape[2:]
             flat_cached_latents = cached_latents.reshape(B * N, D, T_lat, H_lat, W_lat)
 
+        flat_image_is_pad = None
+        image_is_pad = segments.get("image_is_pad")
+        if image_is_pad is not None:
+            if image_is_pad.ndim != 3 or image_is_pad.shape[:2] != (B, N):
+                raise ValueError(
+                    "Interleaved `image_is_pad` must be [B,N,T], "
+                    f"got {tuple(image_is_pad.shape)}."
+                )
+            flat_image_is_pad = image_is_pad.reshape(B * N, image_is_pad.shape[-1])
+
         flat_video_spatial_valid_mask = None
         video_spatial_valid_mask = segments.get("video_spatial_valid_mask")
         if video_spatial_valid_mask is not None:
@@ -1606,24 +1971,22 @@ class HFastWAM(nn.Module):
             subtask_len = int(flat_lang_pre["segments"]["subtask_len"])
             lang_pre = self._merge_segment_pre_state(flat_lang_pre, batch_size=B, num_segments=N)
 
-        input_latents = self._prepare_training_video_latents(
-            video=flat_video,
-            cached_latents=flat_cached_latents,
-            tiled=tiled,
-            source="segments",
-        )
-
         if self.is_jepa_predictor:
-            if input_latents.shape[2] < 2:
-                raise ValueError(
-                    "JEPA predictor interleaved training requires ≥2 temporal latent frames per segment; "
-                    f"got {input_latents.shape[2]}."
-                )
-            context_latents = input_latents[:, :, :-1]  # [B*N, D, T-1, H, W]
-            target_video = input_latents[:, :, 1:]       # [B*N, D, T-1, H, W]
+            context_latents, target_video = self._prepare_jepa_context_target_latents(
+                video=flat_video,
+                cached_latents=flat_cached_latents,
+                tiled=tiled,
+                source="segments",
+            )
             fuse_flag = False
             timestep_video = None
         else:
+            input_latents = self._prepare_training_video_latents(
+                video=flat_video,
+                cached_latents=flat_cached_latents,
+                tiled=tiled,
+                source="segments",
+            )
             noise_video = torch.randn_like(input_latents)
             timestep_video = self.train_video_scheduler.sample_training_t(
                 batch_size=B * N, device=self.device, dtype=input_latents.dtype,
@@ -1633,6 +1996,10 @@ class HFastWAM(nn.Module):
             fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
             if fuse_flag:
                 noisy_latents[:, :, 0:1] = input_latents[:, :, 0:1]
+
+        target_video_is_pad = None
+        if self.is_jepa_predictor and flat_image_is_pad is not None:
+            target_video_is_pad = self._causal_visual_target_is_pad(flat_image_is_pad)
 
         proprio_ctx, proprio_mask = self._make_interleaved_proprio_text_context(
             segments.get("proprio"),
@@ -1679,33 +2046,84 @@ class HFastWAM(nn.Module):
         )
         video_pre = self._merge_segment_pre_state(flat_video_pre, batch_size=B, num_segments=N)
 
-        action = segments.get("action")
+        physical_action = segments.get("action")
+        if self.latent_action_enabled and physical_action is None:
+            raise ValueError("Latent-action mode requires physical `segments['action']` decoder targets.")
         action_pre = None
         target_action = None
         timestep_action = None
+        noisy_action = None
         flat_action_is_pad = None
-        if action is not None:
-            if action.ndim != 4:
-                raise ValueError(f"Interleaved `action` must be [B,N,T,D], got {tuple(action.shape)}")
-            if action.shape[:2] != (B, N):
-                raise ValueError(f"`action` leading dims must be {(B, N)}, got {tuple(action.shape[:2])}")
-            flat_action = action.reshape(B * N, action.shape[2], action.shape[3]).to(
-                device=self.device, dtype=self.torch_dtype,
+        flat_physical_action = None
+        flat_physical_action_is_pad = None
+        flat_action_dim_is_pad = None
+        if physical_action is not None:
+            if physical_action.ndim != 4:
+                raise ValueError(
+                    f"Interleaved `action` must be [B,N,T,D], got {tuple(physical_action.shape)}"
+                )
+            if physical_action.shape[:2] != (B, N):
+                raise ValueError(
+                    f"`action` leading dims must be {(B, N)}, got {tuple(physical_action.shape[:2])}"
+                )
+            flat_physical_action = physical_action.reshape(
+                B * N, physical_action.shape[2], physical_action.shape[3]
+            ).to(device=self.device, dtype=self.torch_dtype)
+            physical_action_is_pad = segments.get(
+                "action_is_pad", sample.get("action_is_pad", None)
             )
-            action_dim_is_pad = segments.get("action_dim_is_pad")
-            flat_action_dim_is_pad = (
-                None
-                if action_dim_is_pad is None
-                else action_dim_is_pad.reshape(B * N, action_dim_is_pad.shape[-1])
-            )
-            flat_action = self._zero_padded_action_dims(
-                flat_action,
-                flat_action_dim_is_pad,
-            )
-            noise_action = self._zero_padded_action_dims(
-                torch.randn_like(flat_action),
-                flat_action_dim_is_pad,
-            )
+            if physical_action_is_pad is not None:
+                if physical_action_is_pad.ndim != 3 or physical_action_is_pad.shape[:2] != (B, N):
+                    raise ValueError(
+                        "`action_is_pad` for interleaved input must be [B,N,T], "
+                        f"got {tuple(physical_action_is_pad.shape)}"
+                    )
+                flat_physical_action_is_pad = physical_action_is_pad.reshape(
+                    B * N, physical_action_is_pad.shape[-1]
+                )
+
+            if self.latent_action_enabled:
+                latent_action = segments.get("latent_action")
+                latent_action_is_pad = segments.get("latent_action_is_pad")
+                if latent_action is None or latent_action_is_pad is None:
+                    raise ValueError(
+                        "Latent-action mode requires interleaved `latent_action` and "
+                        "`latent_action_is_pad`."
+                    )
+                expected_latent = (B, N, 8, 32)
+                expected_mask = (B, N, 8)
+                if tuple(latent_action.shape) != expected_latent:
+                    raise ValueError(
+                        f"Interleaved `latent_action` must be {expected_latent}, got {tuple(latent_action.shape)}."
+                    )
+                if tuple(latent_action_is_pad.shape) != expected_mask:
+                    raise ValueError(
+                        "Interleaved `latent_action_is_pad` must be "
+                        f"{expected_mask}, got {tuple(latent_action_is_pad.shape)}."
+                    )
+                flat_action = latent_action.reshape(B * N, 8, 32).to(
+                    device=self.device, dtype=self.torch_dtype
+                )
+                flat_action_is_pad = latent_action_is_pad.reshape(B * N, 8)
+                if tuple(flat_physical_action.shape[1:]) != (32, 14):
+                    raise ValueError(
+                        "Latent-action decoder target must be physical [B*N,32,14], got "
+                        f"{tuple(flat_physical_action.shape)}."
+                    )
+            else:
+                flat_action = flat_physical_action
+                flat_action_is_pad = flat_physical_action_is_pad
+                action_dim_is_pad = segments.get("action_dim_is_pad")
+                flat_action_dim_is_pad = (
+                    None
+                    if action_dim_is_pad is None
+                    else action_dim_is_pad.reshape(B * N, action_dim_is_pad.shape[-1])
+                )
+                flat_action = self._zero_padded_action_dims(flat_action, flat_action_dim_is_pad)
+
+            noise_action = torch.randn_like(flat_action)
+            if not self.latent_action_enabled:
+                noise_action = self._zero_padded_action_dims(noise_action, flat_action_dim_is_pad)
             timestep_action = self.train_action_scheduler.sample_training_t(
                 batch_size=B * N, device=self.device, dtype=flat_action.dtype,
             )
@@ -1725,15 +2143,6 @@ class HFastWAM(nn.Module):
                 enabled=has_proprio_context,
             )
             action_pre = self._merge_segment_pre_state(flat_action_pre, batch_size=B, num_segments=N)
-
-            action_is_pad = segments.get("action_is_pad", sample.get("action_is_pad", None))
-            if action_is_pad is not None:
-                if action_is_pad.ndim != 3 or action_is_pad.shape[:2] != (B, N):
-                    raise ValueError(
-                        "`action_is_pad` for interleaved input must be [B,N,T], "
-                        f"got {tuple(action_is_pad.shape)}"
-                    )
-                flat_action_is_pad = action_is_pad.reshape(B * N, action_is_pad.shape[-1])
         else:
             action_context_payload = None
 
@@ -1769,6 +2178,7 @@ class HFastWAM(nn.Module):
             fuse_flag=fuse_flag,
             timestep_video=timestep_video,
             spatial_valid_mask=flat_video_spatial_valid_mask,
+            video_is_pad=target_video_is_pad,
         )
         total_loss = total_loss + self.loss_lambda_video * loss_video
         loss_dict["loss_video"] = self.loss_lambda_video * float(loss_video.detach().item())
@@ -1820,6 +2230,56 @@ class HFastWAM(nn.Module):
             )
             total_loss = total_loss + self.loss_lambda_action * loss_action
             loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action.detach().item())
+
+            if self.latent_action_enabled:
+                initial_proprio = self._select_interleaved_initial_proprio(
+                    segments.get("proprio"),
+                    batch_size=B,
+                    num_segments=N,
+                    source="segments['proprio']",
+                )
+                if initial_proprio is None:
+                    raise ValueError("Latent-action decoding requires current normalized proprio.")
+                generated_latent = self._estimate_clean_latent(
+                    noisy_action,
+                    pred_action,
+                    timestep_action,
+                    self.train_action_scheduler.num_train_timesteps,
+                )
+                decoder_latent, _ = self._select_decoder_latent(
+                    flat_action,
+                    generated_latent,
+                    self._latent_action_oracle_probability(),
+                )
+                decoded_action = self.latent_action_decoder(
+                    decoder_latent,
+                    initial_proprio.reshape(B * N, self.proprio_dim).detach(),
+                    context_latents[:, :, :1].detach(),
+                    latent_is_pad=flat_action_is_pad.to(self.device, dtype=torch.bool),
+                    flatten_output=True,
+                )
+                decoder_action_is_pad = flat_action_is_pad.to(
+                    device=self.device,
+                    dtype=torch.bool,
+                ).repeat_interleave(
+                    int(self.latent_action_config["actions_per_latent"]),
+                    dim=1,
+                )
+                if flat_physical_action_is_pad is not None:
+                    decoder_action_is_pad |= flat_physical_action_is_pad.to(
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                decoder_loss = self._compute_latent_action_decoder_loss(
+                    decoded_action,
+                    flat_physical_action.detach(),
+                    decoder_action_is_pad,
+                    beta=float(self.latent_action_config["decoder_loss_beta"]),
+                )
+                total_loss = total_loss + self.loss_lambda_latent_action_decoder * decoder_loss
+                loss_dict["loss_latent_action_decoder"] = (
+                    self.loss_lambda_latent_action_decoder * float(decoder_loss.detach().item())
+                )
 
         return total_loss, loss_dict
 
@@ -1893,12 +2353,14 @@ class HFastWAM(nn.Module):
                 f"vs expected {batch_size}"
             )
 
-        input_latents = self._prepare_training_video_latents(
-            video=video,
-            cached_latents=cached_latents,
-            tiled=tiled,
-            source="sample",
-        )
+        input_latents = None
+        if not self.is_jepa_predictor:
+            input_latents = self._prepare_training_video_latents(
+                video=video,
+                cached_latents=cached_latents,
+                tiled=tiled,
+                source="sample",
+            )
 
         proprio_ctx, proprio_mask = self._make_proprio_text_context(
             sample.get("proprio"),
@@ -1914,15 +2376,13 @@ class HFastWAM(nn.Module):
             action_context, action_context_mask = video_context, video_context_mask
 
         if self.is_jepa_predictor:
-            # JEPA: clean context frames [0..T-2] → predict target frames [1..T-1].
-            # No noise, no timestep; the predictor is deterministic.
-            if input_latents.shape[2] < 2:
-                raise ValueError(
-                    "JEPA predictor training requires at least 2 temporal latent frames "
-                    f"(need context+target), got T_lat={input_latents.shape[2]}."
-                )
-            context_latents = input_latents[:, :, :-1]  # [B, D, T-1, H, W]
-            target_video = input_latents[:, :, 1:]       # [B, D, T-1, H, W]
+            # JEPA: online context states predict the next frozen-teacher states.
+            context_latents, target_video = self._prepare_jepa_context_target_latents(
+                video=video,
+                cached_latents=cached_latents,
+                tiled=tiled,
+                source="sample",
+            )
             fuse_flag = False
             timestep_video = None
             video_pre = self.video_expert.pre_dit(
@@ -1959,20 +2419,52 @@ class HFastWAM(nn.Module):
         action_pre = None
         target_action = None
         timestep_action = None
+        noisy_action = None
+        physical_action = None
+        physical_action_is_pad = None
+        action_dim_is_pad = None
         if modality_mask["action"]:
-            action = sample["action"].to(device=self.device, dtype=self.torch_dtype)
-            if action.ndim != 3:
-                raise ValueError(f"sample['action'] must be [B,T,a_dim], got {tuple(action.shape)}")
-            if int(action.shape[0]) != batch_size:
+            physical_action = sample["action"].to(device=self.device, dtype=self.torch_dtype)
+            if physical_action.ndim != 3:
                 raise ValueError(
-                    f"Batch mismatch across modalities: action batch={action.shape[0]} vs expected {batch_size}"
+                    f"sample['action'] must be [B,T,a_dim], got {tuple(physical_action.shape)}"
                 )
-            action_dim_is_pad = sample.get("action_dim_is_pad", None)
-            action = self._zero_padded_action_dims(action, action_dim_is_pad)
-            noise_action = self._zero_padded_action_dims(
-                torch.randn_like(action),
-                action_dim_is_pad,
-            )
+            if int(physical_action.shape[0]) != batch_size:
+                raise ValueError(
+                    "Batch mismatch across modalities: "
+                    f"action batch={physical_action.shape[0]} vs expected {batch_size}"
+                )
+            physical_action_is_pad = sample.get("action_is_pad", None)
+            if self.latent_action_enabled:
+                action = sample.get("latent_action")
+                action_is_pad = sample.get("latent_action_is_pad")
+                if action is None or action_is_pad is None:
+                    raise ValueError(
+                        "Latent-action mode requires `latent_action` and `latent_action_is_pad`."
+                    )
+                if tuple(action.shape) != (batch_size, 8, 32):
+                    raise ValueError(
+                        f"`latent_action` must be [B,8,32], got {tuple(action.shape)}."
+                    )
+                if tuple(action_is_pad.shape) != (batch_size, 8):
+                    raise ValueError(
+                        f"`latent_action_is_pad` must be [B,8], got {tuple(action_is_pad.shape)}."
+                    )
+                if tuple(physical_action.shape[1:]) != (32, 14):
+                    raise ValueError(
+                        "Latent-action decoder target must be physical [B,32,14], got "
+                        f"{tuple(physical_action.shape)}."
+                    )
+                action = action.to(device=self.device, dtype=self.torch_dtype)
+            else:
+                action = physical_action
+                action_is_pad = physical_action_is_pad
+                action_dim_is_pad = sample.get("action_dim_is_pad", None)
+                action = self._zero_padded_action_dims(action, action_dim_is_pad)
+
+            noise_action = torch.randn_like(action)
+            if not self.latent_action_enabled:
+                noise_action = self._zero_padded_action_dims(noise_action, action_dim_is_pad)
             timestep_action = self.train_action_scheduler.sample_training_t(
                 batch_size=batch_size, device=self.device, dtype=action.dtype,
             )
@@ -2062,22 +2554,75 @@ class HFastWAM(nn.Module):
             fuse_flag=fuse_flag,
             timestep_video=timestep_video,
             spatial_valid_mask=sample.get("video_spatial_valid_mask"),
+            video_is_pad=(
+                self._causal_visual_target_is_pad(sample["image_is_pad"])
+                if self.is_jepa_predictor and sample.get("image_is_pad") is not None
+                else None
+            ),
         )
         total_loss = total_loss + self.loss_lambda_video * loss_video
         loss_dict["loss_video"] = self.loss_lambda_video * float(loss_video.detach().item())
 
         if modality_mask["action"]:
             pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
-            action_is_pad = sample.get("action_is_pad", None)
             loss_action = self._compute_action_loss(
                 pred_action=pred_action,
                 target_action=target_action,
                 timestep_action=timestep_action,
                 action_is_pad=action_is_pad,
-                action_dim_is_pad=sample.get("action_dim_is_pad", None),
+                action_dim_is_pad=action_dim_is_pad,
             )
             total_loss = total_loss + self.loss_lambda_action * loss_action
             loss_dict["loss_action"] = self.loss_lambda_action * float(loss_action.detach().item())
+
+            if self.latent_action_enabled:
+                initial_proprio = self._select_initial_proprio(
+                    sample.get("proprio"),
+                    batch_size=batch_size,
+                    source="sample['proprio']",
+                )
+                if initial_proprio is None:
+                    raise ValueError("Latent-action decoding requires current normalized proprio.")
+                generated_latent = self._estimate_clean_latent(
+                    noisy_action,
+                    pred_action,
+                    timestep_action,
+                    self.train_action_scheduler.num_train_timesteps,
+                )
+                decoder_latent, _ = self._select_decoder_latent(
+                    action,
+                    generated_latent,
+                    self._latent_action_oracle_probability(),
+                )
+                decoded_action = self.latent_action_decoder(
+                    decoder_latent,
+                    initial_proprio.detach(),
+                    context_latents[:, :, :1].detach(),
+                    latent_is_pad=action_is_pad.to(self.device, dtype=torch.bool),
+                    flatten_output=True,
+                )
+                decoder_action_is_pad = action_is_pad.to(
+                    device=self.device,
+                    dtype=torch.bool,
+                ).repeat_interleave(
+                    int(self.latent_action_config["actions_per_latent"]),
+                    dim=1,
+                )
+                if physical_action_is_pad is not None:
+                    decoder_action_is_pad |= physical_action_is_pad.to(
+                        device=self.device,
+                        dtype=torch.bool,
+                    )
+                decoder_loss = self._compute_latent_action_decoder_loss(
+                    decoded_action,
+                    physical_action.detach(),
+                    decoder_action_is_pad,
+                    beta=float(self.latent_action_config["decoder_loss_beta"]),
+                )
+                total_loss = total_loss + self.loss_lambda_latent_action_decoder * decoder_loss
+                loss_dict["loss_latent_action_decoder"] = (
+                    self.loss_lambda_latent_action_decoder * float(decoder_loss.detach().item())
+                )
 
         return total_loss, loss_dict
 
@@ -2105,7 +2650,11 @@ class HFastWAM(nn.Module):
             device=video_pre["tokens"].device,
         )
 
-        detach_set = {"language"} if self.knowledge_insulation else None
+        detach_set = set()
+        if self.knowledge_insulation:
+            detach_set.add("language")
+        if self.action_loss_detach_video_expert:
+            detach_set.add("video")
 
         return self.mot(
             embeds_all={
@@ -2129,7 +2678,7 @@ class HFastWAM(nn.Module):
                 "video": video_pre["t_mod"],
                 "action": action_pre["t_mod"],
             },
-            detach_kv_experts=detach_set,
+            detach_kv_experts=detach_set or None,
         )
 
     def _prepare_inference_action_video_pre(
@@ -2272,6 +2821,24 @@ class HFastWAM(nn.Module):
     # ------------------------------------------------------------------ #
     # Loss helpers
     # ------------------------------------------------------------------ #
+    def _causal_visual_target_is_pad(self, image_is_pad: torch.Tensor) -> torch.Tensor:
+        if image_is_pad.ndim != 2:
+            raise ValueError(
+                f"image_is_pad must be [B,T], got {tuple(image_is_pad.shape)}."
+            )
+        encoder = self.visual_encoder
+        temporal_patch = int(getattr(encoder, "_temporal_patch", 1))
+        temporal_stride = int(getattr(encoder, "temporal_downsample_factor", 1))
+        num_frames = int(image_is_pad.shape[1])
+        anchors = list(range(0, num_frames, temporal_stride))
+        if len(anchors) < 2:
+            raise ValueError(f"At least two visual anchors are required, got {anchors}.")
+        target_masks = []
+        for frame_index in anchors[1:]:
+            start = max(frame_index - temporal_patch + 1, 0)
+            target_masks.append(image_is_pad[:, start : frame_index + 1].all(dim=1))
+        return torch.stack(target_masks, dim=1)
+
     def _compute_video_loss(
         self,
         pred_video: torch.Tensor,
@@ -2279,6 +2846,7 @@ class HFastWAM(nn.Module):
         fuse_flag: bool = False,
         timestep_video: Optional[torch.Tensor] = None,
         spatial_valid_mask: Optional[torch.Tensor] = None,
+        video_is_pad: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         valid = None
         if spatial_valid_mask is not None:
@@ -2303,16 +2871,24 @@ class HFastWAM(nn.Module):
                 mode="nearest",
             ).unsqueeze(2)
 
+        if video_is_pad is not None:
+            video_is_pad = video_is_pad.to(device=pred_video.device, dtype=torch.bool)
+            if video_is_pad.ndim != 2 or video_is_pad.shape != (
+                pred_video.shape[0], pred_video.shape[2]
+            ):
+                raise ValueError(
+                    "video_is_pad must match [B,T] of the video prediction, "
+                    f"got {tuple(video_is_pad.shape)} for {tuple(pred_video.shape)}."
+                )
+            temporal_valid = (~video_is_pad).to(dtype=torch.float32)[:, None, :, None, None]
+            valid = temporal_valid if valid is None else valid * temporal_valid
+
         def reduce_error(error: torch.Tensor) -> torch.Tensor:
             if valid is None:
                 return error.mean(dim=(1, 2, 3, 4))
-            weighted = error * valid
-            elements_per_spatial_position = error.shape[1] * error.shape[2]
-            denominator = (
-                valid.sum(dim=(1, 2, 3, 4))
-                * elements_per_spatial_position
-            ).clamp_min(1.0)
-            return weighted.sum(dim=(1, 2, 3, 4)) / denominator
+            expanded_valid = valid.expand_as(error)
+            denominator = expanded_valid.sum(dim=(1, 2, 3, 4)).clamp_min(1.0)
+            return (error * expanded_valid).sum(dim=(1, 2, 3, 4)) / denominator
 
         if self.video_loss_type == "l1":
             # JEPA predictor: plain L1 regression in encoder-latent space.
@@ -2442,6 +3018,15 @@ class HFastWAM(nn.Module):
         if action_horizon is None or int(action_horizon) <= 0:
             raise ValueError(f"`action_horizon` must be a positive integer, got {action_horizon}")
         action_horizon = int(action_horizon)
+        requested_action_horizon = action_horizon
+        if self.latent_action_enabled:
+            expected_physical_horizon = int(self.latent_action_config["physical_action_horizon"])
+            if requested_action_horizon != expected_physical_horizon:
+                raise ValueError(
+                    "Latent-action inference requires external action_horizon="
+                    f"{expected_physical_horizon}, got {requested_action_horizon}."
+                )
+            action_horizon = int(self.latent_action_config["latent_horizon"])
 
         self.eval()
         _vmask = str(getattr(self.video_expert, "video_attention_mask_mode", ""))
@@ -2633,8 +3218,25 @@ class HFastWAM(nn.Module):
                 pred_action, step_delta, latents_action,
             )
 
+        if self.latent_action_enabled:
+            initial_proprio = self._select_initial_proprio(
+                proprio,
+                batch_size=1,
+                source="proprio",
+            )
+            if initial_proprio is None:
+                raise ValueError("Latent-action inference requires current normalized proprio.")
+            output_action = self.latent_action_decoder(
+                latents_action,
+                initial_proprio,
+                first_frame_latents[:, :, :1],
+                flatten_output=True,
+            )[0]
+        else:
+            output_action = latents_action[0]
+
         return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+            "action": output_action.detach().to(device="cpu", dtype=torch.float32),
             "subtask_tokens": subtask_ids_used[0].detach().cpu(),
         }
 
@@ -2718,34 +3320,164 @@ class HFastWAM(nn.Module):
     # ------------------------------------------------------------------ #
     # Checkpoint I/O
     # ------------------------------------------------------------------ #
+    def set_latent_action_cache_manifest(self, manifest: dict) -> None:
+        """Copy validated cache provenance into latent checkpoint metadata."""
+        if not self.latent_action_enabled:
+            return
+        if not isinstance(manifest, dict):
+            raise TypeError("Latent-action cache manifest must be a dict.")
+        signature = manifest.get("signature")
+        signature_payload = manifest.get("signature_payload")
+        if not isinstance(signature, str) or not isinstance(signature_payload, dict):
+            raise ValueError(
+                "Latent-action cache manifest is missing signed provenance metadata."
+            )
+        normalization = signature_payload.get("normalization")
+        dreamdojo = signature_payload.get("dreamdojo")
+        if not isinstance(normalization, dict) or not isinstance(dreamdojo, dict):
+            raise ValueError(
+                "Latent-action cache signature payload must contain normalization and DreamDojo metadata."
+            )
+        provenance_fields = {
+            "dreamdojo_code_revision": "git_revision",
+            "dreamdojo_checkpoint_revision": "checkpoint_revision",
+            "dreamdojo_checkpoint_hash": "checkpoint_sha256",
+        }
+        for config_key, manifest_key in provenance_fields.items():
+            actual = dreamdojo.get(manifest_key)
+            expected = self.latent_action_config.get(config_key)
+            if not isinstance(actual, str) or not actual:
+                raise ValueError(
+                    "Latent-action cache signature payload is missing DreamDojo "
+                    f"provenance field `{manifest_key}`."
+                )
+            if expected not in (None, "") and actual != str(expected):
+                raise ValueError(
+                    f"DreamDojo provenance mismatch for `{config_key}`: "
+                    f"config={expected!r}, manifest={actual!r}."
+                )
+        expected_signature = self.latent_action_config.get("latent_cache_signature")
+        if expected_signature not in (None, "") and signature != str(expected_signature):
+            raise ValueError(
+                "Latent cache signature mismatch between model config and dataset manifest: "
+                f"config={expected_signature!r}, manifest={signature!r}."
+            )
+        self.latent_action_config["latent_cache_signature"] = signature
+        self.latent_action_config["latent_normalization_stats"] = copy.deepcopy(
+            normalization
+        )
+        for config_key, manifest_key in provenance_fields.items():
+            self.latent_action_config[config_key] = dreamdojo[manifest_key]
+
+    def _checkpoint_metadata(self) -> dict:
+        metadata = {
+            "checkpoint_schema_version": self.CHECKPOINT_SCHEMA_VERSION,
+            "action_representation": "latent" if self.latent_action_enabled else "direct",
+        }
+        if self.latent_action_enabled:
+            metadata.update(self.LATENT_ACTION_CONTRACT)
+            metadata["latent_action_config"] = dict(self.latent_action_config)
+            metadata["latent_action_decoder_config"] = dict(
+                self.latent_action_decoder_config
+            )
+            for key in (
+                "latent_cache_signature",
+                "dreamdojo_code_revision",
+                "dreamdojo_checkpoint_revision",
+                "dreamdojo_checkpoint_hash",
+                "latent_normalization_stats",
+                "predictor_source_checkpoint",
+                "predictor_source_hash",
+            ):
+                if key in self.latent_action_config:
+                    metadata[key] = self.latent_action_config[key]
+        return metadata
+
     def save_checkpoint(self, path: str, optimizer=None, step=None):
         payload = {
             "language_expert": self.language_expert.state_dict(),
             "mot": self.mot.state_dict(),
+            "checkpoint_metadata": self._checkpoint_metadata(),
             "training_phase": self._training_phase,
             "torch_dtype": str(self.torch_dtype),
             "step": step,
         }
+        if self.latent_action_enabled:
+            payload["latent_action_decoder"] = self.latent_action_decoder.state_dict()
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
         if self.use_visual_encoder:
             payload["visual_encoder"] = self.visual_encoder.state_dict()
+        payload["fixed_target_encoder"] = self.fixed_target_encoder is not None
+        teacher_handle = self.__dict__.get("_fixed_teacher_handle")
+        if teacher_handle is not None:
+            payload["fixed_target_source"] = teacher_handle.source_checkpoint
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
     def load_checkpoint(self, path: str, optimizer=None, strict: bool = False):
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = torch.load(
+            path,
+            map_location="cpu",
+            mmap=True,
+            weights_only=True,
+        )
 
-        def _validate(name, missing, unexpected):
-            logger.info(
-                "Loaded %s (missing=%d, unexpected=%d).",
-                name, len(missing), len(unexpected),
+        metadata = payload.get("checkpoint_metadata")
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                raise ValueError("Checkpoint `checkpoint_metadata` must be a dictionary.")
+            schema_version = metadata.get("checkpoint_schema_version")
+            if (
+                isinstance(schema_version, bool)
+                or not isinstance(schema_version, int)
+                or schema_version != self.CHECKPOINT_SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    "Unsupported checkpoint schema version: "
+                    f"got {schema_version!r}, expected {self.CHECKPOINT_SCHEMA_VERSION}."
+                )
+        checkpoint_representation = None if metadata is None else metadata.get("action_representation")
+        expected_representation = "latent" if self.latent_action_enabled else "direct"
+        if checkpoint_representation is not None and checkpoint_representation != expected_representation:
+            raise ValueError(
+                "Checkpoint/model action representation mismatch: "
+                f"checkpoint={checkpoint_representation!r}, model={expected_representation!r}."
             )
-            if strict and (missing or unexpected):
+        if strict and metadata is None and self.latent_action_enabled:
+            raise ValueError(
+                "Strict latent-action checkpoint load requires `checkpoint_metadata`."
+            )
+        if self.latent_action_enabled and metadata is not None:
+            for key, expected in self.LATENT_ACTION_CONTRACT.items():
+                if int(metadata.get(key, -1)) != expected:
+                    raise ValueError(
+                        f"Checkpoint latent-action `{key}` mismatch: "
+                        f"got {metadata.get(key)!r}, expected {expected}."
+                    )
+            expected_signature = self.latent_action_config.get("latent_cache_signature")
+            actual_signature = metadata.get("latent_cache_signature")
+            if expected_signature is not None and actual_signature != expected_signature:
+                raise ValueError(
+                    "Latent cache signature mismatch: "
+                    f"checkpoint={actual_signature!r}, expected={expected_signature!r}."
+                )
+
+        def _validate(name, missing, unexpected, allowed_missing=()):
+            allowed_missing = set(allowed_missing)
+            required_missing = [key for key in missing if key not in allowed_missing]
+            logger.info(
+                "Loaded %s (missing=%d, allowed_missing=%d, unexpected=%d).",
+                name,
+                len(required_missing),
+                len(missing) - len(required_missing),
+                len(unexpected),
+            )
+            if strict and (required_missing or unexpected):
                 raise ValueError(
                     f"Strict checkpoint load failed for {name}: "
-                    f"missing={missing[:20]}, unexpected={unexpected[:20]}"
+                    f"missing={required_missing[:20]}, unexpected={unexpected[:20]}"
                 )
 
         if "language_expert" in payload:
@@ -2755,7 +3487,28 @@ class HFastWAM(nn.Module):
         elif strict:
             raise ValueError(f"Strict checkpoint is missing `language_expert`: {path}")
         if "mot" in payload:
-            _validate("mot", *self.mot.load_state_dict(payload["mot"], strict=False))
+            mot_state = payload["mot"]
+            if self.latent_action_enabled and checkpoint_representation is None:
+                legacy_action_head_keys = [
+                    key
+                    for key in mot_state
+                    if any(
+                        key.startswith(prefix)
+                        for prefix in self.ACTION_HEAD_CHECKPOINT_PREFIXES
+                    )
+                ]
+                if legacy_action_head_keys:
+                    logger.warning(
+                        "Reinitializing legacy direct-action ActionDiT input/output layers "
+                        "while loading latent mode: %s",
+                        legacy_action_head_keys,
+                    )
+                    mot_state = {
+                        key: value
+                        for key, value in mot_state.items()
+                        if key not in legacy_action_head_keys
+                    }
+            _validate("mot", *self.mot.load_state_dict(mot_state, strict=False))
         elif "dit" in payload:
             if strict:
                 raise ValueError(
@@ -2767,6 +3520,24 @@ class HFastWAM(nn.Module):
             ))
         else:
             raise ValueError(f"Checkpoint missing both `mot` and legacy `dit` keys: {path}")
+        if self.latent_action_enabled:
+            if "latent_action_decoder" in payload:
+                self.latent_action_decoder.load_state_dict(
+                    payload["latent_action_decoder"], strict=True
+                )
+            elif strict or checkpoint_representation == "latent":
+                raise ValueError(
+                    f"Latent-action checkpoint is missing `latent_action_decoder`: {path}"
+                )
+            else:
+                logger.warning(
+                    "Checkpoint has no latent-action decoder weights; keeping random initialization."
+                )
+        elif "latent_action_decoder" in payload:
+            raise ValueError(
+                "Cannot load a latent-action decoder checkpoint into a direct-action model."
+            )
+
         if self.proprio_encoder is not None:
             if "proprio_encoder" in payload:
                 self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
@@ -2777,9 +3548,13 @@ class HFastWAM(nn.Module):
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
         if self.use_visual_encoder and "visual_encoder" in payload:
-            _validate("visual_encoder", *self.visual_encoder.load_state_dict(
-                payload["visual_encoder"], strict=False,
-            ))
+            _validate(
+                "visual_encoder",
+                *self.visual_encoder.load_state_dict(
+                    payload["visual_encoder"], strict=False,
+                ),
+                allowed_missing=("_norm_mean", "_norm_std"),
+            )
         elif strict and self.use_visual_encoder:
             raise ValueError(f"Strict checkpoint is missing `visual_encoder`: {path}")
         if "training_phase" in payload:
@@ -2818,6 +3593,8 @@ class HFastWAM(nn.Module):
         loss_config: dict | None = None,
         video_scheduler: dict | None = None,
         action_scheduler: dict | None = None,
+        latent_action_config: dict | None = None,
+        latent_action_decoder_config: dict | None = None,
         proprio_dim: int | None = None,
         knowledge_insulation: bool = True,
         action_loss_detach_video_expert: bool = False,
@@ -2829,6 +3606,8 @@ class HFastWAM(nn.Module):
         freeze_action_expert: bool = False,
         fastwam_checkpoint: str | None = None,
         pretrain_checkpoint: str | None = None,
+        fastwam_checkpoint_strict: bool = False,
+        fixed_target_encoder: bool = False,
         # Language expert config
         language_backend: str = "legacy",
         language_model_id: str = "Qwen/Qwen3-VL-2B-Instruct",
@@ -2857,6 +3636,24 @@ class HFastWAM(nn.Module):
             action_dit_config = {}
         if not isinstance(action_dit_config, dict):
             raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+        if isinstance(latent_action_config, DictConfig):
+            latent_action_config = OmegaConf.to_container(latent_action_config, resolve=True)
+        if latent_action_config is not None and not isinstance(latent_action_config, dict):
+            raise ValueError(
+                f"`latent_action_config` must resolve to a dict or null, got {type(latent_action_config)}"
+            )
+        if isinstance(latent_action_decoder_config, DictConfig):
+            latent_action_decoder_config = OmegaConf.to_container(
+                latent_action_decoder_config, resolve=True
+            )
+        if latent_action_decoder_config is not None and not isinstance(
+            latent_action_decoder_config, dict
+        ):
+            raise ValueError(
+                "`latent_action_decoder_config` must resolve to a dict or null, got "
+                f"{type(latent_action_decoder_config)}"
+            )
 
         if isinstance(visual_encoder_config, DictConfig):
             visual_encoder_config = OmegaConf.to_container(visual_encoder_config, resolve=True)
@@ -2919,6 +3716,16 @@ class HFastWAM(nn.Module):
                     "Visual encoder and video expert dimensions must match: "
                     f"encoder={encoder_dim}, in_dim={video_in_dim}, out_dim={video_out_dim}."
                 )
+
+        latent_action_config, latent_action_decoder_config = cls._validate_latent_action_configs(
+            latent_action_config,
+            latent_action_decoder_config,
+            action_dit_config,
+            proprio_dim,
+            int(video_dit_config["in_dim"]),
+        )
+        if latent_action_config and _video_expert_type != "jepa_predictor":
+            raise ValueError("Latent-action mode requires video_expert_type='jepa_predictor'.")
 
         # Wan2.2 components (VAE + tokenizer; Wan DiT only for wan_dit path).
         # When video_expert_type='jepa_predictor', pass skip_dit_build=True so
@@ -3037,6 +3844,12 @@ class HFastWAM(nn.Module):
                 f"Unsupported language_backend={language_backend}. Expected one of {{'legacy','qwen3'}}."
             )
 
+        latent_action_decoder = None
+        if latent_action_config:
+            latent_action_decoder = LatentActionDecoder(
+                **latent_action_decoder_config
+            ).to(device=device, dtype=torch_dtype)
+
         # 3-expert MoT (order matters: language | video | action)
         mot = MoT(
             mixtures={
@@ -3083,6 +3896,12 @@ class HFastWAM(nn.Module):
             loss_lambda_language=float(loss_config.get("lambda_language", 1.0)),
             loss_lambda_video=float(loss_config.get("lambda_video", 1.0)),
             loss_lambda_action=float(loss_config.get("lambda_action", 1.0)),
+            loss_lambda_latent_action_decoder=float(
+                loss_config.get("lambda_latent_action_decoder", 1.0)
+            ),
+            latent_action_decoder=latent_action_decoder,
+            latent_action_config=latent_action_config,
+            latent_action_decoder_config=latent_action_decoder_config,
             training_phase=training_phase,
             knowledge_insulation=knowledge_insulation,
             action_loss_detach_video_expert=action_loss_detach_video_expert,
@@ -3092,48 +3911,25 @@ class HFastWAM(nn.Module):
             freeze_action_expert=bool(freeze_action_expert),
             visual_encoder=dino_visual_encoder,
             video_loss_type="l1" if _video_expert_type == "jepa_predictor" else "flow_matching",
+            fixed_target_encoder=bool(fixed_target_encoder),
         )
 
-        # Optional: resume video expert from a fastwam pretrain ckpt.
+        # Optional weight-only initialization. Optimizer/scheduler/step are not restored.
         ckpt_path = fastwam_checkpoint or pretrain_checkpoint
         if ckpt_path is not None:
-            logger.info("Loading fastwam pretrain checkpoint: %s", ckpt_path)
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            if "mot" in ckpt:
-                missing, unexpected = model.mot.load_state_dict(ckpt["mot"], strict=False)
-                logger.info(
-                    "Merged fastwam MoT into 3-expert MoT (missing=%d, unexpected=%d).",
-                    len(missing), len(unexpected),
-                )
-            elif "dit" in ckpt:
-                missing, unexpected = model.video_expert.load_state_dict(ckpt["dit"], strict=False)
-                logger.info(
-                    "Loaded legacy DiT into video_expert (missing=%d, unexpected=%d).",
-                    len(missing), len(unexpected),
-                )
-            else:
-                raise ValueError(
-                    f"FastWAM pretrain checkpoint missing both `mot` and legacy `dit` keys: {ckpt_path}"
-                )
-            if model.proprio_encoder is not None:
-                if "proprio_encoder" in ckpt:
-                    model.proprio_encoder.load_state_dict(ckpt["proprio_encoder"], strict=True)
-                else:
-                    logger.warning("FastWAM pretrain checkpoint has no `proprio_encoder`; keeping current params.")
-            elif "proprio_encoder" in ckpt:
-                logger.warning(
-                    "FastWAM pretrain checkpoint contains `proprio_encoder` but current model has `proprio_dim=None`; "
-                    "ignoring."
-                )
-            if model.use_visual_encoder and "visual_encoder" in ckpt:
-                missing, unexpected = model.visual_encoder.load_state_dict(
-                    ckpt["visual_encoder"], strict=False,
-                )
-                logger.info(
-                    "Loaded visual_encoder (missing=%d, unexpected=%d).",
-                    len(missing), len(unexpected),
-                )
-            del ckpt
+            logger.info(
+                "Loading fastwam pretrain checkpoint: %s (strict=%s)",
+                ckpt_path,
+                fastwam_checkpoint_strict,
+            )
+            model.load_checkpoint(
+                ckpt_path,
+                optimizer=None,
+                strict=bool(fastwam_checkpoint_strict),
+            )
+
+        if model.fixed_target_encoder_enabled:
+            model._initialize_fixed_target_encoder(ckpt_path)
 
         return model
 

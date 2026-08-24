@@ -1,7 +1,6 @@
-# H-FastWAM SMALL with a frozen V-JEPA 2.1 ViT-G/16 encoder and JEPA predictor.
-#
-# The Wan-style video DiT is replaced by the same deterministic JEPAPredictor
-# path used by hfastwam_small_vjepa_predictor, now in 1664-d V-JEPA 2.1 space.
+# H-FastWAM SMALL latent-action training with the causal V-JEPA 2.1
+# predictor architecture. V-JEPA and Qwen stay frozen; the predictor,
+# latent ActionDiT, and physical-action decoder start from scratch.
 
 _target_: fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam
 
@@ -17,6 +16,7 @@ proprio_dim: ${data.train.processor.proprio_output_dim}
 video_expert_type: jepa_predictor
 skip_video_dit_load_from_pretrain: true
 skip_dit_load_from_pretrain: true
+mot_checkpoint_mixed_attn: false
 
 visual_encoder_config:
   encoder_type: vjepa2_1
@@ -39,14 +39,14 @@ language_vocab_size: 32000
 language_max_task_len: 128
 language_max_subtask_len: 128
 
-knowledge_insulation: true
+knowledge_insulation: false
 action_loss_detach_video_expert: false
 
 strict_expert_compat: false
 layer_alignment_mode: "tail_overlap"
 shared_attention_expert: "video"
 
-freeze_language_expert: false
+freeze_language_expert: true
 freeze_video_expert: false
 freeze_action_expert: false
 
@@ -71,7 +71,7 @@ video_dit_config:
   use_text_context: true
 
 action_dit_config:
-  action_dim: ${data.train.processor.action_output_dim}
+  action_dim: 32
   hidden_dim: 2048
   ffn_dim: 8192
   num_heads: 16
@@ -83,6 +83,35 @@ action_dit_config:
   use_gradient_checkpointing: true
 
 action_dit_pretrained_path: null
+
+latent_action_config:
+  enabled: true
+  latent_horizon: 8
+  latent_dim: 32
+  physical_action_horizon: 32
+  physical_action_dim: 14
+  actions_per_latent: 4
+  oracle_probabilities: [1.0, 0.75, 0.5, 0.25, 0.0]
+  decoder_loss_type: smooth_l1
+  decoder_loss_beta: 0.1
+  latent_cache_signature: ${oc.env:ROBOTWIN_LATENT_ACTION_CACHE_SIGNATURE}
+  dreamdojo_code_revision: 02f119b759d5c7f84a399fdeea3c6e82e7ed6cff
+  dreamdojo_checkpoint_revision: 89d029e10816d2995d700cb8ba06f171e0504203
+  dreamdojo_checkpoint_hash: d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f
+
+latent_action_decoder_config:
+  latent_dim: 32
+  proprio_dim: ${data.train.processor.proprio_output_dim}
+  visual_dim: 1664
+  num_latents: 8
+  substeps_per_latent: 4
+  action_dim: 14
+  d_model: 512
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1
+  activation: "gelu"
 
 video_scheduler:
   train_shift: 5.0
@@ -101,6 +130,7 @@ action_scheduler:
   logit_std: 1.0
 
 loss_config:
-  lambda_language: 1.0
+  lambda_language: 0.0
   lambda_video: 1.0
   lambda_action: 1.0
+  lambda_latent_action_decoder: 1.0

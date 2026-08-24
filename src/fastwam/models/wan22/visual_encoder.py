@@ -1255,8 +1255,11 @@ class VJEPA2Encoder(BaseVisualEncoder):
         frames_normed = self._normalise_for_backbone(frames_flat)
         frames_normed = frames_normed.reshape(B, T, C, H, W)
 
-        # V-JEPA 2 forward (frozen)
-        with torch.no_grad():
+        # Keep the frozen default graph-free while allowing backbone fine-tuning.
+        if self._freeze_backbone:
+            with torch.no_grad():
+                patch_tokens = self._extract_tokens(frames_normed)  # [B, N_total, D]
+        else:
             patch_tokens = self._extract_tokens(frames_normed)  # [B, N_total, D]
 
         # Compute spatial/temporal patch grid
@@ -1696,6 +1699,7 @@ class VJEPA21Encoder(VJEPA2Encoder):
         output_dim: int = 48,
         mlp_hidden_dim: Optional[int] = None,
         freeze_backbone: bool = True,
+        use_activation_checkpointing: bool = False,
         spatial_downsample: int = 16,
         temporal_downsample: int = 4,
         standardise_output: bool = True,
@@ -1731,6 +1735,7 @@ class VJEPA21Encoder(VJEPA2Encoder):
         self.standardise_output = standardise_output
         self.skip_projection = skip_projection
         self._freeze_backbone = freeze_backbone
+        self.use_activation_checkpointing = use_activation_checkpointing
         self.requires_independent_first_frame = True
         self.causal_tubelet_encoding = causal_tubelet_encoding
         self.causal_prefix_encoding = causal_prefix_encoding
@@ -1745,6 +1750,7 @@ class VJEPA21Encoder(VJEPA2Encoder):
             checkpoint_path=checkpoint_path,
             repo_path=repo_path,
             dtype=torch_dtype,
+            use_activation_checkpointing=use_activation_checkpointing,
         )
         self.processor = None
         self._hidden_dim = int(spec["hidden_dim"])
@@ -1796,6 +1802,7 @@ class VJEPA21Encoder(VJEPA2Encoder):
         checkpoint_path: str,
         repo_path: Optional[str],
         dtype: torch.dtype,
+        use_activation_checkpointing: bool,
     ) -> nn.Module:
         checkpoint = Path(checkpoint_path).expanduser().resolve()
         if not checkpoint.is_file():
@@ -1866,6 +1873,7 @@ class VJEPA21Encoder(VJEPA2Encoder):
                 use_rope=True,
                 img_temporal_dim_size=1,
                 interpolate_rope=True,
+                use_activation_checkpointing=use_activation_checkpointing,
             )
         finally:
             torch.set_default_dtype(previous_dtype)

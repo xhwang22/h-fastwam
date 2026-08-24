@@ -16,6 +16,13 @@ def _resolved_dir(value: str, label: str) -> Path:
     return path
 
 
+def _resolved_file(value: str, label: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+    return path
+
+
 def _resolved_file_or_dir(value: str, label: str) -> Path:
     path = Path(value).expanduser().resolve()
     if not path.exists():
@@ -50,12 +57,28 @@ def prepare(args: argparse.Namespace) -> None:
         model_cfg.visual_encoder_config.checkpoint_path = str(xr1_checkpoint)
         model_cfg.visual_encoder_config.model_name = str(qwen_dir)
         model_cfg.visual_encoder_config.local_files_only = True
-    elif args.model == "idm":
-        if "HFastWAMIDM" not in target and "HFastWAMFullConditionIDM" not in target:
-            raise ValueError(f"IDM config has unexpected model target: {target}")
+    elif args.model in {"idm", "vjepa"}:
+        if args.model == "idm":
+            if "HFastWAMIDM" not in target and "HFastWAMFullConditionIDM" not in target:
+                raise ValueError(f"IDM config has unexpected model target: {target}")
+        else:
+            expected_target = (
+                "fastwam.models.hfastwam.hfastwam."
+                "HFastWAM.from_pretrained_fastwam"
+            )
+            if target != expected_target:
+                raise ValueError(f"V-JEPA config has unexpected model target: {target}")
+            video_expert_type = str(model_cfg.get("video_expert_type", ""))
+            if video_expert_type != "jepa_predictor":
+                raise ValueError(
+                    "V-JEPA config has unexpected video expert: "
+                    f"{video_expert_type}"
+                )
         if encoder_type != "vjepa2_1":
-            raise ValueError(f"IDM config has unexpected visual encoder: {encoder_type}")
-        vjepa_checkpoint = _resolved_file_or_dir(
+            raise ValueError(
+                f"{args.model} config has unexpected visual encoder: {encoder_type}"
+            )
+        vjepa_checkpoint = _resolved_file(
             args.vjepa_checkpoint,
             "V-JEPA2.1 checkpoint",
         )
@@ -87,7 +110,7 @@ def prepare(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["xr1", "idm"], required=True)
+    parser.add_argument("--model", choices=["xr1", "idm", "vjepa"], required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--qwen-dir", required=True)
@@ -98,10 +121,13 @@ def main() -> None:
 
     if args.model == "xr1" and not args.xr1_checkpoint:
         parser.error("--xr1-checkpoint is required for --model=xr1")
-    if args.model == "idm" and (
+    if args.model in {"idm", "vjepa"} and (
         not args.vjepa_checkpoint or not args.vjepa_repo
     ):
-        parser.error("--vjepa-checkpoint and --vjepa-repo are required for --model=idm")
+        parser.error(
+            "--vjepa-checkpoint and --vjepa-repo are required for "
+            f"--model={args.model}"
+        )
     prepare(args)
 
 

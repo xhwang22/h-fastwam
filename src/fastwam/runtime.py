@@ -1,6 +1,7 @@
 import logging
 import os
 import inspect
+import time
 from pathlib import Path
 
 import torch
@@ -506,12 +507,64 @@ def create_fastwam_idm(
     )
 
 
+def _instantiate_dataset_local_main_first(
+    dataset_cfg: DictConfig,
+    *,
+    cache_key: str,
+    **kwargs,
+):
+    if os.environ.get("FASTWAM_LOCAL_DATASET_CACHE_WARMUP", "0") != "1":
+        return instantiate(dataset_cfg, **kwargs)
+
+    state = PartialState()
+    cache_root = Path(os.environ["HF_DATASETS_CACHE"])
+    warmup_id = os.environ["FASTWAM_DATASET_WARMUP_ID"]
+    marker_dir = cache_root / ".fastwam_warmup"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    ready_marker = marker_dir / f"{warmup_id}.{cache_key}.ready"
+    failed_marker = marker_dir / f"{warmup_id}.{cache_key}.failed"
+
+    if state.is_local_main_process:
+        ready_marker.unlink(missing_ok=True)
+        failed_marker.unlink(missing_ok=True)
+        logger.info(
+            "Building %s dataset cache on local rank 0 (global rank %d/%d).",
+            cache_key,
+            state.process_index,
+            state.num_processes,
+        )
+        try:
+            dataset = instantiate(dataset_cfg, **kwargs)
+        except Exception as exc:
+            failed_marker.write_text(f"{type(exc).__name__}: {exc}\n")
+            raise
+        ready_marker.write_text("ready\n")
+        return dataset
+
+    timeout = float(os.environ.get("FASTWAM_DATASET_WARMUP_TIMEOUT", "7200"))
+    deadline = time.monotonic() + timeout
+    logger.info("Waiting for local rank 0 to build the %s dataset cache.", cache_key)
+    while not ready_marker.is_file():
+        if failed_marker.is_file():
+            raise RuntimeError(
+                f"Local dataset cache warmup failed: {failed_marker.read_text().strip()}"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out after {timeout:g}s waiting for {ready_marker}."
+            )
+        time.sleep(2)
+    return instantiate(dataset_cfg, **kwargs)
+
+
 def build_datasets(data_cfg: DictConfig):
-    train_ds = instantiate(data_cfg.train)
+    train_ds = _instantiate_dataset_local_main_first(
+        data_cfg.train,
+        cache_key="train",
+    )
     if data_cfg.get("val") is None:
         val_ds = train_ds
     else:
-        PartialState().wait_for_everyone()
         train_stats_path = data_cfg.train.get("pretrained_norm_stats")
         default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
@@ -527,14 +580,24 @@ def build_datasets(data_cfg: DictConfig):
             logger.info(
                 "Building WebDataset val split with normalization stats from preprocessed_root."
             )
-            val_ds = instantiate(data_cfg.val)
+            val_ds = _instantiate_dataset_local_main_first(
+                data_cfg.val,
+                cache_key="val",
+            )
         elif _needs_norm_stats:
             pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
             logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
-            val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
+            val_ds = _instantiate_dataset_local_main_first(
+                data_cfg.val,
+                cache_key="val",
+                pretrained_norm_stats=pretrained_norm_stats,
+            )
         else:
             logger.info("Building val dataset (no pretrained_norm_stats needed).")
-            val_ds = instantiate(data_cfg.val)
+            val_ds = _instantiate_dataset_local_main_first(
+                data_cfg.val,
+                cache_key="val",
+            )
     return train_ds, val_ds
 
 
@@ -566,6 +629,14 @@ def run_training(cfg: DictConfig):
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    latent_action_manifest = getattr(
+        train_ds, "latent_action_cache_manifest", None
+    )
+    set_latent_action_manifest = getattr(
+        model, "set_latent_action_cache_manifest", None
+    )
+    if latent_action_manifest is not None and callable(set_latent_action_manifest):
+        set_latent_action_manifest(latent_action_manifest)
 
     from .utils.video_latent_cache import ensure_training_video_latent_caches
 

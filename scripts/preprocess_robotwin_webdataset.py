@@ -20,6 +20,8 @@ import tarfile
 import torch
 from PIL import Image
 
+from robotwin_s3 import AwsCliS3, S3Config
+
 FORMAT_NAME = "robotwin-webdataset"
 FORMAT_VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
@@ -90,12 +92,22 @@ class WorkerConfig:
     png_compress_level: int
     decode_chunk_frames: int
     overwrite: bool
+    s3_output_root: str | None = None
+    aws_profile: str = "roboticsx"
+    aws_region: str = "us-east-2"
+    aws_credentials_file: str = "/fsx/.aws/credentials"
+    aws_cli: str = "aws"
 
 
 class UncompressedTarWriter:
     def __init__(self, handle: BinaryIO):
         self._handle = handle
         self._closed = False
+        self._sha256 = hashlib.sha256()
+
+    def _write(self, data: bytes) -> None:
+        self._handle.write(data)
+        self._sha256.update(data)
 
     def add_bytes(self, name: str, data: bytes) -> tuple[int, int]:
         if self._closed:
@@ -113,22 +125,27 @@ class UncompressedTarWriter:
         header = info.tobuf(format=tarfile.USTAR_FORMAT, encoding="ascii", errors="strict")
         if len(header) != 512:
             raise ValueError(f"Unexpected tar header size for {name}: {len(header)}")
-        self._handle.write(header)
+        self._write(header)
         data_offset = self._handle.tell()
-        self._handle.write(data)
+        self._write(data)
         pad = (-len(data)) % 512
         if pad:
-            self._handle.write(b"\0" * pad)
+            self._write(b"\0" * pad)
         return data_offset, len(data)
 
     def close(self) -> None:
         if self._closed:
             return
-        self._handle.write(b"\0" * 1024)
+        self._write(b"\0" * 1024)
         self._closed = True
 
     def tell(self) -> int:
         return self._handle.tell()
+
+    def hexdigest(self) -> str:
+        if not self._closed:
+            raise RuntimeError("Tar writer must be closed before reading its digest")
+        return self._sha256.hexdigest()
 
 
 class _NumpyJSONEncoder(json.JSONEncoder):
@@ -141,8 +158,7 @@ class _NumpyJSONEncoder(json.JSONEncoder):
 
 
 def default_workers() -> int:
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(32, cpu_count // 2))
+    return 4
 
 
 def default_stats_path(source_root: str | Path) -> Path:
@@ -164,7 +180,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         default="data/robotwin2.0_webdataset",
-        help="Path to the output directory.",
+        help="Path to the local staging/output directory.",
+    )
+    parser.add_argument(
+        "--s3-output-root",
+        default=None,
+        help="Optional s3:// destination. Completed shards are verified remotely then removed locally.",
+    )
+    parser.add_argument("--aws-profile", default="roboticsx")
+    parser.add_argument("--aws-region", default="us-east-2")
+    parser.add_argument("--aws-credentials-file", default="/fsx/.aws/credentials")
+    parser.add_argument("--aws-cli", default="aws")
+    parser.add_argument(
+        "--allow-partial-s3",
+        action="store_true",
+        help="Allow --max-episodes with S3 output. Use only with a dedicated non-production prefix.",
     )
     parser.add_argument(
         "--stats-path",
@@ -175,7 +205,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--workers",
         type=int,
         default=default_workers(),
-        help="Worker process count. Default: max(1, min(32, os.cpu_count()//2)).",
+        help="Worker process count. Default: 4.",
     )
     parser.add_argument(
         "--episodes-per-shard",
@@ -443,6 +473,20 @@ def source_file_fingerprint(
     for path in paths:
         stat = path.stat()
         records[str(path.relative_to(source_root))] = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
+        }
+    return records
+
+
+def source_metadata_fingerprint(metadata: SourceMetadata) -> dict[str, dict[str, int]]:
+    source_root = Path(metadata.source_root)
+    records = {}
+    for relative in ("meta/info.json", "meta/tasks.jsonl", "meta/episodes.jsonl"):
+        path = source_root / relative
+        stat = path.stat()
+        records[relative] = {
             "size": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
             "ctime_ns": stat.st_ctime_ns,
@@ -734,6 +778,7 @@ def validate_summary(
     metadata: SourceMetadata,
     spec: ShardSpec,
     config: WorkerConfig,
+    validate_local_payloads: bool = True,
 ) -> None:
     required_fields = [
         "format",
@@ -753,6 +798,9 @@ def validate_summary(
         "output_bytes_total",
         "payload_files",
         "source_files",
+        "source_metadata_files",
+        "total_tasks",
+        "fps",
         "validation",
     ]
     missing = [field for field in required_fields if field not in summary]
@@ -786,6 +834,14 @@ def validate_summary(
         raise ValueError(
             f"Summary png_compress_level mismatch: {summary['png_compress_level']} != {config.png_compress_level}"
         )
+    if int(summary["fps"]) != metadata.fps:
+        raise ValueError(f"Summary fps mismatch: {summary['fps']} != {metadata.fps}")
+    if int(summary["total_tasks"]) != metadata.total_tasks:
+        raise ValueError(
+            f"Summary total_tasks mismatch: {summary['total_tasks']} != {metadata.total_tasks}"
+        )
+    if summary["source_metadata_files"] != source_metadata_fingerprint(metadata):
+        raise ValueError("Source metadata files changed; rebuild required.")
     if list(summary["camera_keys"]) != list(metadata.camera_short_keys):
         raise ValueError(f"Summary camera_keys mismatch: {summary['camera_keys']} != {list(metadata.camera_short_keys)}")
     if int(summary["raw_height"]) != metadata.raw_height or int(summary["raw_width"]) != metadata.raw_width:
@@ -818,6 +874,11 @@ def validate_summary(
             "Summary validation.decoder_average_fps_by_camera keys mismatch: "
             f"{sorted(decoder_fps)} != {sorted(metadata.camera_short_keys)}"
         )
+    for camera_name, value in decoder_fps.items():
+        if not math.isclose(float(value), float(metadata.fps), rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(
+                f"Summary decoder fps mismatch for {camera_name}: {value} != {metadata.fps}"
+            )
     payload_files = summary["payload_files"]
     if not isinstance(payload_files, dict) or not payload_files:
         raise ValueError("Summary payload_files must be a non-empty dict")
@@ -838,17 +899,18 @@ def validate_summary(
         record = payload_files.get(path.name)
         if not isinstance(record, dict):
             raise ValueError(f"Summary payload_files is missing {path.name}")
-        stat = path.stat()
-        if int(record.get("size", -1)) != stat.st_size:
-            raise ValueError(
-                f"Payload size mismatch for {path}: "
-                f"{record.get('size')} != {stat.st_size}"
-            )
-        if int(record.get("mtime_ns", -1)) != stat.st_mtime_ns:
-            raise ValueError(
-                f"Payload mtime mismatch for {path}: "
-                f"{record.get('mtime_ns')} != {stat.st_mtime_ns}"
-            )
+        sha256 = record.get("sha256")
+        if not isinstance(sha256, str) or len(sha256) != 64:
+            raise ValueError(f"Payload SHA256 is missing or invalid for {path.name}")
+        if validate_local_payloads:
+            stat = path.stat()
+            if int(record.get("size", -1)) != stat.st_size:
+                raise ValueError(
+                    f"Payload size mismatch for {path}: "
+                    f"{record.get('size')} != {stat.st_size}"
+                )
+            if hash_file(path) != sha256:
+                raise ValueError(f"Payload SHA256 mismatch for {path}")
     current_source_files = source_file_fingerprint(metadata, spec)
     if summary["source_files"] != current_source_files:
         raise ValueError(
@@ -885,12 +947,128 @@ def try_load_complete_summary(
     return summary
 
 
+def make_s3_store(config: WorkerConfig) -> AwsCliS3 | None:
+    if config.s3_output_root is None:
+        return None
+    return AwsCliS3(
+        S3Config(
+            root_uri=config.s3_output_root,
+            profile=config.aws_profile,
+            region=config.aws_region,
+            credentials_file=config.aws_credentials_file,
+            aws_cli=config.aws_cli,
+        )
+    )
+
+
+def shard_relative_key(path: Path) -> str:
+    return f"shards/{path.name}"
+
+
+def try_load_remote_summary(
+    metadata: SourceMetadata,
+    spec: ShardSpec,
+    config: WorkerConfig,
+    store: AwsCliS3,
+) -> dict[str, Any] | None:
+    paths = expected_shard_paths(Path(config.output_root), spec.shard_index)
+    done_key = shard_relative_key(paths["done"])
+    summary_key = shard_relative_key(paths["summary"])
+    try:
+        if store.head(done_key) is None:
+            return None
+        done = json.loads(store.read_bytes(done_key))
+        summary_bytes = store.read_bytes(summary_key)
+        summary = json.loads(summary_bytes)
+        if done.get("summary_sha256") != hash_bytes(summary_bytes):
+            raise ValueError("Remote shard done marker does not match summary")
+        validate_summary(
+            summary,
+            metadata=metadata,
+            spec=spec,
+            config=config,
+            validate_local_payloads=False,
+        )
+        for key in (
+            "tar",
+            "offsets",
+            "sizes",
+            "state",
+            "action",
+            "task_index",
+            "episodes",
+        ):
+            path = paths[key]
+            record = summary["payload_files"][path.name]
+            remote = store.head(shard_relative_key(path))
+            metadata_fields = remote.get("Metadata", {}) if remote else {}
+            if (
+                remote is None
+                or int(remote.get("ContentLength", -1)) != int(record["size"])
+                or metadata_fields.get("sha256") != record["sha256"]
+            ):
+                raise ValueError(f"Remote payload validation failed for {path.name}")
+        return summary
+    except Exception:
+        LOGGER.warning(
+            "Remote shard %s validation failed; rebuilding or re-uploading without modifying the remote marker yet.\n%s",
+            shard_stem(spec.shard_index),
+            traceback.format_exc(),
+        )
+        return None
+
+
+def upload_complete_shard(
+    paths: dict[str, Path],
+    summary: dict[str, Any],
+    store: AwsCliS3,
+) -> None:
+    store.delete(shard_relative_key(paths["done"]))
+    for key in (
+        "tar",
+        "offsets",
+        "sizes",
+        "state",
+        "action",
+        "task_index",
+        "episodes",
+    ):
+        path = paths[key]
+        record = summary["payload_files"][path.name]
+        store.upload_file(path, shard_relative_key(path), record["sha256"])
+
+    summary_sha256 = hash_file(paths["summary"])
+    store.upload_file(
+        paths["summary"],
+        shard_relative_key(paths["summary"]),
+        summary_sha256,
+    )
+    done_payload = {
+        "format": "robotwin-webdataset-shard-done",
+        "version": 1,
+        "shard_index": int(summary["shard_index"]),
+        "summary_sha256": summary_sha256,
+        "payload_count": 7,
+    }
+    write_json(paths["done"], done_payload)
+    store.upload_file(
+        paths["done"],
+        shard_relative_key(paths["done"]),
+        hash_file(paths["done"]),
+    )
+
+
+def cleanup_complete_shard(paths: dict[str, Path]) -> None:
+    cleanup_paths(paths.values())
+
+
 def build_shard_summary(
     *,
     spec: ShardSpec,
     metadata: SourceMetadata,
     config: WorkerConfig,
     tar_path: Path,
+    tar_sha256: str,
     sidecar_paths: Sequence[Path],
     png_bytes_total: int,
     source_files: dict[str, dict[str, int]],
@@ -902,7 +1080,7 @@ def build_shard_summary(
     payload_files = {
         path.name: {
             "size": path.stat().st_size,
-            "mtime_ns": path.stat().st_mtime_ns,
+            "sha256": tar_sha256 if path == tar_path else hash_file(path),
         }
         for path in payload_paths
     }
@@ -928,8 +1106,10 @@ def build_shard_summary(
         "sidecar_bytes_total": int(sidecar_bytes_total),
         "output_bytes_total": int(tar_bytes + sidecar_bytes_total),
         "fps": metadata.fps,
+        "total_tasks": metadata.total_tasks,
         "payload_files": payload_files,
         "source_files": source_files,
+        "source_metadata_files": source_metadata_fingerprint(metadata),
         "validation": validation,
     }
     return summary
@@ -990,8 +1170,21 @@ def process_shard(spec: ShardSpec, metadata: SourceMetadata, config: WorkerConfi
     output_root = Path(config.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "shards").mkdir(parents=True, exist_ok=True)
+    paths = expected_shard_paths(output_root, spec.shard_index)
+    store = make_s3_store(config)
+
+    if store is not None and not config.overwrite:
+        remote_summary = try_load_remote_summary(metadata, spec, config, store)
+        if remote_summary is not None:
+            cleanup_complete_shard(paths)
+            return {"result": "remote-skipped", "summary": remote_summary}
+
     existing_summary = None if config.overwrite else try_load_complete_summary(metadata, spec, config)
     if existing_summary is not None:
+        if store is not None:
+            upload_complete_shard(paths, existing_summary, store)
+            cleanup_complete_shard(paths)
+            return {"result": "uploaded", "summary": existing_summary}
         return {"result": "skipped", "summary": existing_summary}
     source_files_before = source_file_fingerprint(metadata, spec)
 
@@ -1002,7 +1195,6 @@ def process_shard(spec: ShardSpec, metadata: SourceMetadata, config: WorkerConfi
             "torchcodec is required to convert RoboTwin videos. Install project dependencies before running this script."
         ) from exc
 
-    paths = expected_shard_paths(output_root, spec.shard_index)
     partials = {key: partial_path(final_path) for key, final_path in paths.items()}
     cleanup_paths(partials.values())
 
@@ -1142,6 +1334,7 @@ def process_shard(spec: ShardSpec, metadata: SourceMetadata, config: WorkerConfi
             )
 
         tar_writer.close()
+        tar_sha256 = tar_writer.hexdigest()
         tar_handle.flush()
         tar_handle.close()
         tar_handle = None
@@ -1175,6 +1368,7 @@ def process_shard(spec: ShardSpec, metadata: SourceMetadata, config: WorkerConfi
             metadata=metadata,
             config=config,
             tar_path=paths["tar"],
+            tar_sha256=tar_sha256,
             sidecar_paths=[
                 paths["offsets"],
                 paths["sizes"],
@@ -1196,6 +1390,10 @@ def process_shard(spec: ShardSpec, metadata: SourceMetadata, config: WorkerConfi
         os.replace(partials["summary"], paths["summary"])
         write_text(partials["done"], DONE_MARKER_TEXT)
         os.replace(partials["done"], paths["done"])
+        if store is not None:
+            upload_complete_shard(paths, summary, store)
+            cleanup_complete_shard(paths)
+            return {"result": "uploaded", "summary": summary}
         return {"result": "written", "summary": summary}
     except Exception:
         cleanup_paths(partials.values())
@@ -1322,6 +1520,12 @@ def run(argv: Sequence[str] | None = None) -> int:
     source_root = resolve_path(args.source_root)
     output_root = resolve_path(args.output_root)
     stats_path = resolve_path(args.stats_path) if args.stats_path is not None else default_stats_path(source_root)
+    if args.s3_output_root and str(args.output_root).startswith(("s3://", "/s3/")):
+        raise ValueError("--output-root must be a local POSIX staging directory, not S3 or /s3 FUSE")
+    if args.s3_output_root and args.max_episodes is not None and not args.allow_partial_s3:
+        raise ValueError(
+            "Partial S3 conversion requires --allow-partial-s3 and a dedicated non-production prefix."
+        )
     LOGGER.info("Loading source metadata from %s", source_root)
     metadata = load_source_metadata(source_root)
     tasks = load_tasks(source_root)
@@ -1340,6 +1544,9 @@ def run(argv: Sequence[str] | None = None) -> int:
         and requested_frames == metadata.total_source_frames
     )
     remove_dataset_done_marker(output_root)
+    if output_root.exists():
+        for stale_partial in output_root.rglob("*.partial.*"):
+            cleanup_paths([stale_partial])
     dataset_stats = copy_dataset_stats(
         source_path=stats_path,
         output_root=output_root,
@@ -1360,7 +1567,16 @@ def run(argv: Sequence[str] | None = None) -> int:
         png_compress_level=int(args.png_compress_level),
         decode_chunk_frames=int(args.decode_chunk_frames),
         overwrite=bool(args.overwrite),
+        s3_output_root=args.s3_output_root,
+        aws_profile=args.aws_profile,
+        aws_region=args.aws_region,
+        aws_credentials_file=args.aws_credentials_file,
+        aws_cli=args.aws_cli,
     )
+    s3_store = make_s3_store(config)
+    if s3_store is not None:
+        s3_store.delete(DATASET_DONE_FILENAME)
+        LOGGER.info("Publishing shards to %s", args.s3_output_root)
 
     shard_summaries: dict[int, dict[str, Any]] = {}
     completed_shards = 0
@@ -1394,7 +1610,7 @@ def run(argv: Sequence[str] | None = None) -> int:
             completed_shards += 1
             completed_frames += int(summary["frame_count"])
             completed_bytes += int(summary["output_bytes_total"])
-            skipped_shards += int(result["result"] == "skipped")
+            skipped_shards += int(result["result"].endswith("skipped"))
 
             elapsed = max(time.perf_counter() - start_time, 1e-6)
             throughput = completed_frames / elapsed
@@ -1427,13 +1643,47 @@ def run(argv: Sequence[str] | None = None) -> int:
     )
     converted_episodes = sum(int(summary["episode_count"]) for summary in ordered_summaries)
     converted_frames = sum(int(summary["frame_count"]) for summary in ordered_summaries)
-    if (
+    conversion_complete = (
         converted_episodes == metadata.total_source_episodes
         and converted_frames == metadata.total_source_frames
-    ):
+    )
+    if conversion_complete and s3_store is None:
         write_dataset_done_marker(output_root)
     else:
         remove_dataset_done_marker(output_root)
+
+    if s3_store is not None:
+        stats_output_path = output_root / "dataset_stats.json"
+        s3_store.upload_file(
+            stats_output_path,
+            stats_output_path.name,
+            hash_file(stats_output_path),
+        )
+        s3_store.upload_file(
+            manifest_path,
+            manifest_path.name,
+            hash_file(manifest_path),
+        )
+        if conversion_complete:
+            dataset_done_path = output_root / DATASET_DONE_FILENAME
+            write_json(
+                dataset_done_path,
+                {
+                    "format": "robotwin-webdataset-done",
+                    "version": 1,
+                    "manifest_sha256": hash_file(manifest_path),
+                    "shard_count": len(shards),
+                    "converted_episodes": converted_episodes,
+                    "converted_frames": converted_frames,
+                },
+            )
+            s3_store.upload_file(
+                dataset_done_path,
+                DATASET_DONE_FILENAME,
+                hash_file(dataset_done_path),
+            )
+        else:
+            LOGGER.info("Partial conversion: remote dataset.done was intentionally not published.")
     total_elapsed = time.perf_counter() - start_time
     LOGGER.info(
         "Finished %d shard(s), %d frame(s) in %s. Manifest: %s",

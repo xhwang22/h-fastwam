@@ -91,13 +91,21 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.action_meta = shape_meta["action"]
 
         delta_timestamps = {}
+        image_delta_indices = (
+            range(-past_obs_size, -past_obs_size + obs_size)
+            if self.image_sample_indices is None
+            else (
+                -past_obs_size + index
+                for index in self.image_sample_indices
+            )
+        )
+        image_delta_timestamps = [
+            (t * global_sample_stride) / fps for t in image_delta_indices
+        ]
         for meta in self.image_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
-            delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps
-                for t in range(-past_obs_size, -past_obs_size + obs_size)
-            ]
+            delta_timestamps[meta["lerobot_key"]] = image_delta_timestamps
         
         for meta in self.state_meta:
             key = meta["key"]
@@ -149,6 +157,28 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "to": torch.cat([dataset["to"] for dataset in episode_data_index]),
         }
 
+    def _select_image_timeline(self, value: torch.Tensor, name: str) -> torch.Tensor:
+        actual_frames = int(value.shape[0])
+        expected_frames = (
+            self.obs_size
+            if self.image_sample_indices is None
+            else len(self.image_sample_indices)
+        )
+        if actual_frames == expected_frames:
+            return value
+        if (
+            self._image_sample_indices_tensor is not None
+            and actual_frames == self.obs_size
+        ):
+            return value.index_select(
+                0,
+                self._image_sample_indices_tensor.to(value.device),
+            )
+        raise ValueError(
+            f"`{name}` has {actual_frames} frames; expected "
+            f"{expected_frames} pre-sampled frames or {self.obs_size} full frames."
+        )
+
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
         action: torch.Tensor = lerobot_sample[lerobot_key] # [T, action_dim]
@@ -171,8 +201,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         image: torch.Tensor = lerobot_sample[lerobot_key]
         if image.ndim == 3: # time dim will lost when obs_size is 1
             image = image.unsqueeze(0)
-        if self._image_sample_indices_tensor is not None:
-            image = image.index_select(0, self._image_sample_indices_tensor)
+        image = self._select_image_timeline(image, lerobot_key)
         image = (image * 255).to(torch.uint8) # (1, 3, H, W)
         # For config simplication
         # assert image.shape[1:] == raw_shape, f"Image '{key}' shape {image.shape[1:]} mismatch with {raw_shape}."
@@ -256,12 +285,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         image_padding_key = f"{self.image_meta[0]['lerobot_key']}_is_pad"
         image_is_pad = lerobot_sample.get(image_padding_key)
         if image_is_pad is not None:
-            if self._image_sample_indices_tensor is not None:
-                image_is_pad = image_is_pad.index_select(
-                    0,
-                    self._image_sample_indices_tensor,
-                )
-            sample["image_is_pad"] = image_is_pad
+            sample["image_is_pad"] = self._select_image_timeline(
+                image_is_pad,
+                image_padding_key,
+            )
         else:
             image_count = (
                 len(self.image_sample_indices)

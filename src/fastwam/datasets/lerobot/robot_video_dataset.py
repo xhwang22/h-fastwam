@@ -21,6 +21,11 @@ from fastwam.utils.video_latent_cache import (
     load_video_latent,
     load_video_latent_cache_manifest,
 )
+from fastwam.utils.latent_action_cache import (
+    LatentActionCacheError,
+    load_latent_action,
+    load_latent_action_cache_manifest,
+)
 from accelerate import PartialState
 logger = get_logger(__name__)
 
@@ -28,6 +33,34 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 DATASET_STATS_FILENAME = "dataset_stats.json"
 DEFAULT_STATS_SYNC_TIMEOUT_SECONDS = 3600.0
+
+
+def make_robotwin_canvas(video: torch.Tensor) -> torch.Tensor:
+    if video.ndim != 5 or video.shape[0] != 3:
+        raise ValueError(
+            "RoboTwin canvas requires video shaped [3,T,C,H,W], "
+            f"got {tuple(video.shape)}."
+        )
+    cam_top = transforms_F.resize(
+        video[0],
+        size=[256, 320],
+        interpolation=transforms_F.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    cam_left = transforms_F.resize(
+        video[1],
+        size=[128, 160],
+        interpolation=transforms_F.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    cam_right = transforms_F.resize(
+        video[2],
+        size=[128, 160],
+        interpolation=transforms_F.InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    bottom = torch.cat([cam_left, cam_right], dim=-1)
+    return torch.cat([cam_top, bottom], dim=-2)
 
 
 def _dataset_stats_path() -> str:
@@ -78,6 +111,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         video_latent_cache_dir: Optional[str] = None,
         drop_video_when_cached: bool = False,
+        latent_action_cache_dir: Optional[str] = None,
+        latent_action_cache_expected_signature: Optional[str] = None,
     ):
         self.num_frames = int(num_frames)
         self.action_video_freq_ratio = int(action_video_freq_ratio)
@@ -120,6 +155,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_latent_cache_dir = None
         self.video_latent_cache_manifest = None
         self.drop_video_when_cached = bool(drop_video_when_cached)
+        self.latent_action_cache_dir = None
+        self.latent_action_cache_manifest = None
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -169,6 +206,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 cache_dir=video_latent_cache_dir,
                 expected_length=len(self),
                 drop_video=self.drop_video_when_cached,
+            )
+        if latent_action_cache_dir is not None:
+            self.set_latent_action_cache(
+                cache_dir=latent_action_cache_dir,
+                expected_length=len(self),
+                expected_signature=latent_action_cache_expected_signature,
             )
         
     def __len__(self):
@@ -221,6 +264,72 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         return self
 
+    def set_latent_action_cache(
+        self,
+        *,
+        cache_dir: str | os.PathLike,
+        expected_length: Optional[int] = None,
+        expected_signature: Optional[str] = None,
+    ):
+        expected_length = len(self) if expected_length is None else int(expected_length)
+        manifest = load_latent_action_cache_manifest(
+            cache_dir,
+            expected_length=expected_length,
+            expected_signature=expected_signature,
+        )
+        self.latent_action_cache_dir = os.path.realpath(os.path.expanduser(str(cache_dir)))
+        self.latent_action_cache_manifest = manifest
+        logger.info(
+            "Configured latent action cache: dir=%s length=%d signature=%s",
+            self.latent_action_cache_dir,
+            expected_length,
+            manifest["signature"],
+        )
+        return self
+
+    @staticmethod
+    def _expected_latent_action_is_pad(
+        image_is_pad: torch.Tensor,
+        action_is_pad: torch.Tensor,
+    ) -> torch.Tensor:
+        image_is_pad = torch.as_tensor(image_is_pad, dtype=torch.bool)
+        action_is_pad = torch.as_tensor(action_is_pad, dtype=torch.bool)
+        if image_is_pad.shape != (9,):
+            raise LatentActionCacheError(
+                f"Latent action alignment requires 9 image padding flags, got {tuple(image_is_pad.shape)}."
+            )
+        if action_is_pad.shape != (32,):
+            raise LatentActionCacheError(
+                f"Latent action alignment requires 32 physical action padding flags, got {tuple(action_is_pad.shape)}."
+            )
+        return image_is_pad[:-1] | image_is_pad[1:] | action_is_pad.view(8, 4).any(dim=1)
+
+    def _attach_cached_latent_action(self, data: dict, sample_idx: int) -> None:
+        if self.latent_action_cache_dir is None:
+            return
+        try:
+            latent_action, cached_is_pad = load_latent_action(
+                self.latent_action_cache_dir,
+                self.latent_action_cache_manifest,
+                sample_idx,
+            )
+        except Exception as exc:
+            raise LatentActionCacheError(
+                f"Failed to load cached latent action for sample {sample_idx} "
+                f"from {self.latent_action_cache_dir}"
+            ) from exc
+        expected_is_pad = self._expected_latent_action_is_pad(
+            data["image_is_pad"],
+            data["action_is_pad"],
+        )
+        if not torch.equal(cached_is_pad, expected_is_pad):
+            raise LatentActionCacheError(
+                f"Cached latent action padding mismatch for sample {sample_idx}: "
+                f"cached={cached_is_pad.tolist()} expected={expected_is_pad.tolist()}."
+            )
+        data["latent_action"] = latent_action
+        data["latent_action_is_pad"] = cached_is_pad | expected_is_pad
+
     def _get(self, idx):
         sample_idx = idx
         sample = None
@@ -269,6 +378,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "action_is_pad": sample["action_is_pad"],
                 "proprio_is_pad": sample["proprio_is_pad"],
             }
+            self._attach_cached_latent_action(data, sample_idx)
             if self.load_text_context:
                 context, context_mask = self._get_cached_text_context(instruction)
                 context[~context_mask] = 0.0
@@ -308,26 +418,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 raise ValueError(
                     f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
                 )
-            cam_top = transforms_F.resize(
-                video[0],
-                size=[256, 320],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 256, 320]
-            cam_left = transforms_F.resize(
-                video[1],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            cam_right = transforms_F.resize(
-                video[2],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            video = make_robotwin_canvas(video)  # [T_video, C, 384, 320]
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
                 video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
@@ -381,6 +472,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             data["video_latents"] = self._load_cached_video_latent(sample_idx)
             if self.drop_video_when_cached:
                 del data["video"]
+        self._attach_cached_latent_action(data, sample_idx)
         if self.load_text_context:
             context, context_mask = self._get_cached_text_context(instruction)
             # NOTE: to keep consistent with wan2.2's behavior
@@ -440,7 +532,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         try:
             data = self._get(idx)
-        except VideoLatentCacheError:
+        except (VideoLatentCacheError, LatentActionCacheError):
             raise
         except Exception as e:
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
@@ -511,7 +603,7 @@ class InterleavedRobotVideoDataset(RobotVideoDataset):
     def __getitem__(self, idx):
         try:
             return self._get_segments(idx)
-        except VideoLatentCacheError:
+        except (VideoLatentCacheError, LatentActionCacheError):
             raise
         except Exception as e:
             print(f"Error processing interleaved sample idx {idx}: {e}. Returning a random sample instead.")

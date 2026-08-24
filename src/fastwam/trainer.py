@@ -5,17 +5,19 @@ import functools
 import os
 import re
 import shutil
+import types
 from contextlib import nullcontext
-from math import ceil
+from math import ceil, cos, pi
 from pathlib import Path
 import time
 
 import numpy as np
 import torch
 from accelerate import Accelerator
+from accelerate.utils import SCHEDULER_NAME
 from omegaconf import DictConfig
 from PIL import Image
-from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
@@ -37,6 +39,37 @@ def _count_params(params) -> tuple[int, int]:
         tensor_count += 1
         param_count += int(p.numel())
     return tensor_count, param_count
+
+
+class _LRMultiplier:
+    """Picklable ``lr_lambda`` for :class:`LambdaLR`.
+
+    ``_build_scheduler`` used to define this as a local closure, whose
+    qualified name (``Wan22Trainer._build_scheduler.<locals>.lr_multiplier``)
+    is unresolvable outside the call frame that created it. Under plain
+    single-process training this went unnoticed because
+    ``LambdaLR.state_dict()`` already excludes plain-function lambdas from
+    the saved payload, but with DeepSpeed (accelerate wraps the scheduler in
+    ``AcceleratedScheduler``, which still saves via the same ``state_dict``
+    path) checkpoint saving crashed with ``AttributeError: Can't get local
+    object 'Wan22Trainer._build_scheduler.<locals>.lr_multiplier'``. A
+    module-level class instance has a resolvable qualified name and pickles
+    safely regardless of how the scheduler gets wrapped.
+    """
+
+    def __init__(self, scheduler_type: str, warmup_steps: int, remaining_steps: int):
+        self.scheduler_type = scheduler_type
+        self.warmup_steps = warmup_steps
+        self.remaining_steps = remaining_steps
+
+    def __call__(self, step: int) -> float:
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            start_factor = 1.0 / self.warmup_steps
+            return start_factor + (1.0 - start_factor) * (step / self.warmup_steps)
+        if self.scheduler_type == "constant":
+            return 1.0
+        progress = min(max((step - self.warmup_steps) / self.remaining_steps, 0.0), 1.0)
+        return 0.01 + 0.99 * 0.5 * (1.0 + cos(pi * progress))
 
 
 def _segment_count(segments) -> int:
@@ -185,8 +218,47 @@ class Wan22Trainer:
         
         self.resume = cfg.resume
         self.trainable_components = list(cfg.get("trainable_components", ["dit"]))
+        self.visual_encoder_lr_multiplier = float(cfg.get("visual_encoder_lr_multiplier", 1.0))
         self.projection_lr_multiplier = float(cfg.get("projection_lr_multiplier", 10.0))
         self.freeze_visual_encoder = bool(cfg.get("freeze_visual_encoder", False))
+
+        if bool(getattr(self.model, "latent_action_enabled", False)):
+            train_manifest = getattr(
+                self.train_dataset,
+                "latent_action_cache_manifest",
+                None,
+            )
+            if not isinstance(train_manifest, dict):
+                raise ValueError(
+                    "Latent-action training requires a validated train dataset cache manifest."
+                )
+            set_manifest = getattr(self.model, "set_latent_action_cache_manifest", None)
+            if not callable(set_manifest):
+                raise TypeError(
+                    "Latent-action model must implement set_latent_action_cache_manifest()."
+                )
+            set_manifest(train_manifest)
+            cache_signature = train_manifest.get("signature")
+            if self.val_dataset is not None:
+                val_manifest = getattr(
+                    self.val_dataset,
+                    "latent_action_cache_manifest",
+                    None,
+                )
+                if not isinstance(val_manifest, dict):
+                    raise ValueError(
+                        "Latent-action validation requires a validated val dataset cache manifest."
+                    )
+                if val_manifest.get("signature") != cache_signature:
+                    raise ValueError(
+                        "Train/val latent-action cache signatures must match: "
+                        f"{cache_signature!r} != {val_manifest.get('signature')!r}."
+                    )
+                if val_manifest.get("normalization") != train_manifest.get("normalization"):
+                    raise ValueError(
+                        "Train/val latent-action cache normalization must match."
+                    )
+
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
             raise ValueError(
@@ -194,6 +266,9 @@ class Wan22Trainer:
                 "Expected one of: ['no', 'fp16', 'bf16']."
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
+
+        # Freeze before FSDP inspects trainability and before optimizer/prepare.
+        self._apply_dit_only_train_mode(self.model)
 
         # When running plain DDP (no DeepSpeed), some trainable params may not
         # receive grads on every step (route-dependent experts / skipped
@@ -261,6 +336,7 @@ class Wan22Trainer:
 
             # Top-level small trainable modules.
             _add_ignored(getattr(self.model, "proprio_encoder", None), "proprio_encoder (trainable linear)")
+            _add_ignored(getattr(self.model, "latent_action_decoder", None), "latent_action_decoder")
             _add_ignored(getattr(self.model, "visual_encoder", None), "visual_encoder (non-DiT encoder/projection)")
 
             # Video expert pre/post modules outside DiTBlock.
@@ -365,56 +441,10 @@ class Wan22Trainer:
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
-        # Freeze non-trainable modules before optimizer/deepspeed initialization.
-        # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
-        self._apply_dit_only_train_mode(self.model)
-
-        # Build parameter groups from the post-freeze trainable set only.
-        # This is critical for H-FastWAM: model.dit is the whole MoT
-        # (language + video + action). If we hand the full parameter list to the
-        # optimizer/DeepSpeed, frozen experts still get optimizer state / ZeRO
-        # bookkeeping, which can dominate backward time.
-        dit_params = [p for p in self.model.dit.parameters() if p.requires_grad]
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            dit_params.extend([p for p in proprio_encoder.parameters() if p.requires_grad])
-
-        dit_tensor_count, dit_param_count = _count_params(dit_params)
-        logger.info(
-            "Optimizer base group: trainable_tensors=%d trainable_params=%.3fB",
-            dit_tensor_count,
-            dit_param_count / 1e9,
-        )
-
-        param_groups = [
-            {"params": dit_params, "lr": self.learning_rate},
-        ]
-
-        # Include the optional visual-encoder projection when it is trainable.
-        if getattr(self.model, "use_visual_encoder", False) and not self.freeze_visual_encoder:
-            proj_params = [p for p in self.model.visual_encoder.projection.parameters() if p.requires_grad]
-            if proj_params:  # skip_projection=True → nn.Identity() → no params
-                projection_lr = self.learning_rate * self.projection_lr_multiplier
-                proj_tensor_count, proj_param_count = _count_params(proj_params)
-                param_groups.append({
-                    "params": proj_params,
-                    "lr": projection_lr,
-                })
-                logger.info(
-                    "Projection LR: %.2e (%.1fx base LR %.2e), trainable_tensors=%d trainable_params=%.3fM",
-                    projection_lr,
-                    self.projection_lr_multiplier,
-                    self.learning_rate,
-                    proj_tensor_count,
-                    proj_param_count / 1e6,
-                )
-            else:
-                logger.info(
-                    "Visual encoder in skip_projection mode (DiT-side projection). "
-                    "No separate projection params — patchify Conv3d is trained as part of DiT."
-                )
-        elif getattr(self.model, "use_visual_encoder", False) and self.freeze_visual_encoder:
-            logger.info("Visual encoder projection is FROZEN (freeze_visual_encoder=true).")
+        # Build groups from the post-freeze trainable set. Parameters belonging
+        # to the online visual encoder get their own LR; every other trainable
+        # parameter (including the always-trainable proprio encoder) uses base LR.
+        param_groups = self._build_optimizer_param_groups()
 
         # AdamW implementation selection (memory vs speed):
         #   fused=True   -> fused CUDA kernel, NO large temporary copy in step()
@@ -460,7 +490,7 @@ class Wan22Trainer:
             self.optimizer = ZeroRedundancyOptimizer(
                 param_groups[0]["params"],
                 optimizer_class=torch.optim.AdamW,
-                lr=self.learning_rate,
+                lr=param_groups[0]["lr"],
                 weight_decay=self.weight_decay,
                 betas=(0.9, 0.95),
                 **_adam_kwargs,
@@ -739,40 +769,87 @@ class Wan22Trainer:
         )
         return max(opt_steps_per_epoch * self.num_epochs, 1)
 
+    def _build_optimizer_param_groups(self):
+        visual_params = []
+        visual_group_name = "visual_encoder"
+        visual_lr_multiplier = self.visual_encoder_lr_multiplier
+        if getattr(self.model, "use_visual_encoder", False):
+            if "visual_encoder" in self.trainable_components:
+                visual_params = [
+                    param for param in self.model.visual_encoder.parameters() if param.requires_grad
+                ]
+            elif not getattr(self, "freeze_visual_encoder", False):
+                # Backward compatibility for DINO configs that train only the
+                # projection MLP via projection_lr_multiplier.
+                visual_group_name = "visual_projection"
+                visual_lr_multiplier = getattr(self, "projection_lr_multiplier", 10.0)
+                visual_params = [
+                    param
+                    for param in self.model.visual_encoder.projection.parameters()
+                    if param.requires_grad
+                ]
+        visual_param_ids = {id(param) for param in visual_params}
+        base_params = [
+            param
+            for param in self.model.parameters()
+            if param.requires_grad and id(param) not in visual_param_ids
+        ]
+
+        param_groups = []
+        if base_params:
+            param_groups.append({"name": "base", "params": base_params, "lr": self.learning_rate})
+            tensor_count, param_count = _count_params(base_params)
+            logger.info(
+                "Optimizer base group: trainable_tensors=%d trainable_params=%.3fB lr=%.2e",
+                tensor_count,
+                param_count / 1e9,
+                self.learning_rate,
+            )
+        if visual_params:
+            visual_lr = self.learning_rate * visual_lr_multiplier
+            param_groups.append({
+                "name": visual_group_name,
+                "params": visual_params,
+                "lr": visual_lr,
+            })
+            tensor_count, param_count = _count_params(visual_params)
+            logger.info(
+                "Optimizer visual-encoder group: trainable_tensors=%d trainable_params=%.3fM "
+                "lr=%.2e (%.3gx base)",
+                tensor_count,
+                param_count / 1e6,
+                visual_lr,
+                visual_lr_multiplier,
+            )
+
+        grouped_params = [param for group in param_groups for param in group["params"]]
+        grouped_param_ids = [id(param) for param in grouped_params]
+        trainable_param_ids = {id(param) for param in self.model.parameters() if param.requires_grad}
+        if len(grouped_param_ids) != len(set(grouped_param_ids)):
+            raise RuntimeError("Optimizer parameter groups contain duplicate parameters.")
+        if set(grouped_param_ids) != trainable_param_ids:
+            raise RuntimeError("Optimizer parameter groups do not cover all trainable parameters.")
+        if not param_groups:
+            raise ValueError("No trainable parameters remain after applying trainable_components.")
+        return param_groups
+
     def _build_scheduler(self, scheduler_type, total_train_steps: int, warmup_steps: int = 0):
         scheduler_type = str(scheduler_type).strip().lower()
         total_train_steps = max(int(total_train_steps), 1)
         warmup_steps = min(max(int(warmup_steps), 0), total_train_steps - 1)
-
         remaining_steps = max(total_train_steps - warmup_steps, 1)
-        if scheduler_type == "cosine":
-            main_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=remaining_steps,
-                eta_min=self.learning_rate * 0.01,
-            )
-        elif scheduler_type == "constant":
-            main_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=remaining_steps)
-        else:
+
+        if scheduler_type not in {"cosine", "constant"}:
             raise ValueError(
                 f"Unsupported lr_scheduler_type: {scheduler_type}. "
                 "Expected one of: ['cosine', 'constant']."
             )
 
-        if warmup_steps <= 0:
-            return main_scheduler
-
-        warmup_scheduler = LinearLR(
-            self.optimizer,
-            start_factor=1.0 / warmup_steps,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        return SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
-            milestones=[warmup_steps],
-        )
+        # One multiplier for every group preserves the configured LR ratios.
+        # Uses a module-level callable class (not a local closure) so the
+        # scheduler pickles correctly under DeepSpeed checkpoint saving.
+        lr_multiplier = _LRMultiplier(scheduler_type, warmup_steps, remaining_steps)
+        return LambdaLR(self.optimizer, lr_lambda=lr_multiplier)
     
     def _estimate_eta(self):
         elapsed = max(time.perf_counter() - self.run_start_time, 1e-6)
@@ -800,44 +877,11 @@ class Wan22Trainer:
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
 
     def _apply_dit_only_train_mode(self, model):
-        """Pre-accelerator freeze: only DiT + optional components stay trainable."""
-        model.eval()
-        model.requires_grad_(False)
-        model.dit.train()
-        model.dit.requires_grad_(True)
-
-        if bool(getattr(model, "freeze_language_expert", False)) and hasattr(model, "language_expert"):
-            model.language_expert.eval()
-            model.language_expert.requires_grad_(False)
-        if bool(getattr(model, "freeze_video_expert", False)) and hasattr(model, "video_expert"):
-            model.video_expert.eval()
-            model.video_expert.requires_grad_(False)
-        if bool(getattr(model, "freeze_action_expert", False)) and hasattr(model, "action_expert"):
-            model.action_expert.eval()
-            model.action_expert.requires_grad_(False)
-
-        proprio_encoder = getattr(model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            proprio_encoder.train()
-            proprio_encoder.requires_grad_(True)
-        if getattr(model, "use_visual_encoder", False) and not self.freeze_visual_encoder:
-            proj_params = list(model.visual_encoder.projection.parameters())
-            if proj_params:  # has MLP (not skip_projection mode)
-                model.visual_encoder.projection.train()
-                model.visual_encoder.projection.requires_grad_(True)
-
-    def _set_dit_only_train_mode(self):
-        # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
-        # Extended to support configurable trainable_components.
-        model = self.accelerator.unwrap_model(self.model)
-        components = self.trainable_components
-        logger.info("Setting trainable components: %s (freezing everything else).", components)
-
-        # First freeze everything
+        """Apply configured trainability before optimizer/distributed wrapping."""
+        components = set(self.trainable_components)
         model.eval()
         model.requires_grad_(False)
 
-        # Unfreeze DiT (always included by default)
         if "dit" in components:
             model.dit.train()
             model.dit.requires_grad_(True)
@@ -852,34 +896,65 @@ class Wan22Trainer:
             model.action_expert.eval()
             model.action_expert.requires_grad_(False)
 
-        # Unfreeze VAE
         if "vae" in components:
-            if hasattr(model, "vae"):
-                model.vae.train()
-                model.vae.requires_grad_(True)
-                logger.info("VAE encoder/decoder set to trainable.")
+            vae = getattr(model, "vae", None)
+            if vae is not None:
+                vae.train()
+                vae.requires_grad_(True)
             else:
                 logger.warning("trainable_components includes 'vae' but model has no 'vae' attribute.")
 
-        # Unfreeze text encoder
         if "text_encoder" in components:
-            if hasattr(model, "text_encoder") and model.text_encoder is not None:
-                model.text_encoder.train()
-                model.text_encoder.requires_grad_(True)
-                logger.info("Text encoder set to trainable.")
+            text_encoder = getattr(model, "text_encoder", None)
+            if text_encoder is not None:
+                text_encoder.train()
+                text_encoder.requires_grad_(True)
 
-        # Unfreeze proprio encoder (always if present, for backward compat)
+        if "latent_action_decoder" in components:
+            decoder = getattr(model, "latent_action_decoder", None)
+            if decoder is None:
+                logger.warning(
+                    "trainable_components includes 'latent_action_decoder' but the model has none."
+                )
+            else:
+                decoder.train()
+                decoder.requires_grad_(True)
+
+        # Keep the historical behavior: proprio is trainable whenever present.
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
 
-        # Unfreeze an optional visual-encoder MLP projection (backbone stays frozen).
-        if getattr(model, "use_visual_encoder", False) and not self.freeze_visual_encoder:
-            proj_params = list(model.visual_encoder.projection.parameters())
-            if proj_params:  # has MLP (not skip_projection mode)
-                model.visual_encoder.projection.train()
-                model.visual_encoder.projection.requires_grad_(True)
+        visual_encoder = getattr(model, "visual_encoder", None)
+        if getattr(model, "use_visual_encoder", False) and visual_encoder is not None:
+            if "visual_encoder" in components:
+                # BaseVisualEncoder.train() keeps a configured frozen backbone in
+                # eval mode, so explicitly opt the complete online encoder in.
+                if hasattr(visual_encoder, "_freeze_backbone"):
+                    visual_encoder._freeze_backbone = False
+                visual_encoder.train()
+                visual_encoder.requires_grad_(True)
+            else:
+                visual_encoder.eval()
+                visual_encoder.requires_grad_(False)
+                if not getattr(self, "freeze_visual_encoder", False):
+                    projection_params = list(visual_encoder.projection.parameters())
+                    if projection_params:
+                        visual_encoder.projection.train()
+                        visual_encoder.projection.requires_grad_(True)
+        elif "visual_encoder" in components:
+            logger.warning(
+                "trainable_components includes 'visual_encoder' but the model has no online visual encoder."
+            )
+
+    def _set_dit_only_train_mode(self):
+        model = self.accelerator.unwrap_model(self.model)
+        logger.info(
+            "Setting trainable components: %s (proprio remains trainable when present).",
+            self.trainable_components,
+        )
+        self._apply_dit_only_train_mode(model)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -974,7 +1049,7 @@ class Wan22Trainer:
                     f"Cached eval latent batch {video_latents.shape[0]} != video batch {video.shape[0]}"
                 )
 
-        return {
+        result = {
             "video": video,
             "video_latents": video_latents,
             "prompt": prompt,
@@ -984,6 +1059,32 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "action_horizon": action_horizon,
         }
+        for key in (
+            "action_is_pad",
+            "action_dim_is_pad",
+            "image_is_pad",
+            "video_spatial_valid_mask",
+            "latent_action",
+            "latent_action_is_pad",
+        ):
+            value = sample.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"`sample['{key}']` must be a torch.Tensor, got {type(value)}")
+            if key in {"latent_action", "latent_action_is_pad", "action_is_pad", "action_dim_is_pad", "image_is_pad", "video_spatial_valid_mask"}:
+                expected_ndim = {
+                    "latent_action": 3,
+                    "latent_action_is_pad": 2,
+                    "action_is_pad": 2,
+                    "action_dim_is_pad": 2,
+                    "image_is_pad": 2,
+                    "video_spatial_valid_mask": 4,
+                }[key]
+                if value.ndim == expected_ndim - 1:
+                    value = value.unsqueeze(0)
+            result[key] = value
+        return result
 
     @staticmethod
     def _first_segment_prompt(prompt):
@@ -1118,7 +1219,18 @@ class Wan22Trainer:
                 num_segments=num_segments,
             ),
         }
-        for key in ("action", "proprio", "context", "context_mask"):
+        for key in (
+            "action",
+            "action_is_pad",
+            "action_dim_is_pad",
+            "proprio",
+            "context",
+            "context_mask",
+            "image_is_pad",
+            "video_spatial_valid_mask",
+            "latent_action",
+            "latent_action_is_pad",
+        ):
             value = batched_segments.get(key)
             if value is not None:
                 if not isinstance(value, torch.Tensor):
@@ -1137,6 +1249,8 @@ class Wan22Trainer:
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
         model.eval()
+        if callable(getattr(model, "set_training_epoch", None)):
+            model.set_training_epoch(self.epoch)
 
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
@@ -1473,7 +1587,59 @@ class Wan22Trainer:
             except OSError as exc:
                 logger.warning("Failed to prune checkpoint %s: %s", tag, exc)
 
+    def _patch_scheduler_for_legacy_resume(self, state_dir: str):
+        """Allow resuming checkpoints saved with the old SequentialLR-based
+        scheduler (warmup LinearLR chained into CosineAnnealingLR/ConstantLR)
+        under the current LambdaLR-based scheduler.
+
+        Both scheduler implementations advance ``last_epoch`` by one per
+        optimizer step, so replaying the legacy ``last_epoch`` through the
+        current lr_lambda formula reproduces the intended LR without needing
+        the incompatible nested ``_schedulers``/``_milestones`` payload that
+        ``LambdaLR.load_state_dict`` cannot parse (raises ``KeyError:
+        'lr_lambdas'``).
+        """
+        scheduler_file = Path(state_dir) / f"{SCHEDULER_NAME}.bin"
+        if not scheduler_file.exists():
+            return
+        legacy_state = torch.load(scheduler_file, map_location="cpu", weights_only=False)
+        if "lr_lambdas" in legacy_state:
+            return  # Already the current LambdaLR format; nothing to patch.
+        if "_schedulers" not in legacy_state:
+            logger.warning(
+                "Unrecognized scheduler state format at %s; leaving load_state_dict "
+                "unpatched (resume may fail).",
+                scheduler_file,
+            )
+            return
+
+        legacy_last_epoch = int(legacy_state["last_epoch"])
+        logger.warning(
+            "scheduler state at %s uses the legacy SequentialLR format "
+            "(last_epoch=%d); restoring only last_epoch under the current "
+            "LambdaLR schedule instead of the incompatible nested state.",
+            scheduler_file,
+            legacy_last_epoch,
+        )
+
+        # Accelerate wraps the raw torch scheduler inside AcceleratedScheduler
+        # (or DeepSpeedSchedulerWrapper); reach through to the real LambdaLR.
+        raw_scheduler = getattr(self.scheduler, "scheduler", self.scheduler)
+
+        def _legacy_compatible_load_state_dict(sched_self, state_dict, _epoch=legacy_last_epoch):
+            if "lr_lambdas" in state_dict:
+                LambdaLR.load_state_dict(sched_self, state_dict)
+            else:
+                # `epoch=` sets last_epoch directly and recomputes LR from it,
+                # instead of incrementing from the scheduler's current state.
+                sched_self.step(epoch=_epoch)
+
+        raw_scheduler.load_state_dict = types.MethodType(
+            _legacy_compatible_load_state_dict, raw_scheduler
+        )
+
     def load_training_state(self, state_dir: str):
+        self._patch_scheduler_for_legacy_resume(state_dir)
         self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
@@ -1522,6 +1688,8 @@ class Wan22Trainer:
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if callable(getattr(unwrapped_model, "set_training_epoch", None)):
+            unwrapped_model.set_training_epoch(self.epoch)
 
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
@@ -1545,6 +1713,8 @@ class Wan22Trainer:
                     logger.info("Fetched first training batch; running first training_loss forward.")
             except StopIteration:
                 self.epoch += 1
+                if callable(getattr(unwrapped_model, "set_training_epoch", None)):
+                    unwrapped_model.set_training_epoch(self.epoch)
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)

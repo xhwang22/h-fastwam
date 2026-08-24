@@ -102,16 +102,47 @@ def _check_data_contract(train_cfg) -> None:
 
 
 def _check_model_contract(model_kind: str, model) -> None:
+    latent_config = model.get("latent_action_config")
+    latent_enabled = bool(latent_config and latent_config.get("enabled", False))
+    if latent_enabled and model_kind != "vjepa":
+        raise ValueError("Latent-action evaluation is only supported for the V-JEPA model.")
+
     _require_equal(str(model.language_backend), "qwen3", "language_backend")
     _require_equal(bool(model.freeze_language_expert), True, "freeze_language_expert")
     _require_equal(float(model.loss_config.lambda_language), 0.0, "lambda_language")
     _require_equal(bool(model.knowledge_insulation), False, "knowledge_insulation")
-    _require_equal(bool(model.action_loss_detach_video_expert), False, "action detach")
+    _require_equal(
+        bool(model.action_loss_detach_video_expert),
+        False,
+        "action detach",
+    )
     _require_equal(str(model.layer_alignment_mode), "tail_overlap", "layer alignment")
     _require_equal(int(model.video_dit_config.hidden_dim), 2048, "video hidden_dim")
     _require_equal(int(model.video_dit_config.num_layers), 28, "video num_layers")
     _require_equal(int(model.action_dit_config.hidden_dim), 2048, "action hidden_dim")
     _require_equal(int(model.action_dit_config.num_layers), 28, "action num_layers")
+    _require_equal(
+        int(model.action_dit_config.action_dim),
+        32 if latent_enabled else 14,
+        "ActionDiT action_dim",
+    )
+    if latent_enabled:
+        expected_contract = {
+            "latent_horizon": 8,
+            "latent_dim": 32,
+            "physical_action_horizon": 32,
+            "physical_action_dim": 14,
+            "actions_per_latent": 4,
+        }
+        for key, expected in expected_contract.items():
+            _require_equal(int(latent_config[key]), expected, f"latent action {key}")
+        decoder = model.get("latent_action_decoder_config")
+        if decoder is None:
+            raise ValueError("Latent-action model is missing latent_action_decoder_config.")
+        _require_equal(int(decoder.latent_dim), 32, "decoder latent_dim")
+        _require_equal(int(decoder.num_latents), 8, "decoder num_latents")
+        _require_equal(int(decoder.substeps_per_latent), 4, "decoder substeps")
+        _require_equal(int(decoder.action_dim), 14, "decoder action_dim")
     visual = model.visual_encoder_config
     _require_equal(bool(visual.freeze_backbone), True, "visual freeze_backbone")
     _require_equal(bool(visual.skip_projection), True, "visual skip_projection")
@@ -149,11 +180,33 @@ def _check_model_contract(model_kind: str, model) -> None:
             "per_frame_causal",
             "IDM video mask",
         )
+    elif model_kind == "vjepa":
+        _require_equal(
+            target,
+            "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam",
+            "V-JEPA model target",
+        )
+        _require_equal(str(model.video_expert_type), "jepa_predictor", "video expert")
+        _require_equal(bool(model.fixed_target_encoder), False, "fixed_target_encoder")
+        _require_equal(str(visual.encoder_type), "vjepa2_1", "V-JEPA encoder")
+        _require_equal(int(model.video_dit_config.in_dim), 1664, "V-JEPA video in_dim")
+        _require_equal(int(model.video_dit_config.out_dim), 1664, "V-JEPA video out_dim")
+        _require_equal(
+            str(model.video_dit_config.video_attention_mask_mode),
+            "per_frame_causal",
+            "V-JEPA video mask",
+        )
     else:
         raise ValueError(f"Unsupported model kind: {model_kind}")
 
 
-def _check_checkpoint(checkpoint_path: Path, expected_video_dim: int) -> None:
+def _check_checkpoint(
+    checkpoint_path: Path,
+    expected_video_dim: int,
+    expected_action_dim: int = 14,
+    latent_action_config=None,
+    expected_fixed_target_encoder: bool | None = None,
+) -> None:
     payload = torch.load(
         checkpoint_path,
         map_location="cpu",
@@ -163,19 +216,25 @@ def _check_checkpoint(checkpoint_path: Path, expected_video_dim: int) -> None:
     for key in ("mot", "language_expert", "proprio_encoder", "visual_encoder"):
         if key not in payload:
             raise ValueError(f"Checkpoint is missing `{key}`: {checkpoint_path}")
+    if expected_fixed_target_encoder is not None:
+        _require_equal(
+            bool(payload.get("fixed_target_encoder", False)),
+            expected_fixed_target_encoder,
+            "checkpoint fixed_target_encoder",
+        )
     mot = payload["mot"]
     action_input = mot.get("mixtures.action.action_encoder.weight")
     action_output = mot.get("mixtures.action.head.weight")
     video_patch = mot.get("mixtures.video.patch_embedding.weight")
     proprio = payload["proprio_encoder"].get("weight")
-    if action_input is None or tuple(action_input.shape)[1] != 14:
+    if action_input is None or tuple(action_input.shape)[1] != expected_action_dim:
         raise ValueError(
-            f"Checkpoint ActionDiT input is not 14-d: "
+            f"Checkpoint ActionDiT input is not {expected_action_dim}-d: "
             f"{None if action_input is None else tuple(action_input.shape)}"
         )
-    if action_output is None or tuple(action_output.shape)[0] != 14:
+    if action_output is None or tuple(action_output.shape)[0] != expected_action_dim:
         raise ValueError(
-            f"Checkpoint ActionDiT output is not 14-d: "
+            f"Checkpoint ActionDiT output is not {expected_action_dim}-d: "
             f"{None if action_output is None else tuple(action_output.shape)}"
         )
     if proprio is None or tuple(proprio.shape) != (4096, 14):
@@ -189,10 +248,39 @@ def _check_checkpoint(checkpoint_path: Path, expected_video_dim: int) -> None:
             f"{None if video_patch is None else tuple(video_patch.shape)}"
         )
 
+    if latent_action_config is not None:
+        metadata = payload.get("checkpoint_metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError("Latent-action checkpoint is missing checkpoint_metadata.")
+        _require_equal(int(metadata.get("checkpoint_schema_version", -1)), 2, "checkpoint schema")
+        _require_equal(metadata.get("action_representation"), "latent", "action representation")
+        expected_signature = latent_action_config.get("latent_cache_signature")
+        if expected_signature is not None:
+            _require_equal(
+                metadata.get("latent_cache_signature"),
+                str(expected_signature),
+                "latent cache signature",
+            )
+        decoder = payload.get("latent_action_decoder")
+        if not isinstance(decoder, dict):
+            raise ValueError("Latent-action checkpoint is missing `latent_action_decoder`.")
+        latent_projection = decoder.get("latent_projection.weight")
+        action_projection = decoder.get("action_projection.weight")
+        if latent_projection is None or tuple(latent_projection.shape)[1] != 32:
+            raise ValueError(
+                "Checkpoint latent decoder input is not 32-d: "
+                f"{None if latent_projection is None else tuple(latent_projection.shape)}"
+            )
+        if action_projection is None or tuple(action_projection.shape)[0] != 14:
+            raise ValueError(
+                "Checkpoint latent decoder output is not 14-d: "
+                f"{None if action_projection is None else tuple(action_projection.shape)}"
+            )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["xr1", "idm"], required=True)
+    parser.add_argument("--model", choices=["xr1", "idm", "vjepa"], required=True)
     parser.add_argument("--train-config", required=True)
     parser.add_argument("--eval-config", required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -227,9 +315,17 @@ def main() -> None:
     _check_data_contract(train_cfg)
     model = _model_cfg(eval_cfg)
     _check_model_contract(args.model, model)
+    expected_video_dims = {"xr1": 1024, "idm": 1664, "vjepa": 1664}
+    latent_action_config = model.get("latent_action_config")
+    latent_enabled = bool(
+        latent_action_config and latent_action_config.get("enabled", False)
+    )
     _check_checkpoint(
         checkpoint_path,
-        expected_video_dim=1024 if args.model == "xr1" else 1664,
+        expected_video_dim=expected_video_dims[args.model],
+        expected_action_dim=32 if latent_enabled else 14,
+        latent_action_config=latent_action_config if latent_enabled else None,
+        expected_fixed_target_encoder=False if args.model == "vjepa" else None,
     )
 
     training_stats = (
@@ -260,6 +356,10 @@ def main() -> None:
     print(f"num_video_frames={num_video_frames}")
     if args.model == "idm":
         print("IDM condition=[z0,pred_z1,pred_z2], inference KV cache=disabled")
+    elif args.model == "vjepa" and latent_enabled:
+        print("V-JEPA predictor + latent ActionDiT=8x32 + physical decoder=32x14")
+    elif args.model == "vjepa":
+        print("V-JEPA predictor conditioning=non-IDM per-frame causal latent sequence")
     else:
         print("XR-1 action conditioning=current clean first-frame latent")
     print("image_pipeline=480x640 -> 240x320 -> RoboTwin 384x320 canvas")

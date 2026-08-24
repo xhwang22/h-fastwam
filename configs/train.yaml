@@ -34,6 +34,8 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+trainable_components: [dit]
+visual_encoder_lr_multiplier: 1.0
 
 # Optional persistent frozen visual-encoder cache. When enabled, training first
 # fills missing BF16 safetensors shards, then bypasses the encoder on every step.

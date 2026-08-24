@@ -9,6 +9,11 @@
 !/src/
 !/third_party/
 !/visualizations/
+!/tests/
+/tests/*
+!/tests/test_latent_action_cache.py
+!/tests/test_latent_action_decoder.py
+!/tests/test_latent_action_pipeline.py
 
 # 忽略所有日志文件
 *.log

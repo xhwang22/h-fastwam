@@ -184,10 +184,17 @@ class WorldActionRobotWinPolicy:
         visual_encoder_type = str(
             model_cfg_copy.get("visual_encoder_config", {}).get("encoder_type", "")
         )
+        video_expert_type = str(model_cfg_copy.get("video_expert_type", ""))
         strict_checkpoint = (
             "HFastWAMIDM" in model_target
             or "HFastWAMFullConditionIDM" in model_target
             or visual_encoder_type == "xr1_vision"
+            or (
+                model_target
+                == "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam"
+                and visual_encoder_type == "vjepa2_1"
+                and video_expert_type == "jepa_predictor"
+            )
         )
         self.model.load_checkpoint(checkpoint_path, strict=strict_checkpoint)
         self.model = self.model.to(device).eval()
