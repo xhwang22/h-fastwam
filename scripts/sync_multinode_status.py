@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Synchronize independent RoboTwin task-shard managers across nodes."""
+"""Synchronize exit status for independent processes across managed nodes."""
 
 from __future__ import annotations
 

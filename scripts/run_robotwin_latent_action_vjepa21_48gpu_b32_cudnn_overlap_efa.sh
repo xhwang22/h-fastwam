@@ -59,6 +59,8 @@ fastwam_prepare_aws_hyperpod_runtime
 mkdir -p "${LATENT_ACTION_CACHE_ROOT}/logs"
 CACHE_TRAIN_PORT="${LATENT_ACTION_CACHE_TRAIN_PORT:-$((MASTER_PORT + 10))}"
 CACHE_VAL_PORT="${LATENT_ACTION_CACHE_VAL_PORT:-$((MASTER_PORT + 11))}"
+CACHE_TRAIN_SYNC_PORT="${LATENT_ACTION_CACHE_TRAIN_SYNC_PORT:-$((MASTER_PORT + 12))}"
+CACHE_VAL_SYNC_PORT="${LATENT_ACTION_CACHE_VAL_SYNC_PORT:-$((MASTER_PORT + 13))}"
 if [[ -z "${PYTHON_BIN:-}" ]]; then
   if command -v python >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python)"
@@ -78,8 +80,12 @@ run_cache_phase() {
   local split="$1"
   local cache_dir="$2"
   local port="$3"
+  local sync_port="$4"
   local log_file="${LATENT_ACTION_CACHE_ROOT}/logs/${split}.rank${NODE_RANK}.log"
   local attempt=0
+  local local_status
+  local sync_status
+  local -a pipeline_status
   local -a normalization_args=()
   if [[ "${split}" == "val" ]]; then
     normalization_args=(
@@ -88,7 +94,8 @@ run_cache_phase() {
   fi
   while true; do
     echo "[latent-cache] split=${split} world=$((NNODES * NPROC_PER_NODE)) cache=${cache_dir} attempt=$((attempt + 1))"
-    if "${PYTHON_BIN}" -m torch.distributed.run \
+    set +e
+    "${PYTHON_BIN}" -m torch.distributed.run \
       --nnodes="${NNODES}" \
       --node_rank="${NODE_RANK}" \
       --nproc_per_node="${NPROC_PER_NODE}" \
@@ -112,9 +119,28 @@ run_cache_phase() {
       "${normalization_args[@]}" \
       "data.train.preprocessed_root=${ROBOTWIN_WEBDATASET_ROOT}" \
       "data.val.preprocessed_root=${ROBOTWIN_WEBDATASET_ROOT}" \
-      2>&1 | tee -a "${log_file}"; then
+      2>&1 | tee -a "${log_file}"
+    pipeline_status=("${PIPESTATUS[@]}")
+    set -e
+    local_status="${pipeline_status[0]}"
+    if (( local_status == 0 && pipeline_status[1] != 0 )); then
+      local_status="${pipeline_status[1]}"
+    fi
+
+    sync_status=0
+    "${PYTHON_BIN}" scripts/sync_multinode_status.py \
+      --phase "latent-cache-${split}-attempt-$((attempt + 1))" \
+      --rank "${NODE_RANK}" \
+      --world-size "${NNODES}" \
+      --master-addr "${MASTER_ADDR}" \
+      --master-port "${sync_port}" \
+      --local-exit-code "${local_status}" \
+      --timeout-seconds "${LATENT_ACTION_CACHE_SYNC_TIMEOUT_SECONDS:-3600}" \
+      || sync_status=$?
+    if (( sync_status == 0 )); then
       return
     fi
+    echo "[latent-cache] split=${split} attempt=$((attempt + 1)) failed on one or more nodes; synchronized retry."
     if (( attempt >= LATENT_ACTION_CACHE_MAX_RETRIES )); then
       echo "[latent-cache] ERROR: split=${split} failed after $((attempt + 1)) attempts." >&2
       return 1
@@ -125,8 +151,16 @@ run_cache_phase() {
   done
 }
 
-run_cache_phase train "${LATENT_ACTION_TRAIN_CACHE_DIR}" "${CACHE_TRAIN_PORT}"
-run_cache_phase val "${LATENT_ACTION_VAL_CACHE_DIR}" "${CACHE_VAL_PORT}"
+run_cache_phase \
+  train \
+  "${LATENT_ACTION_TRAIN_CACHE_DIR}" \
+  "${CACHE_TRAIN_PORT}" \
+  "${CACHE_TRAIN_SYNC_PORT}"
+run_cache_phase \
+  val \
+  "${LATENT_ACTION_VAL_CACHE_DIR}" \
+  "${CACHE_VAL_PORT}" \
+  "${CACHE_VAL_SYNC_PORT}"
 test -f "${LATENT_ACTION_TRAIN_CACHE_DIR}/manifest.json"
 test -f "${LATENT_ACTION_VAL_CACHE_DIR}/manifest.json"
 

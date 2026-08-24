@@ -191,7 +191,7 @@ if (( MANAGED_LAUNCH == 1 )); then
     PREPARE_STATUS=$?
     set -e
   fi
-  "${SYNC_PYTHON}" scripts/sync_robotwin_eval_nodes.py \
+  "${SYNC_PYTHON}" scripts/sync_multinode_status.py \
     --phase prepare \
     --rank "${NODE_INDEX}" \
     --world-size "${NODE_COUNT}" \
@@ -210,7 +210,7 @@ if (( MANAGED_LAUNCH == 1 )); then
   LOCAL_STATUS=$?
   set -e
 
-  "${SYNC_PYTHON}" scripts/sync_robotwin_eval_nodes.py \
+  "${SYNC_PYTHON}" scripts/sync_multinode_status.py \
     --phase evaluation \
     --rank "${NODE_INDEX}" \
     --world-size "${NODE_COUNT}" \
