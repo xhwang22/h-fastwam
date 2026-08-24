@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -366,6 +367,7 @@ def main() -> None:
             cache_signature = {
                 "format": CACHE_FORMAT,
                 "version": CACHE_VERSION,
+                "target_contract": "dreamdojo_adjacent_pair_z_mu_32d_v1",
                 "split": args.split,
                 "dataset_length": dataset_length,
                 "shard_size": args.shard_size,
@@ -390,6 +392,13 @@ def main() -> None:
                 "dataset_index_fingerprint": _dataset_index_fingerprint(dataset),
                 "data_config": data_cfg,
                 "implementation_sha256": _sha256(Path(__file__).resolve()),
+                "encoder_implementation_sha256": _sha256(
+                    Path(
+                        inspect.unwrap(
+                            encode_dreamdojo_latent_actions
+                        ).__code__.co_filename
+                    ).resolve()
+                ),
                 "normalization_stats_cache": (
                     None
                     if args.normalization_stats_cache is None
@@ -410,6 +419,22 @@ def main() -> None:
                     )
                 ),
             }
+            nonsemantic_fields = {
+                "implementation_sha256",
+                "encoder_implementation_sha256",
+            }
+
+            def mismatched_signature_fields(existing: dict) -> list[str]:
+                mismatched = []
+                for key, value in cache_signature.items():
+                    if key in nonsemantic_fields:
+                        continue
+                    if key == "target_contract" and key not in existing:
+                        continue
+                    if existing.get(key) != value:
+                        mismatched.append(key)
+                return mismatched
+
             if manifest_path.is_file():
                 existing_manifest = load_latent_action_cache_manifest(
                     cache_dir,
@@ -417,11 +442,9 @@ def main() -> None:
                     expected_horizon=32,
                     expected_dim=32,
                 )
-                mismatched_fields = [
-                    key
-                    for key, value in cache_signature.items()
-                    if existing_manifest.get(key) != value
-                ]
+                mismatched_fields = mismatched_signature_fields(
+                    existing_manifest
+                )
                 if mismatched_fields:
                     raise ValueError(
                         "Complete latent-action cache does not match the "
@@ -456,11 +479,15 @@ def main() -> None:
                         encoding="utf-8",
                     ) as handle:
                         existing_signature = json.load(handle)
-                    if existing_signature != cache_signature:
+                    mismatched_fields = mismatched_signature_fields(
+                        existing_signature
+                    )
+                    if mismatched_fields:
                         raise ValueError(
                             "Existing partial latent-action cache was produced "
                             "by a different checkpoint, dataset, configuration, "
-                            f"or implementation: {partial_manifest_path}"
+                            "or target contract; mismatched fields="
+                            f"{mismatched_fields}: {partial_manifest_path}"
                         )
                 else:
                     _atomic_json_dump(cache_signature, partial_manifest_path)
@@ -523,6 +550,8 @@ def main() -> None:
         loader_kwargs["multiprocessing_context"] = (
             args.multiprocessing_context
         )
+        if "in_order" in inspect.signature(DataLoader).parameters:
+            loader_kwargs["in_order"] = False
     extraction_loader = DataLoader(extraction_dataset, **loader_kwargs)
     sample_iterator = tqdm(
         extraction_loader,
@@ -533,8 +562,8 @@ def main() -> None:
         initial=0,
         unit="batch",
     )
-    current_shard_id = None
-    tensors = {}
+    shard_buffers: dict[int, dict[str, torch.Tensor]] = {}
+    shard_sample_counts: dict[int, int] = {}
 
     def flush_shard(shard_id: int, shard_tensors: dict) -> None:
         first = shard_id * args.shard_size
@@ -566,18 +595,28 @@ def main() -> None:
         for offset, index_tensor in enumerate(batch_indices):
             index = int(index_tensor.item())
             shard_id = index // args.shard_size
-            if current_shard_id is None:
-                current_shard_id = shard_id
-            elif shard_id != current_shard_id:
-                flush_shard(current_shard_id, tensors)
-                tensors = {}
-                current_shard_id = shard_id
+            tensors = shard_buffers.setdefault(shard_id, {})
             tensors[latent_action_tensor_key(index)] = latent_actions[
                 offset
             ].to(dtype=output_dtype)
             tensors[f"valid_{index:012d}"] = valid_masks[offset]
-    if current_shard_id is not None:
-        flush_shard(current_shard_id, tensors)
+            shard_sample_counts[shard_id] = (
+                shard_sample_counts.get(shard_id, 0) + 1
+            )
+            first = shard_id * args.shard_size
+            expected_count = min(
+                first + args.shard_size,
+                dataset_length,
+            ) - first
+            if shard_sample_counts[shard_id] == expected_count:
+                flush_shard(shard_id, tensors)
+                del shard_buffers[shard_id]
+                del shard_sample_counts[shard_id]
+    if shard_buffers:
+        raise RuntimeError(
+            "DataLoader ended with incomplete latent-action shard buffers: "
+            f"{sorted(shard_buffers)}."
+        )
 
     if dist.is_initialized():
         dist.barrier()

@@ -151,6 +151,29 @@ def test_online_dreamdojo_encoding_preserves_transition_order():
     )
 
 
+def test_checkpoint_provenance_accepts_legacy_v1_target_contract():
+    provenance = {
+        "checkpoint_sha256": "checkpoint",
+        "target_contract": "dreamdojo_adjacent_pair_z_mu_32d_v1",
+    }
+    owner = type(
+        "ProvenanceOwner",
+        (),
+        {"dreamdojo_provenance": provenance},
+    )()
+    metadata = {
+        "video_target_representation": "dreamdojo_latent_action",
+        "dreamdojo_target": {"checkpoint_sha256": "checkpoint"},
+    }
+
+    HFastWAMLatentAction._validate_checkpoint_metadata(
+        owner,
+        metadata,
+        strict=True,
+        path="legacy.pt",
+    )
+
+
 class _FakeVisualEncoder(BaseVisualEncoder):
     def __init__(self):
         super().__init__()

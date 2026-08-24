@@ -194,6 +194,10 @@ class HFastWAMLatentAction(HFastWAM):
             "source_revision": manifest.get("dreamdojo_source_revision"),
             "source_sha256": manifest["dreamdojo_source_sha256"],
             "implementation_sha256": manifest["implementation_sha256"],
+            "target_contract": manifest.get(
+                "target_contract",
+                "dreamdojo_adjacent_pair_z_mu_32d_v1",
+            ),
             "dataset_manifest_sha256": manifest["dataset_manifest_sha256"],
             "dataset_index_fingerprint": manifest[
                 "dataset_index_fingerprint"
@@ -230,6 +234,16 @@ class HFastWAMLatentAction(HFastWAM):
                 f"targets: {path}"
             )
         actual = metadata.get("dreamdojo_target")
+        if (
+            isinstance(actual, dict)
+            and "target_contract" not in actual
+            and self.dreamdojo_provenance.get("target_contract")
+            == "dreamdojo_adjacent_pair_z_mu_32d_v1"
+        ):
+            actual = dict(actual)
+            actual["target_contract"] = (
+                "dreamdojo_adjacent_pair_z_mu_32d_v1"
+            )
         if actual != self.dreamdojo_provenance:
             raise ValueError(
                 "DreamDojo target provenance mismatch while resuming: "

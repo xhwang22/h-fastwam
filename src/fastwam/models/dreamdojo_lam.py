@@ -5,11 +5,29 @@ import hashlib
 import os
 import subprocess
 import sys
+import types
 from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+
+def _dreamdojo_sdpa(
+    self,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=self.scale,
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -184,6 +202,23 @@ def load_dreamdojo_lam(
     del model.patch_up
     del model.action_up
     del model.decoder
+    patched_attention_layers = 0
+    for module in model.modules():
+        if (
+            module.__class__.__name__ == "SelfAttention"
+            and hasattr(module, "scaled_dot_product_attention")
+            and hasattr(module, "scale")
+        ):
+            module.scaled_dot_product_attention = types.MethodType(
+                _dreamdojo_sdpa,
+                module,
+            )
+            patched_attention_layers += 1
+    if patched_attention_layers == 0:
+        raise RuntimeError(
+            "DreamDojo LAM contains no compatible SelfAttention layers for "
+            "the optimized SDPA path."
+        )
     model.eval()
     model.requires_grad_(False)
     return model.to(device=device, dtype=dtype)
