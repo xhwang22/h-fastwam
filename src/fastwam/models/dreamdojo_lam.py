@@ -197,6 +197,7 @@ def encode_dreamdojo_latent_actions(
     pair_batch_size: int,
     device: torch.device,
     model_dtype: torch.dtype = torch.bfloat16,
+    preprocess_all_frames: bool = False,
 ) -> torch.Tensor:
     if not torch.is_tensor(video) or video.ndim != 5:
         raise ValueError(
@@ -216,27 +217,12 @@ def encode_dreamdojo_latent_actions(
     batch_size = int(video.shape[0])
     num_transitions = 32
     num_pairs = batch_size * num_transitions
-    outputs = []
-    for start in range(0, num_pairs, pair_batch_size):
-        stop = min(start + pair_batch_size, num_pairs)
-        pair_indices = torch.arange(start, stop, device=video.device)
-        batch_indices = torch.div(
-            pair_indices,
-            num_transitions,
-            rounding_mode="floor",
-        )
-        transition_indices = pair_indices.remainder(num_transitions)
-        pair_frames = torch.stack(
-            (
-                video[batch_indices, :, transition_indices],
-                video[batch_indices, :, transition_indices + 1],
-            ),
-            dim=1,
-        )
-        pair_count = int(pair_frames.shape[0])
-        frames = pair_frames.flatten(0, 1).to(
-            device=device,
-            dtype=torch.float32,
+    frames = None
+    if preprocess_all_frames:
+        frames = (
+            video.permute(0, 2, 1, 3, 4)
+            .flatten(0, 1)
+            .to(device=device, dtype=torch.float32, non_blocking=True)
         )
         frames = F.interpolate(
             frames.clamp(-1.0, 1.0),
@@ -245,13 +231,61 @@ def encode_dreamdojo_latent_actions(
             align_corners=False,
             antialias=True,
         )
-        pair_batch = (
+        frames = (
             ((frames + 1.0) * 0.5)
-            .reshape(pair_count, 2, 3, 240, 320)
+            .to(dtype=model_dtype)
+            .reshape(batch_size, 33, 3, 240, 320)
             .permute(0, 1, 3, 4, 2)
             .contiguous()
-            .to(dtype=model_dtype)
         )
+    outputs = []
+    for start in range(0, num_pairs, pair_batch_size):
+        stop = min(start + pair_batch_size, num_pairs)
+        index_device = device if frames is not None else video.device
+        pair_indices = torch.arange(start, stop, device=index_device)
+        batch_indices = torch.div(
+            pair_indices,
+            num_transitions,
+            rounding_mode="floor",
+        )
+        transition_indices = pair_indices.remainder(num_transitions)
+        if frames is not None:
+            pair_frames = torch.stack(
+                (
+                    frames[batch_indices, transition_indices],
+                    frames[batch_indices, transition_indices + 1],
+                ),
+                dim=1,
+            )
+        else:
+            raw_pair_frames = torch.stack(
+                (
+                    video[batch_indices, :, transition_indices],
+                    video[batch_indices, :, transition_indices + 1],
+                ),
+                dim=1,
+            )
+            pair_count = int(raw_pair_frames.shape[0])
+            resized = F.interpolate(
+                raw_pair_frames.flatten(0, 1)
+                .to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                .clamp(-1.0, 1.0),
+                size=(240, 320),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            )
+            pair_frames = (
+                ((resized + 1.0) * 0.5)
+                .reshape(pair_count, 2, 3, 240, 320)
+                .permute(0, 1, 3, 4, 2)
+                .contiguous()
+                .to(dtype=model_dtype)
+            )
         autocast_context = (
             torch.autocast(device_type="cuda", dtype=model_dtype)
             if device.type == "cuda"
@@ -259,7 +293,7 @@ def encode_dreamdojo_latent_actions(
             else nullcontext()
         )
         with autocast_context:
-            encoded = model.encode(pair_batch)
+            encoded = model.encode(pair_frames)
         z_rep = encoded.get("z_rep")
         if not torch.is_tensor(z_rep) or z_rep.shape[1:] != (1, 1, 32):
             raise ValueError(

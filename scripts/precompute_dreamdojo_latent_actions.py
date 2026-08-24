@@ -16,6 +16,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from torch.utils.data import DataLoader, Dataset
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
@@ -61,6 +62,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-size", type=int, default=128)
     parser.add_argument("--pair-batch-size", type=int, default=32)
     parser.add_argument("--sample-batch-size", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--multiprocessing-context",
+        choices=("forkserver", "spawn"),
+        default="spawn",
+    )
     parser.add_argument(
         "--cache-dtype",
         choices=("float32", "float16", "bfloat16"),
@@ -186,6 +194,23 @@ def _extract_full_video(
     return video, ~action_is_pad.to(dtype=torch.bool)
 
 
+class _VideoExtractionDataset(Dataset):
+    def __init__(self, dataset, indices: list[int]):
+        self.dataset = dataset
+        self.indices = indices
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(
+        self,
+        position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        index = self.indices[position]
+        video, valid = _extract_full_video(self.dataset, index)
+        return torch.tensor(index, dtype=torch.long), video, valid
+
+
 def _cache_dtype(name: str) -> torch.dtype:
     return {
         "float32": torch.float32,
@@ -269,10 +294,13 @@ def main() -> None:
         args.shard_size <= 0
         or args.pair_batch_size <= 0
         or args.sample_batch_size <= 0
+        or args.num_workers < 0
+        or args.prefetch_factor <= 0
     ):
         raise ValueError(
-            "shard-size, pair-batch-size, and sample-batch-size must be "
-            "positive."
+            "shard-size, pair-batch-size, sample-batch-size, and "
+            "prefetch-factor must be positive; num-workers must be "
+            "non-negative."
         )
     if args.split == "val" and args.normalization_stats_cache is None:
         raise ValueError(
@@ -470,55 +498,50 @@ def main() -> None:
     )
     output_dtype = _cache_dtype(args.cache_dtype)
     assigned_shards = range(rank, num_shards, world_size)
-    shard_iterator = tqdm(
-        assigned_shards,
-        desc=f"{args.split} cache rank0/{world_size}",
-        unit="shard",
-        dynamic_ncols=True,
-        disable=rank != 0,
-    )
-    for shard_id in shard_iterator:
+    pending_indices = []
+    for shard_id in assigned_shards:
         first = shard_id * args.shard_size
         last = min(first + args.shard_size, dataset_length)
-        shard_path = latent_action_shard_path(cache_dir, shard_id)
         if _valid_existing_shard(
-            shard_path,
+            latent_action_shard_path(cache_dir, shard_id),
             first_index=first,
             last_index=last,
         ):
-            if rank != 0:
-                print(
-                    f"[rank {rank}] keeping complete shard "
-                    f"{shard_id}/{num_shards}"
-                )
             continue
-        tensors = {}
-        for batch_first in range(first, last, args.sample_batch_size):
-            batch_last = min(
-                batch_first + args.sample_batch_size,
-                last,
-            )
-            batch_indices = list(range(batch_first, batch_last))
-            videos = []
-            valid_masks = []
-            for index in batch_indices:
-                video, valid = _extract_full_video(dataset, index)
-                videos.append(video)
-                valid_masks.append(valid)
-            latent_actions = encode_dreamdojo_latent_actions(
-                model,
-                torch.stack(videos, dim=0),
-                pair_batch_size=args.pair_batch_size,
-                device=device,
-            ).cpu()
-            for offset, index in enumerate(batch_indices):
-                tensors[latent_action_tensor_key(index)] = latent_actions[
-                    offset
-                ].to(dtype=output_dtype)
-                tensors[f"valid_{index:012d}"] = valid_masks[offset]
+        pending_indices.extend(range(first, last))
+
+    extraction_dataset = _VideoExtractionDataset(dataset, pending_indices)
+    loader_kwargs = {
+        "batch_size": args.sample_batch_size,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": args.num_workers > 0,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        loader_kwargs["multiprocessing_context"] = (
+            args.multiprocessing_context
+        )
+    extraction_loader = DataLoader(extraction_dataset, **loader_kwargs)
+    sample_iterator = tqdm(
+        extraction_loader,
+        desc=f"{args.split} cache rank0/{world_size}",
+        total=math.ceil(len(pending_indices) / args.sample_batch_size),
+        dynamic_ncols=True,
+        disable=rank != 0,
+        initial=0,
+        unit="batch",
+    )
+    current_shard_id = None
+    tensors = {}
+
+    def flush_shard(shard_id: int, shard_tensors: dict) -> None:
+        first = shard_id * args.shard_size
+        last = min(first + args.shard_size, dataset_length)
         _write_shard(
-            shard_path,
-            tensors,
+            latent_action_shard_path(cache_dir, shard_id),
+            shard_tensors,
             metadata={
                 "format": CACHE_FORMAT,
                 "version": str(CACHE_VERSION),
@@ -531,6 +554,30 @@ def main() -> None:
                 f"[rank {rank}] wrote shard {shard_id + 1}/{num_shards} "
                 f"samples=[{first},{last})"
             )
+
+    for batch_indices, videos, valid_masks in sample_iterator:
+        latent_actions = encode_dreamdojo_latent_actions(
+            model,
+            videos,
+            pair_batch_size=args.pair_batch_size,
+            device=device,
+            preprocess_all_frames=True,
+        ).cpu()
+        for offset, index_tensor in enumerate(batch_indices):
+            index = int(index_tensor.item())
+            shard_id = index // args.shard_size
+            if current_shard_id is None:
+                current_shard_id = shard_id
+            elif shard_id != current_shard_id:
+                flush_shard(current_shard_id, tensors)
+                tensors = {}
+                current_shard_id = shard_id
+            tensors[latent_action_tensor_key(index)] = latent_actions[
+                offset
+            ].to(dtype=output_dtype)
+            tensors[f"valid_{index:012d}"] = valid_masks[offset]
+    if current_shard_id is not None:
+        flush_shard(current_shard_id, tensors)
 
     if dist.is_initialized():
         dist.barrier()

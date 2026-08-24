@@ -132,11 +132,23 @@ def test_online_dreamdojo_encoding_preserves_transition_order():
         device=torch.device("cpu"),
         model_dtype=torch.float32,
     )
+    preprocessed_latent_actions = encode_dreamdojo_latent_actions(
+        _FakeDreamDojo(),
+        video,
+        pair_batch_size=13,
+        device=torch.device("cpu"),
+        model_dtype=torch.float32,
+        preprocess_all_frames=True,
+    )
 
     assert latent_actions.shape == (2, 32, 32)
     expected_delta = ((frame_values[1:] - frame_values[:-1]) * 0.5)
     torch.testing.assert_close(latent_actions[0, :, 0], expected_delta)
     torch.testing.assert_close(latent_actions[1], latent_actions[0])
+    torch.testing.assert_close(
+        preprocessed_latent_actions,
+        latent_actions,
+    )
 
 
 class _FakeVisualEncoder(BaseVisualEncoder):
