@@ -20,6 +20,22 @@ def _dreamdojo_sdpa(
     value: torch.Tensor,
     is_causal: bool = False,
 ) -> torch.Tensor:
+    if query.shape[-2] == 2 and key.shape[-2] == 2:
+        # Pairwise temporal attention has pair_count * 300 leading batches,
+        # which exceeds the fused CUDA kernel grid at large cache batches.
+        attention = query @ key.transpose(-2, -1) * self.scale
+        if is_causal:
+            causal_mask = torch.ones(
+                2,
+                2,
+                dtype=torch.bool,
+                device=query.device,
+            ).tril()
+            attention.masked_fill_(
+                causal_mask.logical_not(),
+                float("-inf"),
+            )
+        return torch.softmax(attention, dim=-1) @ value
     return F.scaled_dot_product_attention(
         query,
         key,

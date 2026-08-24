@@ -4,7 +4,10 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file
 
-from fastwam.models.dreamdojo_lam import encode_dreamdojo_latent_actions
+from fastwam.models.dreamdojo_lam import (
+    _dreamdojo_sdpa,
+    encode_dreamdojo_latent_actions,
+)
 from fastwam.models.hfastwam.hfastwam import HFastWAM
 from fastwam.models.hfastwam.hfastwam_latent_action import HFastWAMLatentAction
 from fastwam.models.hfastwam.language_expert import LanguageExpert
@@ -120,6 +123,38 @@ class _FakeDreamDojo(nn.Module):
         delta = pairs[:, 1].mean(dim=(1, 2, 3))
         delta = delta - pairs[:, 0].mean(dim=(1, 2, 3))
         return {"z_rep": delta[:, None, None, None].expand(-1, 1, 1, 32)}
+
+
+def test_dreamdojo_pairwise_temporal_attention_avoids_fused_sdpa(
+    monkeypatch,
+):
+    def fail_fused_sdpa(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError(
+            "Fused SDPA must not handle pairwise temporal attention."
+        )
+
+    monkeypatch.setattr(
+        "fastwam.models.dreamdojo_lam.F.scaled_dot_product_attention",
+        fail_fused_sdpa,
+    )
+    owner = type("AttentionOwner", (), {"scale": 0.5})()
+    query = torch.randn(4, 2, 2, 8)
+    key = torch.randn(4, 2, 2, 8)
+    value = torch.randn(4, 2, 2, 8)
+
+    actual = _dreamdojo_sdpa(
+        owner,
+        query,
+        key,
+        value,
+        is_causal=True,
+    )
+    scores = query @ key.transpose(-2, -1) * owner.scale
+    scores[..., 0, 1] = float("-inf")
+    expected = torch.softmax(scores, dim=-1) @ value
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_online_dreamdojo_encoding_preserves_transition_order():
