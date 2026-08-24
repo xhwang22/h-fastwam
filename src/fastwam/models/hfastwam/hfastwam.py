@@ -76,6 +76,7 @@ from PIL import Image
 
 from fastwam.models.wan22.action_dit import ActionDiT
 from fastwam.models.wan22.jepa_predictor import JEPAPredictor
+from fastwam.models.wan22.latent_action_dit import LatentActionDiT
 from fastwam.models.wan22.helpers.loader import load_wan22_ti2v_5b_components
 from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -2808,8 +2809,7 @@ class HFastWAM(nn.Module):
         action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
         skip_video_dit_load_from_pretrain: bool = False,
-        # 'wan_dit' (default) or 'jepa_predictor' — selects which class
-        # instantiates the video expert.
+        # Selects the module registered as the MoT video expert.
         video_expert_type: str = "wan_dit",
         mot_checkpoint_mixed_attn: bool = True,
         visual_encoder_config: dict | None = None,
@@ -2892,16 +2892,24 @@ class HFastWAM(nn.Module):
 
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required.")
-        if "text_dim" not in video_dit_config:
-            raise ValueError("`video_dit_config['text_dim']` is required.")
 
         # Normalise and validate video_expert_type.
         _video_expert_type = str(video_expert_type).lower()
-        if _video_expert_type not in ("wan_dit", "jepa_predictor"):
+        if _video_expert_type not in (
+            "wan_dit",
+            "jepa_predictor",
+            "latent_action_dit",
+        ):
             raise ValueError(
-                f"video_expert_type must be 'wan_dit' or 'jepa_predictor', "
+                "video_expert_type must be one of "
+                "{'wan_dit','jepa_predictor','latent_action_dit'}, "
                 f"got {video_expert_type!r}"
             )
+        if (
+            _video_expert_type != "latent_action_dit"
+            and "text_dim" not in video_dit_config
+        ):
+            raise ValueError("`video_dit_config['text_dim']` is required.")
 
         # Visual encoder (DINO/Qwen3-VL/V-JEPA) for video expert (optional)
         dino_visual_encoder = None
@@ -2912,19 +2920,31 @@ class HFastWAM(nn.Module):
                 encoder_type=encoder_type, torch_dtype=torch_dtype, **ve_cfg,
             ).to(device=device)
             encoder_dim = int(dino_visual_encoder.z_dim)
-            video_in_dim = int(video_dit_config.get("in_dim", -1))
-            video_out_dim = int(video_dit_config.get("out_dim", -1))
-            if video_in_dim != encoder_dim or video_out_dim != encoder_dim:
-                raise ValueError(
-                    "Visual encoder and video expert dimensions must match: "
-                    f"encoder={encoder_dim}, in_dim={video_in_dim}, out_dim={video_out_dim}."
-                )
+            if _video_expert_type == "latent_action_dit":
+                context_dim = int(video_dit_config.get("context_dim", -1))
+                if context_dim != encoder_dim:
+                    raise ValueError(
+                        "Visual encoder and latent-action context dimensions "
+                        f"must match: encoder={encoder_dim}, context_dim={context_dim}."
+                    )
+            else:
+                video_in_dim = int(video_dit_config.get("in_dim", -1))
+                video_out_dim = int(video_dit_config.get("out_dim", -1))
+                if video_in_dim != encoder_dim or video_out_dim != encoder_dim:
+                    raise ValueError(
+                        "Visual encoder and video expert dimensions must match: "
+                        f"encoder={encoder_dim}, in_dim={video_in_dim}, "
+                        f"out_dim={video_out_dim}."
+                    )
 
         # Wan2.2 components (VAE + tokenizer; Wan DiT only for wan_dit path).
-        # When video_expert_type='jepa_predictor', pass skip_dit_build=True so
+        # Non-WAN experts pass skip_dit_build=True so
         # load_wan22_ti2v_5b_components skips both WAN DiT construction AND the
-        # WAN-specific _validate_dit_config (which would reject JEPA-only keys).
-        _skip_dit_build = (_video_expert_type == "jepa_predictor")
+        # WAN-specific _validate_dit_config.
+        _skip_dit_build = _video_expert_type in {
+            "jepa_predictor",
+            "latent_action_dit",
+        }
         components = load_wan22_ti2v_5b_components(
             device=device, torch_dtype=torch_dtype,
             model_id=model_id, tokenizer_model_id=tokenizer_model_id,
@@ -2952,6 +2972,44 @@ class HFastWAM(nn.Module):
                 sorted(jepa_cfg),
             )
             video_expert = JEPAPredictor(**jepa_cfg).to(device=device, dtype=torch_dtype)
+        elif _video_expert_type == "latent_action_dit":
+            _LATENT_ACTION_KEYS = {
+                "hidden_dim",
+                "latent_dim",
+                "latent_horizon",
+                "ffn_dim",
+                "context_dim",
+                "context_spatial_pool",
+                "freq_dim",
+                "eps",
+                "num_heads",
+                "attn_head_dim",
+                "num_layers",
+                "use_gradient_checkpointing",
+            }
+            latent_action_cfg = {
+                key: value
+                for key, value in video_dit_config.items()
+                if key in _LATENT_ACTION_KEYS
+            }
+            missing = sorted(
+                _LATENT_ACTION_KEYS
+                - {"use_gradient_checkpointing"}
+                - set(latent_action_cfg)
+            )
+            if missing:
+                raise ValueError(
+                    "LatentActionDiT config is missing required keys: "
+                    f"{missing}."
+                )
+            logger.info(
+                "Building LatentActionDiT from video_dit_config (keys: %s).",
+                sorted(latent_action_cfg),
+            )
+            video_expert = LatentActionDiT(**latent_action_cfg).to(
+                device=device,
+                dtype=torch_dtype,
+            )
         else:
             video_expert = components.dit
 
@@ -3060,7 +3118,14 @@ class HFastWAM(nn.Module):
             language_tokenizer=language_tokenizer,
             language_backend=language_backend,
             language_pad_to_max_length=language_pad_to_max_length,
-            text_dim=int(video_dit_config["text_dim"]),
+            text_dim=int(
+                action_dit_config.get(
+                    "text_dim",
+                    video_dit_config.get("text_dim", 4096),
+                )
+                if _video_expert_type == "latent_action_dit"
+                else video_dit_config["text_dim"]
+            ),
             proprio_dim=proprio_dim,
             device=device,
             torch_dtype=torch_dtype,
@@ -3094,18 +3159,69 @@ class HFastWAM(nn.Module):
             video_loss_type="l1" if _video_expert_type == "jepa_predictor" else "flow_matching",
         )
 
-        # Optional: resume video expert from a fastwam pretrain ckpt.
+        # Optional initialization from an existing FastWAM/H-FastWAM checkpoint.
         ckpt_path = fastwam_checkpoint or pretrain_checkpoint
         if ckpt_path is not None:
             logger.info("Loading fastwam pretrain checkpoint: %s", ckpt_path)
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if "mot" in ckpt:
-                missing, unexpected = model.mot.load_state_dict(ckpt["mot"], strict=False)
-                logger.info(
-                    "Merged fastwam MoT into 3-expert MoT (missing=%d, unexpected=%d).",
-                    len(missing), len(unexpected),
-                )
+                if _video_expert_type == "latent_action_dit":
+                    current_mot = model.mot.state_dict()
+                    source_mot = ckpt["mot"]
+                    action_prefix = "mixtures.action."
+                    expected_action_keys = {
+                        key for key in current_mot if key.startswith(action_prefix)
+                    }
+                    compatible = {
+                        key: value
+                        for key, value in source_mot.items()
+                        if not key.startswith("mixtures.video.")
+                        and key in current_mot
+                        and tuple(value.shape) == tuple(current_mot[key].shape)
+                    }
+                    loaded_action_keys = {
+                        key for key in compatible if key.startswith(action_prefix)
+                    }
+                    missing_action_keys = sorted(
+                        expected_action_keys - loaded_action_keys
+                    )
+                    if missing_action_keys:
+                        raise ValueError(
+                            "Latent-action initialization requires a complete, "
+                            "shape-compatible ActionDiT in the source MoT; "
+                            f"missing={missing_action_keys[:20]}."
+                        )
+                    missing, unexpected = model.mot.load_state_dict(
+                        compatible,
+                        strict=False,
+                    )
+                    logger.info(
+                        "Loaded latent-action initialization without the old "
+                        "video expert: compatible=%d action=%d missing=%d "
+                        "unexpected=%d.",
+                        len(compatible),
+                        len(loaded_action_keys),
+                        len(missing),
+                        len(unexpected),
+                    )
+                else:
+                    missing, unexpected = model.mot.load_state_dict(
+                        ckpt["mot"],
+                        strict=False,
+                    )
+                    logger.info(
+                        "Merged fastwam MoT into 3-expert MoT "
+                        "(missing=%d, unexpected=%d).",
+                        len(missing),
+                        len(unexpected),
+                    )
             elif "dit" in ckpt:
+                if _video_expert_type == "latent_action_dit":
+                    raise ValueError(
+                        "A legacy video-only `dit` checkpoint cannot initialize "
+                        "HFastWAMLatentAction. Provide an H-FastWAM checkpoint "
+                        "with `mot` or set action_dit_pretrained_path."
+                    )
                 missing, unexpected = model.video_expert.load_state_dict(ckpt["dit"], strict=False)
                 logger.info(
                     "Loaded legacy DiT into video_expert (missing=%d, unexpected=%d).",

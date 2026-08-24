@@ -1,5 +1,7 @@
 import hashlib
+import json
 import os
+from pathlib import Path
 from typing import Optional
 import time
 import numpy as np
@@ -20,6 +22,11 @@ from fastwam.utils.video_latent_cache import (
     VideoLatentCacheError,
     load_video_latent,
     load_video_latent_cache_manifest,
+)
+from fastwam.utils.latent_action_cache import (
+    LatentActionCacheError,
+    load_latent_action,
+    load_latent_action_cache_manifest,
 )
 from accelerate import PartialState
 logger = get_logger(__name__)
@@ -78,8 +85,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         video_latent_cache_dir: Optional[str] = None,
         drop_video_when_cached: bool = False,
+        latent_action_cache_dir: Optional[str] = None,
+        normalize_latent_actions: bool = True,
     ):
         self.num_frames = int(num_frames)
+        self.is_training_set = bool(is_training_set)
         self.action_video_freq_ratio = int(action_video_freq_ratio)
         if (self.num_frames - 1) % self.action_video_freq_ratio != 0:
             raise ValueError(
@@ -120,6 +130,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.video_latent_cache_dir = None
         self.video_latent_cache_manifest = None
         self.drop_video_when_cached = bool(drop_video_when_cached)
+        self.latent_action_cache_dir = None
+        self.latent_action_cache_manifest = None
+        self.normalize_latent_actions = bool(normalize_latent_actions)
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -169,6 +182,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 cache_dir=video_latent_cache_dir,
                 expected_length=len(self),
                 drop_video=self.drop_video_when_cached,
+            )
+        if latent_action_cache_dir is not None:
+            self.set_latent_action_cache(
+                cache_dir=latent_action_cache_dir,
+                expected_length=len(self),
             )
         
     def __len__(self):
@@ -221,6 +239,103 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         )
         return self
 
+    def set_latent_action_cache(
+        self,
+        *,
+        cache_dir: str | os.PathLike,
+        expected_length: Optional[int] = None,
+    ):
+        expected_length = len(self) if expected_length is None else int(expected_length)
+        manifest = load_latent_action_cache_manifest(
+            cache_dir,
+            expected_length=expected_length,
+            expected_horizon=self.num_frames - 1,
+            expected_dim=32,
+        )
+        expected_dataset_hash = manifest.get("dataset_manifest_sha256")
+        preprocessed_root = getattr(self, "preprocessed_root", None)
+        if expected_dataset_hash and preprocessed_root is not None:
+            dataset_manifest = Path(preprocessed_root) / "manifest.json"
+            if not dataset_manifest.is_file():
+                raise FileNotFoundError(
+                    f"Dataset manifest not found: {dataset_manifest}"
+                )
+            digest = hashlib.sha256()
+            with dataset_manifest.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual_dataset_hash = digest.hexdigest()
+            if actual_dataset_hash != expected_dataset_hash:
+                raise ValueError(
+                    "Latent-action cache was generated from a different "
+                    f"dataset manifest: cache={expected_dataset_hash}, "
+                    f"current={actual_dataset_hash}."
+                )
+        expected_index_fingerprint = manifest.get("dataset_index_fingerprint")
+        selected_episode_ids = getattr(self, "selected_episode_ids", None)
+        if expected_index_fingerprint and selected_episode_ids is not None:
+            index_payload = json.dumps(
+                [int(value) for value in selected_episode_ids],
+                separators=(",", ":"),
+            ).encode("utf-8")
+            actual_index_fingerprint = hashlib.sha256(index_payload).hexdigest()
+            if actual_index_fingerprint != expected_index_fingerprint:
+                raise ValueError(
+                    "Latent-action cache split/index mapping does not match "
+                    "the current dataset seed and split."
+                )
+        if not self.is_training_set:
+            train_cache_dir = os.environ.get("LATENT_ACTION_TRAIN_CACHE_DIR")
+            normalization_source = manifest.get("normalization_stats_cache")
+            if train_cache_dir is not None:
+                expected_source = os.path.realpath(
+                    os.path.expanduser(train_cache_dir)
+                )
+                actual_source = (
+                    None
+                    if normalization_source is None
+                    else os.path.realpath(os.path.expanduser(normalization_source))
+                )
+                if actual_source != expected_source:
+                    raise ValueError(
+                        "Validation latent actions must use training-cache "
+                        "normalization statistics: "
+                        f"expected={expected_source}, got={actual_source}."
+                    )
+                expected_stats_hash = manifest.get(
+                    "normalization_stats_manifest_sha256"
+                )
+                if expected_stats_hash is not None:
+                    source_manifest = (
+                        Path(expected_source) / "manifest.json"
+                    )
+                    digest = hashlib.sha256()
+                    with source_manifest.open("rb") as handle:
+                        for chunk in iter(
+                            lambda: handle.read(1024 * 1024),
+                            b"",
+                        ):
+                            digest.update(chunk)
+                    if digest.hexdigest() != expected_stats_hash:
+                        raise ValueError(
+                            "Training-cache normalization manifest changed "
+                            "after the validation cache was generated."
+                        )
+        self.latent_action_cache_dir = os.path.realpath(
+            os.path.expanduser(str(cache_dir))
+        )
+        self.latent_action_cache_manifest = manifest
+        logger.info(
+            "Configured DreamDojo latent-action cache: dir=%s length=%d "
+            "shape=[%d,%d] normalize=%s",
+            self.latent_action_cache_dir,
+            expected_length,
+            int(manifest["latent_horizon"]),
+            int(manifest["latent_dim"]),
+            self.normalize_latent_actions,
+        )
+        return self
+
     def _get(self, idx):
         sample_idx = idx
         sample = None
@@ -269,6 +384,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "action_is_pad": sample["action_is_pad"],
                 "proprio_is_pad": sample["proprio_is_pad"],
             }
+            if self.latent_action_cache_dir is not None:
+                data["latent_actions"] = self._load_cached_latent_action(sample_idx)
             if self.load_text_context:
                 context, context_mask = self._get_cached_text_context(instruction)
                 context[~context_mask] = 0.0
@@ -381,6 +498,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             data["video_latents"] = self._load_cached_video_latent(sample_idx)
             if self.drop_video_when_cached:
                 del data["video"]
+        if self.latent_action_cache_dir is not None:
+            data["latent_actions"] = self._load_cached_latent_action(sample_idx)
         if self.load_text_context:
             context, context_mask = self._get_cached_text_context(instruction)
             # NOTE: to keep consistent with wan2.2's behavior
@@ -401,6 +520,20 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise VideoLatentCacheError(
                 f"Failed to load cached video latent for sample {sample_idx} "
                 f"from {self.video_latent_cache_dir}"
+            ) from exc
+
+    def _load_cached_latent_action(self, sample_idx: int) -> torch.Tensor:
+        try:
+            return load_latent_action(
+                self.latent_action_cache_dir,
+                self.latent_action_cache_manifest,
+                sample_idx,
+                normalize=self.normalize_latent_actions,
+            )
+        except Exception as exc:
+            raise LatentActionCacheError(
+                f"Failed to load cached latent action for sample {sample_idx} "
+                f"from {self.latent_action_cache_dir}"
             ) from exc
 
     def _get_cached_text_context(self, prompt: str):
@@ -440,7 +573,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         try:
             data = self._get(idx)
-        except VideoLatentCacheError:
+        except (VideoLatentCacheError, LatentActionCacheError):
             raise
         except Exception as e:
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
@@ -511,7 +644,7 @@ class InterleavedRobotVideoDataset(RobotVideoDataset):
     def __getitem__(self, idx):
         try:
             return self._get_segments(idx)
-        except VideoLatentCacheError:
+        except (VideoLatentCacheError, LatentActionCacheError):
             raise
         except Exception as e:
             print(f"Error processing interleaved sample idx {idx}: {e}. Returning a random sample instead.")
