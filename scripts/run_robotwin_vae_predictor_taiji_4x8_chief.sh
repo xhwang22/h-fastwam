@@ -27,7 +27,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NPROC_PER_NODE=8
 export FASTWAM_EXPECTED_WORLD_SIZE=32
 export GLOBAL_BATCH_SIZE=1536
-export GRADIENT_ACCUMULATION_STEPS=2
+export GRADIENT_ACCUMULATION_STEPS=1
 
 export FASTWAM_USE_EFA=0
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond1}"
@@ -43,7 +43,7 @@ export USE_VJEPA21_VISUAL_ENCODER=0
 export VIDEO_LATENT_CACHE_ENABLED=0
 export SAVE_EVERY="${SAVE_EVERY:-2000}"
 export LOG_EVERY="${LOG_EVERY:-10}"
-export RUN_NAME="${RUN_NAME:-robotwin_vae_predictor_taiji_4x8_b24_acc2_gb1536}"
+export RUN_NAME="${RUN_NAME:-robotwin_vae_predictor_taiji_4x8_b48_acc1_gb1536}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-encoder-ablation}"
 export WANDB_GROUP="${WANDB_GROUP:-vae-predictor}"
 
