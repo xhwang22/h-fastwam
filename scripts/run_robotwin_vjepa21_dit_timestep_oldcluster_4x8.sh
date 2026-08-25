@@ -50,6 +50,6 @@ export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 export ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_bf16.yaml}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-vjepa21-dit}"
 export WANDB_GROUP="${WANDB_GROUP:-timestep-globalnorm-oldcluster-4x8}"
-export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_dit_${TIMESTEP_PRESET_SUFFIX}_globalnorm_oldcluster_4x8_b48_acc1_gb1536}"
+export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_video_scheduler_${TIMESTEP_PRESET_SUFFIX}_globalnorm_taiji_4x8_b48_acc1_gb1536}"
 
 exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21.sh" "$@"
