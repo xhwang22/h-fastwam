@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 
 # shellcheck source=_timestep_sampling_preset.sh
 source "${SCRIPT_DIR}/_timestep_sampling_preset.sh"
-fastwam_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}" both
+fastwam_video_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}"
 
 ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
 export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"

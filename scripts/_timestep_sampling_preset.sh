@@ -74,3 +74,7 @@ fastwam_timestep_sampling_preset() {
 fastwam_action_timestep_sampling_preset() {
   fastwam_timestep_sampling_preset "${1:-baseline}" action
 }
+
+fastwam_video_timestep_sampling_preset() {
+  fastwam_timestep_sampling_preset "${1:-baseline}" video
+}

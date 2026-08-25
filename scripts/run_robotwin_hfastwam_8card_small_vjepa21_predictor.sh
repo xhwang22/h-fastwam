@@ -82,17 +82,32 @@ export PYTHONDONTWRITEBYTECODE=1
 export TORCH_EXTENSIONS_DIR="/tmp/torch_ext_robotwin_8card_small_vjepa21_predictor_$$"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
-VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
-if [[ ! -f "${VJEPA21_CHECKPOINT}" ]]; then
-  echo "[robotwin-small-vjepa21-predictor] ERROR: missing ${VJEPA21_CHECKPOINT}" >&2
-  echo "Download: curl -L https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitG_384.pt -o ${VJEPA21_CHECKPOINT}" >&2
-  exit 1
-fi
-if [[ ! -f "${VJEPA21_REPO}/app/vjepa_2_1/models/vision_transformer.py" ]]; then
-  echo "[robotwin-small-vjepa21-predictor] ERROR: V-JEPA 2.1 source tree missing at ${VJEPA21_REPO}." >&2
-  exit 1
-fi
+VJEPA21_MODEL_OVERRIDES=()
+case "${USE_VJEPA21_VISUAL_ENCODER:-1}" in
+  1|true|yes|on)
+    VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
+    VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
+    if [[ ! -f "${VJEPA21_CHECKPOINT}" ]]; then
+      echo "[robotwin-small-vjepa21-predictor] ERROR: missing ${VJEPA21_CHECKPOINT}" >&2
+      echo "Download: curl -L https://dl.fbaipublicfiles.com/vjepa2/vjepa2_1_vitG_384.pt -o ${VJEPA21_CHECKPOINT}" >&2
+      exit 1
+    fi
+    if [[ ! -f "${VJEPA21_REPO}/app/vjepa_2_1/models/vision_transformer.py" ]]; then
+      echo "[robotwin-small-vjepa21-predictor] ERROR: V-JEPA 2.1 source tree missing at ${VJEPA21_REPO}." >&2
+      exit 1
+    fi
+    VJEPA21_MODEL_OVERRIDES=(
+      "model.visual_encoder_config.checkpoint_path=${VJEPA21_CHECKPOINT}"
+      "model.visual_encoder_config.repo_path=${VJEPA21_REPO}"
+    )
+    ;;
+  0|false|no|off)
+    ;;
+  *)
+    echo "[robotwin-small-vjepa21-predictor] ERROR: USE_VJEPA21_VISUAL_ENCODER must be 0/1, true/false, yes/no, or on/off." >&2
+    exit 2
+    ;;
+esac
 
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
@@ -250,8 +265,7 @@ CMD=(
       model.freeze_action_expert=false
       model.loss_config.lambda_language=0.0
       "model.action_loss_detach_video_expert=${DETACH_VIDEO:-false}"
-      model.visual_encoder_config.checkpoint_path="${VJEPA21_CHECKPOINT}"
-      model.visual_encoder_config.repo_path="${VJEPA21_REPO}"
+      "${VJEPA21_MODEL_OVERRIDES[@]}"
       "${PRETRAIN_OVERRIDES[@]}"
       "${CKPT_OVERRIDES[@]}"
       "${STANDARDISE_OVERRIDES[@]}"
@@ -265,6 +279,10 @@ CMD=(
 
 echo "[robotwin-small-vjepa21-predictor] task=${TASK_CONFIG} model=${MODEL_CONFIG}"
 echo "[robotwin-small-vjepa21-predictor] global_batch=${GLOBAL_BATCH_SIZE} world_size=${WORLD_SIZE} batch_size=${BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
-echo "[robotwin-small-vjepa21-predictor] checkpoint=${VJEPA21_CHECKPOINT}"
+if (( ${#VJEPA21_MODEL_OVERRIDES[@]} > 0 )); then
+  echo "[robotwin-small-vjepa21-predictor] checkpoint=${VJEPA21_CHECKPOINT}"
+else
+  echo "[robotwin-small-vjepa21-predictor] V-JEPA visual encoder setup disabled"
+fi
 echo "[robotwin-small-vjepa21-predictor] master=${MASTER_ADDR}:${MASTER_PORT} log=${LOG_FILE}"
 "${CMD[@]}" 2>&1 | tee "${LOG_FILE}"

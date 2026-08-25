@@ -19,7 +19,7 @@ fi
 
 # shellcheck source=_timestep_sampling_preset.sh
 source "${SCRIPT_DIR}/_timestep_sampling_preset.sh"
-fastwam_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}" both
+fastwam_video_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}"
 
 ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
 export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"
@@ -39,7 +39,7 @@ export MODEL_CONFIG=hfastwam_small_vjepa21
 export STANDARDISE_OUTPUT=true
 export CAUSAL_TUBELET_ENCODING=true
 export TEMPORAL_DOWNSAMPLE=4
-export TIMESTEP_SAMPLING_TARGET=both
+export TIMESTEP_SAMPLING_TARGET=video
 export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 export ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_bf16.yaml}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-vjepa21-dit}"

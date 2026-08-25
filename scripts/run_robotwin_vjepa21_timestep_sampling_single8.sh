@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# RoboTwin V-JEPA video/action flow-matching timestep sampling ablation.
+# RoboTwin V-JEPA video-expert flow-matching timestep sampling ablation.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_timestep_sampling_preset.sh
 source "${SCRIPT_DIR}/_timestep_sampling_preset.sh"
-fastwam_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}" both
+fastwam_video_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}"
 
 unset PET_NNODES PET_NODE_RANK PET_MASTER_ADDR PET_MASTER_PORT PET_NPROC_PER_NODE
 unset WORLD_SIZE RANK LOCAL_RANK LOCAL_WORLD_SIZE GROUP_RANK
