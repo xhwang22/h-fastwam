@@ -3,6 +3,7 @@
 Supported backends:
 
 * **DINOv3 / DINOv2** — frozen image ViT, per-frame encoding + temporal stride.
+* **SigLIP2 vision** — frozen native image ViT, encoded per frame.
 * **Qwen3-VL vision** — frozen SigLIP2-initialized video ViT.
 * **Xiaomi Robotics-1 vision** — XR-1-tuned Qwen3-VL-4B vision tower.
 * **V-JEPA 2** — frozen video ViT, native spatiotemporal encoding.
@@ -618,6 +619,190 @@ class DINOEncoder(BaseVisualEncoder):
 
 
 _ENCODER_REGISTRY["dino"] = DINOEncoder
+
+
+# ========================================================================== #
+# Native SigLIP2 vision tower (image encoder — per-frame)
+# ========================================================================== #
+
+class SigLIP2VisionEncoder(BaseVisualEncoder):
+    """Frozen native SigLIP2 vision tower with dense patch-token output."""
+
+    def __init__(
+        self,
+        model_name: str = "google/siglip2-so400m-patch16-384",
+        output_dim: int = 48,
+        mlp_hidden_dim: Optional[int] = None,
+        freeze_backbone: bool = True,
+        spatial_downsample: int = 16,
+        temporal_downsample: int = 4,
+        standardise_output: bool = True,
+        skip_projection: bool = False,
+        causal_tubelet_encoding: bool = False,
+        causal_prefix_encoding: bool = False,
+        local_files_only: bool = True,
+        normalise_stats_path: Optional[str] = None,
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        self.model_name = model_name
+        self.standardise_output = standardise_output
+        self.skip_projection = skip_projection
+        self._freeze_backbone = freeze_backbone
+        self.causal_tubelet_encoding = causal_tubelet_encoding
+        self.causal_prefix_encoding = causal_prefix_encoding
+        self._temporal_patch = 1
+
+        self.backbone = self._load_vision_backbone(
+            model_name=model_name,
+            dtype=torch_dtype,
+            local_files_only=local_files_only,
+        )
+        config = self.backbone.config
+        self._hidden_dim = int(config.hidden_size)
+        self._patch_size = int(config.patch_size)
+        self.output_dim = self._hidden_dim if skip_projection else int(output_dim)
+        self.z_dim = self.output_dim
+        self.upsampling_factor = int(spatial_downsample)
+        self.temporal_downsample_factor = int(temporal_downsample)
+
+        if freeze_backbone:
+            self.backbone.eval()
+            self.backbone.requires_grad_(False)
+
+        if skip_projection:
+            self.projection = nn.Identity()
+        else:
+            hidden_dim = (
+                int(mlp_hidden_dim)
+                if mlp_hidden_dim is not None
+                else 2 * self._hidden_dim
+            )
+            self.projection = nn.Sequential(
+                nn.Linear(self._hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.output_dim),
+            ).to(dtype=torch_dtype)
+            for module in self.projection.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        self._configure_fixed_output_normalisation(
+            normalise_stats_path=normalise_stats_path,
+            num_channels=self.output_dim,
+        )
+        logger.info(
+            "SigLIP2VisionEncoder: model=%s hidden_dim=%d patch=%d output_dim=%d "
+            "skip_projection=%s freeze=%s",
+            model_name,
+            self._hidden_dim,
+            self._patch_size,
+            self.output_dim,
+            skip_projection,
+            freeze_backbone,
+        )
+
+    @staticmethod
+    def _load_vision_backbone(
+        model_name: str,
+        dtype: torch.dtype,
+        local_files_only: bool,
+    ) -> nn.Module:
+        try:
+            from transformers import SiglipVisionModel
+        except Exception as exc:  # pragma: no cover
+            raise ImportError(
+                "Native SigLIP2 loading requires transformers>=4.49."
+            ) from exc
+        return SiglipVisionModel.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
+        )
+
+    def encode(
+        self,
+        videos,
+        device="cuda",
+        tiled=False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+        return_pre_standardise=False,
+    ):
+        del tiled, tile_size, tile_stride
+        videos = videos.to(device=device)
+        batch_size, channels, num_frames, height, width = videos.shape
+        if channels != 3:
+            raise ValueError(
+                f"SigLIP2VisionEncoder expects 3 channels, got {channels}."
+            )
+        if height % self._patch_size != 0 or width % self._patch_size != 0:
+            raise ValueError(
+                f"Input size {(height, width)} must be divisible by patch size "
+                f"{self._patch_size}."
+            )
+
+        patch_h = height // self._patch_size
+        patch_w = width // self._patch_size
+        frames = videos.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames,
+            channels,
+            height,
+            width,
+        )
+
+        backbone_grad_enabled = (
+            torch.is_grad_enabled() and not self._freeze_backbone
+        )
+        with torch.set_grad_enabled(backbone_grad_enabled):
+            outputs = self.backbone(
+                pixel_values=frames,
+                interpolate_pos_encoding=True,
+                return_dict=True,
+            )
+            tokens = outputs.last_hidden_state
+
+        expected_tokens = patch_h * patch_w
+        if tokens.shape[:2] != (batch_size * num_frames, expected_tokens):
+            raise ValueError(
+                "Unexpected SigLIP2 visual output shape: "
+                f"got {tuple(tokens.shape)}, expected token prefix "
+                f"{(batch_size * num_frames, expected_tokens)}."
+            )
+        tokens = self.projection(tokens)
+        tokens = tokens.reshape(
+            batch_size,
+            num_frames,
+            patch_h,
+            patch_w,
+            self.output_dim,
+        ).permute(0, 4, 1, 2, 3)
+
+        latent_h = height // self.upsampling_factor
+        latent_w = width // self.upsampling_factor
+        if (patch_h, patch_w) != (latent_h, latent_w):
+            tokens = F.interpolate(
+                tokens.float(),
+                size=(num_frames, latent_h, latent_w),
+                mode="trilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
+
+        tokens = self._temporal_stride(
+            tokens,
+            self.temporal_downsample_factor,
+        )
+        raw_tokens = tokens
+        tokens = self._normalise_encoder_output(tokens)
+        if return_pre_standardise:
+            return tokens, None if self.skip_projection else raw_tokens
+        return tokens
+
+
+_ENCODER_REGISTRY["siglip2_vision"] = SigLIP2VisionEncoder
+_ENCODER_REGISTRY["native_siglip2"] = SigLIP2VisionEncoder
 
 
 # ========================================================================== #
