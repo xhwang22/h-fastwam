@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# InternData-A1 30Hz VAE+DiT pretraining baseline: 2 nodes x 8 GPUs,
-# per-GPU batch 48, global batch 768.
+# InternData-A1 30Hz VAE+DiT pretraining baseline: 2 nodes x 8 GPUs.
+# Preserve an effective batch contribution of 48 samples/GPU while using a
+# smaller micro-batch for the higher-token-count VAE representation.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,8 +35,24 @@ if [[ "${FASTWAM_RUN_DATA_GATE:-1}" == "1" && "${DATA_GATE_RANK}" == "0" ]]; the
 fi
 
 export FASTWAM_EXPECTED_WORLD_SIZE="${FASTWAM_EXPECTED_WORLD_SIZE:-16}"
-export GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$(( 48 * FASTWAM_EXPECTED_WORLD_SIZE * GRADIENT_ACCUMULATION_STEPS ))}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$(( 48 * FASTWAM_EXPECTED_WORLD_SIZE ))}"
+export PER_GPU_BATCH_SIZE="${PER_GPU_BATCH_SIZE:-24}"
+if [[ ! "${PER_GPU_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[interndata-a1-vae-dit] ERROR: PER_GPU_BATCH_SIZE must be a positive integer." >&2
+  exit 2
+fi
+batch_denominator=$(( FASTWAM_EXPECTED_WORLD_SIZE * PER_GPU_BATCH_SIZE ))
+if (( GLOBAL_BATCH_SIZE % batch_denominator != 0 )); then
+  echo "[interndata-a1-vae-dit] ERROR: GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by world_size*micro_batch=${batch_denominator}." >&2
+  exit 2
+fi
+derived_gradient_accumulation=$(( GLOBAL_BATCH_SIZE / batch_denominator ))
+if [[ -n "${GRADIENT_ACCUMULATION_STEPS:-}" ]] && \
+   (( GRADIENT_ACCUMULATION_STEPS != derived_gradient_accumulation )); then
+  echo "[interndata-a1-vae-dit] ERROR: GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS} conflicts with global batch ${GLOBAL_BATCH_SIZE}, world size ${FASTWAM_EXPECTED_WORLD_SIZE}, and micro-batch ${PER_GPU_BATCH_SIZE}; expected ${derived_gradient_accumulation}." >&2
+  exit 2
+fi
+export GRADIENT_ACCUMULATION_STEPS="${derived_gradient_accumulation}"
 export TASK_CONFIG=interndata_a1_pretrain_3cam_384_1e-4
 export DATA_CONFIG=interndata_a1_v3_30hz
 export MODEL_CONFIG=hfastwam_small
@@ -53,7 +70,7 @@ export FASTWAM_SDPA_BACKEND=cudnn
 export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
 export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-1}"
 export VIDEO_LATENT_CACHE_ENABLED=0
-export RUN_NAME="${RUN_NAME:-interndata_a1_vae_dit_pretrain_30hz_16gpu_b48}"
+export RUN_NAME="${RUN_NAME:-interndata_a1_vae_dit_pretrain_30hz_16gpu_b${PER_GPU_BATCH_SIZE}_acc${GRADIENT_ACCUMULATION_STEPS}_gb${GLOBAL_BATCH_SIZE}}"
 export WANDB="${WANDB:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-interndata-a1}"
 export WANDB_GROUP="${WANDB_GROUP:-vae-dit-pretrain}"
@@ -68,6 +85,8 @@ unset TRAINABLE_COMPONENTS VISUAL_ENCODER_LR_MULTIPLIER
 # shellcheck source=_aws_hyperpod_setup.sh
 source "${SCRIPT_DIR}/_aws_hyperpod_setup.sh"
 fastwam_prepare_aws_hyperpod
+
+echo "[interndata-a1-vae-dit] global_batch=${GLOBAL_BATCH_SIZE} world_size=${FASTWAM_EXPECTED_WORLD_SIZE} micro_batch=${PER_GPU_BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
 
 exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_predictor.sh" \
   "++model.language_pad_to_max_length=true" \
