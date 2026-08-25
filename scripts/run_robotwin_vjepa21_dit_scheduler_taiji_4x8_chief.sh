@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chief-only Taiji launcher for the 2x8 V-JEPA 2.1 video-DiT scheduler study.
+# Chief-only Taiji launcher for the 4x8 V-JEPA 2.1 video-DiT scheduler study.
 # By default, runs baseline, noise, middle, and data sequentially.
 set -euo pipefail
 
@@ -38,8 +38,8 @@ HOSTFILE="${HOSTFILE:-/etc/taiji/hostfile}"
 mapfile -t HOSTS < <(
   awk 'NF && $1 !~ /^#/ && !seen[$1]++ {print $1}' "${HOSTFILE}"
 )
-if [[ "${#HOSTS[@]}" -ne 2 ]]; then
-  err "expected exactly two unique hosts in ${HOSTFILE}, got ${#HOSTS[@]}: ${HOSTS[*]}"
+if [[ "${#HOSTS[@]}" -ne 4 ]]; then
+  err "expected exactly four unique hosts in ${HOSTFILE}, got ${#HOSTS[@]}: ${HOSTS[*]}"
 fi
 
 printf -v NODE_IP_LIST '%s,' "${HOSTS[@]}"
@@ -61,7 +61,7 @@ export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_
 
 RUN_SET="${RUN_SET:-$(date +%Y-%m-%d_%H-%M-%S)}"
 RUN_PREFIX="${RUN_PREFIX:-robotwin_vjepa21_dit_scheduler}"
-INNER_SCRIPT="${SCRIPT_DIR}/run_robotwin_vjepa21_dit_timestep_oldcluster_2x8.sh"
+INNER_SCRIPT="${SCRIPT_DIR}/run_robotwin_vjepa21_dit_timestep_oldcluster_4x8.sh"
 [[ -f "${INNER_SCRIPT}" ]] || err "inner launcher not found: ${INNER_SCRIPT}"
 
 # shellcheck source=_timestep_sampling_preset.sh
@@ -74,7 +74,7 @@ info "execution is sequential; the next preset starts only after the current one
 
 for preset in "${PRESETS[@]}"; do
   fastwam_video_timestep_sampling_preset "${preset}"
-  run_name="${RUN_PREFIX}_${TIMESTEP_PRESET_SUFFIX}_globalnorm_taiji_2x8_b48_acc2_gb1536_${RUN_SET}"
+  run_name="${RUN_PREFIX}_${TIMESTEP_PRESET_SUFFIX}_globalnorm_taiji_4x8_b48_acc1_gb1536_${RUN_SET}"
 
   info "starting preset=${preset} run_name=${run_name}"
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
