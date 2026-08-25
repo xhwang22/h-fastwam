@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+case "${1:-}" in
+  baseline|noise|middle|data|uniform)
+    export TIMESTEP_SAMPLING_PRESET="$1"
+    shift
+    ;;
+esac
+
 if [[ -z "${NODE_IP_LIST:-}" ]]; then
   echo "[vjepa21-dit-oldcluster-4x8] ERROR: set NODE_IP_LIST to exactly four nodes." >&2
   echo 'Example: NODE_IP_LIST="10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4" bash <script>' >&2
