@@ -39,6 +39,7 @@ export TIMESTEP_SAMPLING_TARGET=video
 export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 export ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_bf16.yaml}"
 export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-1}"
+export SAVE_EVERY=2000
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-vjepa21-dit}"
 export WANDB_GROUP="${WANDB_GROUP:-video-scheduler-globalnorm-aws-4x8}"
 export LOG_ROOT="${LOG_ROOT:-/efs/shaunxhwang}"
