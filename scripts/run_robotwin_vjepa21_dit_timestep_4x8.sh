@@ -12,7 +12,7 @@ fastwam_video_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}"
 
 ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
 export ROBOTWIN_DATA_ROOT
-export ROBOTWIN_WEBDATASET_ROOT="${ROBOTWIN_WEBDATASET_ROOT:-${ROBOTWIN_DATA_ROOT}/robotwin2.0_webdataset}"
+export ROBOTWIN_WEBDATASET_ROOT="${ROBOTWIN_WEBDATASET_ROOT:-/efs/shaunxhwang/robotwin2.0_webdataset}"
 if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
   echo "[vjepa21-dit-4x8] ERROR: completed WebDataset not found: ${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" >&2
   echo "Set ROBOTWIN_WEBDATASET_ROOT to the completed indexed RoboTwin dataset." >&2
@@ -41,6 +41,7 @@ export ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2
 export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-vjepa21-dit}"
 export WANDB_GROUP="${WANDB_GROUP:-video-scheduler-globalnorm-aws-4x8}"
+export LOG_ROOT="${LOG_ROOT:-/efs/shaunxhwang}"
 export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_video_scheduler_${TIMESTEP_PRESET_SUFFIX}_globalnorm_aws_4x8_b48_acc1_gb1536}"
 
 exec bash \
