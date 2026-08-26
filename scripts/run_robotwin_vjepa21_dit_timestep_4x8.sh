@@ -27,12 +27,13 @@ export MODEL_CONFIG=hfastwam_small_vjepa21
 export STANDARDISE_OUTPUT=true
 export CAUSAL_TUBELET_ENCODING=true
 export TEMPORAL_DOWNSAMPLE=4
+export TIMESTEP_SAMPLING_TARGET=video
 export FASTWAM_SDPA_BACKEND="${FASTWAM_SDPA_BACKEND:-cudnn}"
 export ACCEL_CONFIG="${ACCEL_CONFIG:-scripts/accelerate_configs/accelerate_zero2_bf16.yaml}"
 export FASTWAM_USE_EFA="${FASTWAM_USE_EFA:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-vjepa21-dit}"
-export WANDB_GROUP="${WANDB_GROUP:-timestep-globalnorm-4x8}"
-export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_dit_${TIMESTEP_PRESET_SUFFIX}_globalnorm_4x8_b48_acc1_gb1536}"
+export WANDB_GROUP="${WANDB_GROUP:-video-scheduler-globalnorm-aws-4x8}"
+export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_video_scheduler_${TIMESTEP_PRESET_SUFFIX}_globalnorm_aws_4x8_b48_acc1_gb1536}"
 
 exec bash \
   "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_vjepa21_causal_tubelet_aws.sh" \
