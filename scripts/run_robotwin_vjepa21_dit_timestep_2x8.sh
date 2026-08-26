@@ -10,6 +10,13 @@ source "${SCRIPT_DIR}/_timestep_sampling_preset.sh"
 fastwam_video_timestep_sampling_preset "${TIMESTEP_SAMPLING_PRESET:-baseline}"
 
 ROBOTWIN_DATA_ROOT="${ROBOTWIN_DATA_ROOT:-data}"
+export ROBOTWIN_DATA_ROOT
+export ROBOTWIN_WEBDATASET_ROOT="${ROBOTWIN_WEBDATASET_ROOT:-${ROBOTWIN_DATA_ROOT}/robotwin2.0_webdataset}"
+if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
+  echo "[vjepa21-dit-2x8] ERROR: completed WebDataset not found: ${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" >&2
+  echo "Set ROBOTWIN_WEBDATASET_ROOT to the completed indexed RoboTwin dataset." >&2
+  exit 2
+fi
 export VJEPA21_NORMALISE_STATS_PATH="${VJEPA21_NORMALISE_STATS_PATH:-${ROBOTWIN_DATA_ROOT}/robotwin2.0/vjepa21_vitG_causal_tubelet_global_stats.pt}"
 if [[ ! -f "${VJEPA21_NORMALISE_STATS_PATH}" ]]; then
   echo "[vjepa21-dit-2x8] ERROR: global norm stats not found: ${VJEPA21_NORMALISE_STATS_PATH}" >&2
