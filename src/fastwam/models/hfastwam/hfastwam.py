@@ -2235,6 +2235,67 @@ class HFastWAM(nn.Module):
             active_expert_order=("language", "video"),
         )
 
+    @torch.no_grad()
+    def _rollout_jepa_video_latents(
+        self,
+        *,
+        first_frame_latents: torch.Tensor,
+        num_latents: int,
+        lang_pre: dict,
+        task_len: int,
+        subtask_len: int,
+        video_context: torch.Tensor,
+        video_context_mask: torch.Tensor,
+        context_payload_enabled: bool,
+    ) -> torch.Tensor:
+        """Autoregressively predict VAE/encoder latents with the deterministic JEPA expert."""
+        if not self.is_jepa_predictor:
+            raise RuntimeError("JEPA latent rollout requires a JEPAPredictor video expert.")
+        if num_latents < 1:
+            raise ValueError(f"`num_latents` must be positive, got {num_latents}.")
+
+        rollout_latents = first_frame_latents
+        for _ in range(num_latents - 1):
+            video_pre = self.video_expert.pre_dit(
+                x=rollout_latents,
+                context=video_context if self.video_expert.use_text_context else None,
+                context_mask=video_context_mask if self.video_expert.use_text_context else None,
+            )
+            video_context_payload = self._context_payload_from_pre_state(
+                video_pre,
+                context_payload_enabled,
+            )
+            tokens_out = self._run_mot_two_experts_lv(
+                lang_pre=lang_pre,
+                video_pre=video_pre,
+                task_len=task_len,
+                subtask_len=subtask_len,
+                video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+                video_context_payload=video_context_payload,
+            )
+            predicted_sequence = self.video_expert.post_dit(
+                tokens_out["video"],
+                video_pre,
+            )
+            if (
+                predicted_sequence.ndim != 5
+                or predicted_sequence.shape[:2] != rollout_latents.shape[:2]
+                or predicted_sequence.shape[3:] != rollout_latents.shape[3:]
+                or predicted_sequence.shape[2] < 1
+            ):
+                raise ValueError(
+                    "JEPA rollout prediction must be [B,C,T,H,W] with matching "
+                    "batch/channel/spatial dimensions; got "
+                    f"{tuple(predicted_sequence.shape)} for context "
+                    f"{tuple(rollout_latents.shape)}."
+                )
+            rollout_latents = torch.cat(
+                [rollout_latents, predicted_sequence[:, :, -1:]],
+                dim=2,
+            )
+
+        return rollout_latents
+
     def _run_mot_two_experts_va(
         self,
         video_pre: dict,
@@ -3369,13 +3430,16 @@ class HFastWAM(nn.Module):
             action_context, action_context_mask = video_context, video_context_mask
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_video = torch.randn(
-            (1, z_dim, latent_t, latent_h, latent_w),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
-        latents_video[:, :, 0:1] = first_frame_latents
+        if self.is_jepa_predictor:
+            latents_video = first_frame_latents
+        else:
+            latents_video = torch.randn(
+                (1, z_dim, latent_t, latent_h, latent_w),
+                generator=generator,
+                device=rand_device,
+                dtype=torch.float32,
+            ).to(device=self.device, dtype=self.torch_dtype)
+            latents_video[:, :, 0:1] = first_frame_latents
         latents_action = torch.randn(
             (1, action_horizon, self.action_expert.action_dim),
             generator=generator,
@@ -3383,15 +3447,22 @@ class HFastWAM(nn.Module):
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
 
-        timestep_zero = torch.zeros((1,), dtype=latents_video.dtype, device=self.device)
-        video_pre_ff = self.video_expert.pre_dit(
-            x=first_frame_latents,
-            timestep=timestep_zero,
-            context=video_context,
-            context_mask=video_context_mask,
-            action=None,
-            fuse_vae_embedding_in_latents=fuse_flag,
-        )
+        if self.is_jepa_predictor:
+            video_pre_ff = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                context=video_context if self.video_expert.use_text_context else None,
+                context_mask=video_context_mask if self.video_expert.use_text_context else None,
+            )
+        else:
+            timestep_zero = torch.zeros((1,), dtype=latents_video.dtype, device=self.device)
+            video_pre_ff = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=timestep_zero,
+                context=video_context,
+                context_mask=video_context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
         video_tokens_per_frame = int(video_pre_ff["meta"]["tokens_per_frame"])
         video_context_payload_ff = self._context_payload_from_pre_state(video_pre_ff, has_proprio_context)
 
@@ -3420,6 +3491,101 @@ class HFastWAM(nn.Module):
             subtask_token_ids=subtask_ids_used,
         )
         seg = lang_pre["segments"]
+
+        if self.is_jepa_predictor:
+            latents_video = self._rollout_jepa_video_latents(
+                first_frame_latents=first_frame_latents,
+                num_latents=latent_t,
+                lang_pre=lang_pre,
+                task_len=seg["task_len"],
+                subtask_len=seg["subtask_len"],
+                video_context=video_context,
+                video_context_mask=video_context_mask,
+                context_payload_enabled=has_proprio_context,
+            )
+            action_video_pre = self._prepare_inference_action_video_pre(
+                lang_pre=lang_pre,
+                video_pre=video_pre_ff,
+                task_len=seg["task_len"],
+                subtask_len=seg["subtask_len"],
+                video_tokens_per_frame=video_tokens_per_frame,
+                video_context_payload=video_context_payload_ff,
+                video_context=video_context,
+                video_context_mask=video_context_mask,
+                first_frame_latents=first_frame_latents,
+                num_video_frames=num_frames,
+            )
+            action_video_tokens_per_frame = int(
+                action_video_pre["meta"]["tokens_per_frame"]
+            )
+            action_video_context_payload = self._context_payload_from_pre_state(
+                action_video_pre,
+                has_proprio_context,
+            )
+            action_inference_cache = self._prepare_action_inference_cache(
+                lang_pre=lang_pre,
+                video_pre=action_video_pre,
+                task_len=seg["task_len"],
+                subtask_len=seg["subtask_len"],
+                action_seq_len=int(latents_action.shape[1]),
+                video_tokens_per_frame=action_video_tokens_per_frame,
+                video_context_payload=action_video_context_payload,
+            )
+            infer_timesteps_action, infer_deltas_action = (
+                self.infer_action_scheduler.build_inference_schedule(
+                    num_inference_steps=num_inference_steps,
+                    device=self.device,
+                    dtype=latents_action.dtype,
+                    shift_override=sigma_shift,
+                )
+            )
+            for step_t_action, step_delta_action in zip(
+                infer_timesteps_action,
+                infer_deltas_action,
+            ):
+                timestep_action = step_t_action.unsqueeze(0).to(
+                    dtype=latents_action.dtype,
+                    device=self.device,
+                )
+                action_pre = self.action_expert.pre_dit(
+                    action_tokens=latents_action,
+                    timestep=timestep_action,
+                    context=action_context,
+                    context_mask=action_context_mask,
+                )
+                action_context_payload = self._context_payload_from_pre_state(
+                    action_pre,
+                    has_proprio_context,
+                )
+                tokens_out = self._run_mot_action_inference(
+                    lang_pre=lang_pre,
+                    video_pre=action_video_pre,
+                    action_pre=action_pre,
+                    task_len=seg["task_len"],
+                    subtask_len=seg["subtask_len"],
+                    video_tokens_per_frame=action_video_tokens_per_frame,
+                    video_context_payload=action_video_context_payload,
+                    action_context_payload=action_context_payload,
+                    action_inference_cache=action_inference_cache,
+                )
+                pred_action = self.action_expert.post_dit(
+                    tokens_out["action"],
+                    action_pre,
+                )
+                latents_action = self.infer_action_scheduler.step(
+                    pred_action,
+                    step_delta_action,
+                    latents_action,
+                )
+
+            return {
+                "video": self._decode_latents(latents_video, tiled=tiled),
+                "action": latents_action[0].detach().to(
+                    device="cpu",
+                    dtype=torch.float32,
+                ),
+                "subtask_tokens": subtask_ids_used[0].detach().cpu(),
+            }
 
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
