@@ -12,6 +12,14 @@ export MODEL_CONFIG="${MODEL_CONFIG:-hfastwam_small_vae_predictor}"
 export USE_VJEPA21_VISUAL_ENCODER=0
 export VIDEO_LATENT_CACHE_ENABLED=0
 export RUN_NAME="${RUN_NAME:-robotwin_hfastwam_vae_predictor_aws}"
+export ROBOTWIN_WEBDATASET_ROOT="${ROBOTWIN_WEBDATASET_ROOT:-/efs/shaunxhwang/robotwin2.0_webdataset}"
+if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
+  echo "[aws-vae-predictor] ERROR: completed WebDataset not found: ${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" >&2
+  echo "Set ROBOTWIN_WEBDATASET_ROOT to the completed indexed RoboTwin dataset." >&2
+  exit 2
+fi
+export LOG_ROOT="${LOG_ROOT:-/efs/shaunxhwang}"
+export LOG_DIR="${LOG_DIR:-${LOG_ROOT}/${RUN_NAME}}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-encoder-ablation}"
 export WANDB_GROUP="${WANDB_GROUP:-vae-predictor}"
 
