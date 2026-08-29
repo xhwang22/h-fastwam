@@ -137,7 +137,8 @@ fi
 BATCH_SIZE=$(( GLOBAL_BATCH_SIZE / _BATCH_DENOM ))
 
 RUN_NAME="${RUN_NAME:-robotwin_hfastwam_8card_small_vjepa21_predictor_ds}"
-LOG_DIR="${REPO_ROOT}/runs/robotwin_hfastwam/${RUN_NAME}"
+LOG_ROOT="${LOG_ROOT:-${REPO_ROOT}/runs/robotwin_hfastwam}"
+LOG_DIR="${LOG_DIR:-${LOG_ROOT}/${RUN_NAME}}"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train.log.rank${NODE_RANK}"
 
