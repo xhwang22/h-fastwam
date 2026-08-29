@@ -57,6 +57,13 @@ export CAUSAL_TUBELET_ENCODING=true
 export TEMPORAL_DOWNSAMPLE=4
 export STANDARDISE_OUTPUT=true
 export VIDEO_LATENT_CACHE_ENABLED=0
+export ROBOTWIN_WEBDATASET_ROOT="${ROBOTWIN_WEBDATASET_ROOT:-/efs/shaunxhwang/robotwin2.0_webdataset}"
+if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
+  echo "[aws-vjepa21-vitl] ERROR: completed WebDataset not found: ${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" >&2
+  echo "Set ROBOTWIN_WEBDATASET_ROOT to the completed indexed RoboTwin dataset." >&2
+  exit 2
+fi
+export LOG_ROOT="${LOG_ROOT:-/efs/shaunxhwang}"
 export RUN_NAME="${RUN_NAME:-robotwin_vjepa21_vitl_300m_causal_tubelet_32gpu_b48_cudnn_overlap_efa}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-encoder-ablation}"
 export WANDB_GROUP="${WANDB_GROUP:-vjepa21-vitl-flow-dit}"

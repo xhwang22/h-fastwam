@@ -243,7 +243,8 @@ CMD=(
       "${RESUME_OVERRIDES[@]}"
 )
 
-echo "[robotwin-small-vjepa21] model=${MODEL_CONFIG} (V-JEPA 2.1 ViT-G/16 2B, raw 1664-d features + Wan DiT)"
+VISUAL_ENCODER_DESCRIPTION="${VISUAL_ENCODER_DESCRIPTION:-V-JEPA 2.1 ViT-G/16 2B, raw 1664-d features + Wan DiT}"
+echo "[robotwin-small-vjepa21] model=${MODEL_CONFIG} (${VISUAL_ENCODER_DESCRIPTION})"
 echo "[robotwin-small-vjepa21] global_batch=${GLOBAL_BATCH_SIZE} world_size=${WORLD_SIZE} batch_size=${BATCH_SIZE} grad_accum=${GRADIENT_ACCUMULATION_STEPS}"
 echo "[robotwin-small-vjepa21] checkpoint=${VJEPA21_CHECKPOINT}"
 echo "[robotwin-small-vjepa21] master=${MASTER_ADDR}:${MASTER_PORT} log=${LOG_FILE}"
