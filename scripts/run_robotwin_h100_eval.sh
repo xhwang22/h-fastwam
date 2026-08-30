@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generic H100 RoboTwin evaluation launcher for XR-1 and V-JEPA21 IDM.
+# Generic single-node H100 RoboTwin evaluation launcher.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,34 +7,72 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 CURRENT_USER="${USER:-$(id -un)}"
 
-if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
-  if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
-    FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
-  else
-    FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
+FASTWAM_EVAL_USE_CURRENT_ENV="${FASTWAM_EVAL_USE_CURRENT_ENV:-0}"
+if [[ "${FASTWAM_EVAL_USE_CURRENT_ENV}" == "1" ]]; then
+  if [[ -z "${PYTHON_BIN:-}" && -x "/opt/venv/bin/python" ]]; then
+    PYTHON_BIN=/opt/venv/bin/python
   fi
-fi
-if [[ -z "${CONDA_SH:-}" ]]; then
-  if [[ -f "/fsx/miniforge3/etc/profile.d/conda.sh" ]]; then
-    CONDA_SH="/fsx/miniforge3/etc/profile.d/conda.sh"
-  else
-    CONDA_SH="/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh"
+  if [[ -z "${PYTHON_BIN:-}" ]]; then
+    PYTHON_BIN="$(command -v python || command -v python3 || true)"
   fi
+  if [[ -z "${PYTHON_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
+    echo "[h100-eval] ERROR: current Python not found; set PYTHON_BIN." >&2
+    exit 1
+  fi
+  PYTHON_ENV_PREFIX="$("${PYTHON_BIN}" -c 'import sys; print(sys.prefix)')"
+  export PATH="$(dirname "${PYTHON_BIN}"):${PATH}"
+else
+  if [[ -z "${FASTWAM_EVAL_ENV:-}" ]]; then
+    if [[ -d "/fsx/conda-envs/fastwam-eval" ]]; then
+      FASTWAM_EVAL_ENV="/fsx/conda-envs/fastwam-eval"
+    else
+      FASTWAM_EVAL_ENV="/fsx/${CURRENT_USER}/conda-envs/fastwam-eval"
+    fi
+  fi
+  if [[ -z "${CONDA_SH:-}" ]]; then
+    if [[ -f "/fsx/miniforge3/etc/profile.d/conda.sh" ]]; then
+      CONDA_SH="/fsx/miniforge3/etc/profile.d/conda.sh"
+    else
+      CONDA_SH="/fsx/${CURRENT_USER}/miniforge3/etc/profile.d/conda.sh"
+    fi
+  fi
+  if [[ ! -f "${CONDA_SH}" ]]; then
+    echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
+    exit 1
+  fi
+  # Always reactivate so a stale nested virtualenv cannot take precedence.
+  # shellcheck disable=SC1090
+  set +u
+  source "${CONDA_SH}"
+  conda activate "${FASTWAM_EVAL_ENV}"
+  unset VIRTUAL_ENV
+  set -u
+  hash -r
+  PYTHON_BIN="${CONDA_PREFIX}/bin/python"
+  PYTHON_ENV_PREFIX="${CONDA_PREFIX}"
 fi
-if [[ ! -f "${CONDA_SH}" ]]; then
-  echo "[h100-eval] ERROR: conda activation script not found: ${CONDA_SH}" >&2
-  exit 1
-fi
-# Always reactivate so a stale nested virtualenv cannot take precedence.
-# shellcheck disable=SC1090
-set +u
-source "${CONDA_SH}"
-conda activate "${FASTWAM_EVAL_ENV}"
-unset VIRTUAL_ENV
-set -u
-hash -r
+export FASTWAM_PYTHON_ENV_PREFIX="${PYTHON_ENV_PREFIX}"
 
-MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND=xr1 or MODEL_KIND=idm}"
+if [[ -z "${NVIDIA_GRAPHICS_ENV:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  DRIVER_VERSION="$(
+    nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1
+  )"
+  CANDIDATE_GRAPHICS_ENV="/fsx/nvidia-userspace/${DRIVER_VERSION}/activate.sh"
+  if [[ -f "${CANDIDATE_GRAPHICS_ENV}" ]]; then
+    NVIDIA_GRAPHICS_ENV="${CANDIDATE_GRAPHICS_ENV}"
+  fi
+fi
+if [[ -n "${NVIDIA_GRAPHICS_ENV:-}" ]]; then
+  if [[ ! -f "${NVIDIA_GRAPHICS_ENV}" ]]; then
+    echo "[h100-eval] ERROR: NVIDIA graphics activation not found: ${NVIDIA_GRAPHICS_ENV}" >&2
+    exit 1
+  else
+    # shellcheck disable=SC1090
+    source "${NVIDIA_GRAPHICS_ENV}"
+  fi
+fi
+
+MODEL_KIND="${MODEL_KIND:?Set MODEL_KIND to a supported evaluation profile}"
 RUN_DIR="${RUN_DIR:?Set RUN_DIR to the completed training run directory}"
 CAMERA_TYPE="${CAMERA_TYPE:-Large_D435}"
 for override in "$@"; do
@@ -55,7 +93,9 @@ RUN_DIR="$(realpath "${RUN_DIR}")"
 TRAIN_CONFIG="${TRAIN_CONFIG:-${RUN_DIR}/config.yaml}"
 ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-${REPO_ROOT}/checkpoints/RoboTwin}"
 if [[ -z "${STATS:-}" ]]; then
-  if [[ -f "${REPO_ROOT}/data/robotwin2.0_webdataset/dataset_stats.json" ]]; then
+  if [[ -f "/efs/shaunxhwang/robotwin2.0_webdataset/dataset_stats.json" ]]; then
+    STATS="/efs/shaunxhwang/robotwin2.0_webdataset/dataset_stats.json"
+  elif [[ -f "${REPO_ROOT}/data/robotwin2.0_webdataset/dataset_stats.json" ]]; then
     STATS="${REPO_ROOT}/data/robotwin2.0_webdataset/dataset_stats.json"
   else
     STATS="${REPO_ROOT}/data/robotwin2.0/dataset_stats.json"
@@ -105,7 +145,7 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/tmp/fastwam_torch_extensions_${CURRENT_USER}}"
 export WARP_CACHE_PATH="${WARP_CACHE_PATH:-/tmp/fastwam_warp_cache_${CURRENT_USER}}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/fastwam_xdg_cache_${CURRENT_USER}}"
-export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${PYTHON_ENV_PREFIX}/lib:${PYTHON_ENV_PREFIX}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
 mkdir -p "${TORCH_EXTENSIONS_DIR}" "${WARP_CACHE_PATH}" "${XDG_CACHE_HOME}"
 
 if [[ -z "${QWEN_DIR:-}" ]]; then
@@ -124,7 +164,7 @@ if [[ ! -f "${QWEN_DIR}/config.json" ]]; then
   exit 1
 fi
 if [[ "${SKIP_MODEL_PREFLIGHT:-0}" != "1" ]]; then
-python - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 from packaging.version import Version
 import transformers
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
@@ -147,25 +187,57 @@ PREPARE_ARGS=(
   --output "${EVAL_CONFIG}"
   --qwen-dir "${QWEN_DIR}"
 )
-if [[ "${MODEL_KIND}" == "xr1" ]]; then
-  XR1_CHECKPOINT="${XR1_CHECKPOINT:-${REPO_ROOT}/checkpoints/XiaomiRobotics/Xiaomi-Robotics-1-5B}"
-  PREPARE_ARGS+=(--xr1-checkpoint "${XR1_CHECKPOINT}")
-  TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
-elif [[ "${MODEL_KIND}" == "idm" ]]; then
-  VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
-  VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
-  PREPARE_ARGS+=(
-    --vjepa-checkpoint "${VJEPA21_CHECKPOINT}"
-    --vjepa-repo "${VJEPA21_REPO}"
-  )
-  TASK_CONFIG=robotwin_idm_3cam_384_1e-4
-else
-  echo "[h100-eval] ERROR: MODEL_KIND must be xr1 or idm." >&2
-  exit 1
-fi
+case "${MODEL_KIND}" in
+  xr1)
+    XR1_CHECKPOINT="${XR1_CHECKPOINT:-${REPO_ROOT}/checkpoints/XiaomiRobotics/Xiaomi-Robotics-1-5B}"
+    PREPARE_ARGS+=(--xr1-checkpoint "${XR1_CHECKPOINT}")
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+    ;;
+  idm)
+    VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
+    VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
+    PREPARE_ARGS+=(
+      --vjepa-checkpoint "${VJEPA21_CHECKPOINT}"
+      --vjepa-repo "${VJEPA21_REPO}"
+    )
+    TASK_CONFIG=robotwin_idm_3cam_384_1e-4
+    ;;
+  vjepa21_flow)
+    VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
+    VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
+    PREPARE_ARGS+=(
+      --vjepa-checkpoint "${VJEPA21_CHECKPOINT}"
+      --vjepa-repo "${VJEPA21_REPO}"
+    )
+    if [[ -n "${VJEPA21_NORMALISE_STATS_PATH:-}" ]]; then
+      PREPARE_ARGS+=(
+        --vjepa-normalise-stats "${VJEPA21_NORMALISE_STATS_PATH}"
+      )
+    fi
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+    ;;
+  dinov3_flow)
+    export DINOV3_MODEL_PATH="${DINOV3_MODEL_PATH:-${REPO_ROOT}/checkpoints/dinov3-vith16plus-pretrain-lvd1689m}"
+    PREPARE_ARGS+=(--dinov3-model "${DINOV3_MODEL_PATH}")
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+    ;;
+  siglip2_flow)
+    export SIGLIP2_MODEL_PATH="${SIGLIP2_MODEL_PATH:-${REPO_ROOT}/checkpoints/siglip2-so400m-patch16-384}"
+    PREPARE_ARGS+=(--siglip2-model "${SIGLIP2_MODEL_PATH}")
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+    ;;
+  vae_predictor)
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+    ;;
+  *)
+    echo "[h100-eval] ERROR: unsupported MODEL_KIND=${MODEL_KIND}." >&2
+    echo "Expected xr1, idm, vjepa21_flow, dinov3_flow, siglip2_flow, or vae_predictor." >&2
+    exit 1
+    ;;
+esac
 
 if [[ "${SKIP_EVAL_PREPARE:-0}" != "1" ]]; then
-  python scripts/prepare_robotwin_h100_eval_config.py "${PREPARE_ARGS[@]}"
+  "${PYTHON_BIN}" scripts/prepare_robotwin_h100_eval_config.py "${PREPARE_ARGS[@]}"
 
   EXPECTED_POLICY="${REPO_ROOT}/experiments/robotwin/fastwam_policy"
   POLICY_LINK="${ROBOTWIN_ROOT}/policy/fastwam_policy"
@@ -183,7 +255,7 @@ if [[ "${SKIP_EVAL_PREPARE:-0}" != "1" ]]; then
   else
     ln -s "${EXPECTED_POLICY}" "${POLICY_LINK}"
   fi
-  python scripts/patch_robotwin_eval_compat.py --robotwin-root "${ROBOTWIN_ROOT}"
+  "${PYTHON_BIN}" scripts/patch_robotwin_eval_compat.py --robotwin-root "${ROBOTWIN_ROOT}"
 else
   if [[ ! -f "${EVAL_CONFIG}" ]]; then
     echo "[h100-eval] ERROR: prepared eval config not found: ${EVAL_CONFIG}" >&2
@@ -204,11 +276,11 @@ if [[ "${CHECK_ALIGNMENT:-1}" == "1" ]]; then
   if [[ -n "${TRAINING_STATS:-}" ]]; then
     ALIGN_ARGS+=(--training-stats "${TRAINING_STATS}")
   fi
-  python scripts/check_robotwin_eval_alignment.py "${ALIGN_ARGS[@]}"
+  "${PYTHON_BIN}" scripts/check_robotwin_eval_alignment.py "${ALIGN_ARGS[@]}"
 fi
 
 if [[ "${CHECK_ENV:-1}" == "1" ]]; then
-  python scripts/check_robotwin_h100_eval_env.py --robotwin-root "${ROBOTWIN_ROOT}"
+  "${PYTHON_BIN}" scripts/check_robotwin_h100_eval_env.py --robotwin-root "${ROBOTWIN_ROOT}"
 fi
 
 MODE="${MODE:-smoke}"
@@ -232,10 +304,11 @@ NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-10}"
 REPLAN_STEPS="${REPLAN_STEPS:-24}"
 RENDER_BACKEND="${RENDER_BACKEND:-gpu}"
 CKPT_NAME="$(basename "${CKPT}" .pt)"
-OUTPUT_TAG="${OUTPUT_TAG:-${MODEL_KIND}_${CKPT_NAME}_h100_${MODE}_aligned_v2}"
+EVAL_LABEL="${EVAL_LABEL:-${MODEL_KIND}}"
+OUTPUT_TAG="${OUTPUT_TAG:-${EVAL_LABEL}_${CKPT_NAME}_h100_${MODE}_aligned_v2}"
 
 CMD=(
-  python experiments/robotwin/run_robotwin_manager.py
+  "${PYTHON_BIN}" experiments/robotwin/run_robotwin_manager.py
   task="${TASK_CONFIG}"
   ckpt="${CKPT}"
   EVALUATION.train_config_path="${EVAL_CONFIG}"

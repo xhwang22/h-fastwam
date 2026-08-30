@@ -35,6 +35,7 @@ def _redacted_model(cfg) -> dict:
             "repo_path",
             "model_name",
             "local_files_only",
+            "normalise_stats_path",
         ):
             visual.pop(key, None)
     return payload
@@ -101,7 +102,7 @@ def _check_data_contract(train_cfg) -> None:
         )
 
 
-def _check_model_contract(model_kind: str, model) -> None:
+def _check_model_contract(model_kind: str, model) -> tuple[int, bool]:
     _require_equal(str(model.language_backend), "qwen3", "language_backend")
     _require_equal(bool(model.freeze_language_expert), True, "freeze_language_expert")
     _require_equal(float(model.loss_config.lambda_language), 0.0, "lambda_language")
@@ -112,14 +113,36 @@ def _check_model_contract(model_kind: str, model) -> None:
     _require_equal(int(model.video_dit_config.num_layers), 28, "video num_layers")
     _require_equal(int(model.action_dit_config.hidden_dim), 2048, "action hidden_dim")
     _require_equal(int(model.action_dit_config.num_layers), 28, "action num_layers")
-    visual = model.visual_encoder_config
+    target = str(model.get("_target_", ""))
+    visual = model.get("visual_encoder_config")
+    if model_kind == "vae_predictor":
+        _require_equal(
+            target,
+            "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam",
+            "VAE predictor model target",
+        )
+        _require_equal(visual, None, "VAE predictor visual encoder")
+        _require_equal(
+            str(model.get("video_expert_type", "")),
+            "jepa_predictor",
+            "VAE predictor video expert",
+        )
+        _require_equal(int(model.video_dit_config.in_dim), 48, "VAE video in_dim")
+        _require_equal(int(model.video_dit_config.out_dim), 48, "VAE video out_dim")
+        _require_equal(
+            str(model.video_dit_config.video_attention_mask_mode),
+            "per_frame_causal",
+            "VAE predictor video mask",
+        )
+        return 48, False
+
+    if visual in (None, "null"):
+        raise ValueError(f"{model_kind} requires a visual encoder.")
     _require_equal(bool(visual.freeze_backbone), True, "visual freeze_backbone")
     _require_equal(bool(visual.skip_projection), True, "visual skip_projection")
     _require_equal(int(visual.temporal_downsample), 4, "temporal downsample")
-    _require_equal(bool(visual.causal_tubelet_encoding), True, "causal tubelet")
     _require_equal(bool(visual.standardise_output), True, "standardise_output")
 
-    target = str(model.get("_target_", ""))
     if model_kind == "xr1":
         _require_equal(
             target,
@@ -134,7 +157,13 @@ def _check_model_contract(model_kind: str, model) -> None:
             "first_frame_causal",
             "XR-1 video mask",
         )
+        return 1024, True
     elif model_kind == "idm":
+        _require_equal(
+            bool(visual.get("causal_tubelet_encoding", False)),
+            True,
+            "IDM causal tubelet",
+        )
         _require_equal(
             target,
             "fastwam.models.hfastwam.hfastwam_idm."
@@ -149,20 +178,96 @@ def _check_model_contract(model_kind: str, model) -> None:
             "per_frame_causal",
             "IDM video mask",
         )
+        return 1664, True
+    elif model_kind == "vjepa21_flow":
+        _require_equal(
+            target,
+            "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam",
+            "V-JEPA Flow-DiT model target",
+        )
+        _require_equal(str(visual.encoder_type), "vjepa2_1", "V-JEPA encoder")
+        _require_equal(
+            bool(visual.get("causal_tubelet_encoding", False)),
+            True,
+            "V-JEPA causal tubelet",
+        )
+        video_dim = int(model.video_dit_config.in_dim)
+        if video_dim not in {1024, 1664}:
+            raise ValueError(f"Unsupported V-JEPA feature dim: {video_dim}")
+        _require_equal(
+            int(model.video_dit_config.out_dim),
+            video_dim,
+            "V-JEPA video out_dim",
+        )
+        _require_equal(
+            str(model.video_dit_config.video_attention_mask_mode),
+            "first_frame_causal",
+            "V-JEPA video mask",
+        )
+        return video_dim, True
+    elif model_kind == "dinov3_flow":
+        _require_equal(
+            target,
+            "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam",
+            "DINOv3 Flow-DiT model target",
+        )
+        _require_equal(str(visual.encoder_type), "dino", "DINOv3 encoder")
+        _require_equal(
+            bool(visual.get("causal_tubelet_encoding", False)),
+            False,
+            "DINOv3 causal tubelet",
+        )
+        _require_equal(int(model.video_dit_config.in_dim), 1280, "DINOv3 video in_dim")
+        _require_equal(int(model.video_dit_config.out_dim), 1280, "DINOv3 video out_dim")
+        _require_equal(
+            str(model.video_dit_config.video_attention_mask_mode),
+            "first_frame_causal",
+            "DINOv3 video mask",
+        )
+        return 1280, True
+    elif model_kind == "siglip2_flow":
+        _require_equal(
+            target,
+            "fastwam.models.hfastwam.hfastwam.HFastWAM.from_pretrained_fastwam",
+            "SigLIP2 Flow-DiT model target",
+        )
+        if str(visual.encoder_type) not in {"siglip2_vision", "native_siglip2"}:
+            raise ValueError(f"Unexpected SigLIP2 encoder: {visual.encoder_type}")
+        _require_equal(
+            bool(visual.get("causal_tubelet_encoding", False)),
+            True,
+            "SigLIP2 causal tubelet",
+        )
+        _require_equal(int(model.video_dit_config.in_dim), 1152, "SigLIP2 video in_dim")
+        _require_equal(int(model.video_dit_config.out_dim), 1152, "SigLIP2 video out_dim")
+        _require_equal(
+            str(model.video_dit_config.video_attention_mask_mode),
+            "first_frame_causal",
+            "SigLIP2 video mask",
+        )
+        return 1152, True
     else:
         raise ValueError(f"Unsupported model kind: {model_kind}")
 
 
-def _check_checkpoint(checkpoint_path: Path, expected_video_dim: int) -> None:
+def _check_checkpoint(
+    checkpoint_path: Path,
+    expected_video_dim: int,
+    require_visual_encoder: bool,
+) -> None:
     payload = torch.load(
         checkpoint_path,
         map_location="cpu",
         mmap=True,
         weights_only=False,
     )
-    for key in ("mot", "language_expert", "proprio_encoder", "visual_encoder"):
+    for key in ("mot", "language_expert", "proprio_encoder"):
         if key not in payload:
             raise ValueError(f"Checkpoint is missing `{key}`: {checkpoint_path}")
+    if require_visual_encoder and "visual_encoder" not in payload:
+        raise ValueError(
+            f"Checkpoint is missing `visual_encoder`: {checkpoint_path}"
+        )
     mot = payload["mot"]
     action_input = mot.get("mixtures.action.action_encoder.weight")
     action_output = mot.get("mixtures.action.head.weight")
@@ -192,7 +297,18 @@ def _check_checkpoint(checkpoint_path: Path, expected_video_dim: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["xr1", "idm"], required=True)
+    parser.add_argument(
+        "--model",
+        choices=[
+            "xr1",
+            "idm",
+            "vjepa21_flow",
+            "dinov3_flow",
+            "siglip2_flow",
+            "vae_predictor",
+        ],
+        required=True,
+    )
     parser.add_argument("--train-config", required=True)
     parser.add_argument("--eval-config", required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -226,10 +342,14 @@ def main() -> None:
 
     _check_data_contract(train_cfg)
     model = _model_cfg(eval_cfg)
-    _check_model_contract(args.model, model)
+    expected_video_dim, require_visual_encoder = _check_model_contract(
+        args.model,
+        model,
+    )
     _check_checkpoint(
         checkpoint_path,
-        expected_video_dim=1024 if args.model == "xr1" else 1664,
+        expected_video_dim=expected_video_dim,
+        require_visual_encoder=require_visual_encoder,
     )
 
     training_stats = (
@@ -260,8 +380,10 @@ def main() -> None:
     print(f"num_video_frames={num_video_frames}")
     if args.model == "idm":
         print("IDM condition=[z0,pred_z1,pred_z2], inference KV cache=disabled")
+    elif args.model == "vae_predictor":
+        print("VAE predictor action conditioning=current clean VAE latent")
     else:
-        print("XR-1 action conditioning=current clean first-frame latent")
+        print(f"{args.model} action conditioning=current clean first-frame latent")
     print("image_pipeline=480x640 -> 240x320 -> RoboTwin 384x320 canvas")
     print(f"dataset_stats={stats_status}")
     print(

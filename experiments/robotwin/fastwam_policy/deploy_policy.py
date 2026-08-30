@@ -181,8 +181,11 @@ class WorldActionRobotWinPolicy:
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         model_target = str(model_cfg_copy.get("_target_", ""))
+        visual_encoder_cfg = model_cfg_copy.get("visual_encoder_config")
         visual_encoder_type = str(
-            model_cfg_copy.get("visual_encoder_config", {}).get("encoder_type", "")
+            ""
+            if visual_encoder_cfg in (None, "null")
+            else visual_encoder_cfg.get("encoder_type", "")
         )
         strict_checkpoint = (
             "HFastWAMIDM" in model_target
