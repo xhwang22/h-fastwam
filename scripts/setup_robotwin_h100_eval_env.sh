@@ -14,6 +14,7 @@ readonly VJEPA21_VITL_EXPECTED_SIZE="5151198524"
 readonly VJEPA21_SOURCE_REVISION="204698b45b3712590f06245fbfba32d3be539812"
 readonly QWEN_REVISION="89644892e4d85e24eaac8bacfd4f463576704203"
 readonly DINOV3_REVISION="c807c9eeea853df70aec4069e6f56b28ddc82acc"
+readonly SETUPTOOLS_REQUIREMENT="setuptools<82"
 readonly CUDA_TOOLKIT_VERSION="12.8"
 readonly CUDA_TOOLKIT_RUNFILE="cuda_12.8.0_570.86.10_linux.run"
 readonly CUDA_TOOLKIT_URL="https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/${CUDA_TOOLKIT_RUNFILE}"
@@ -190,6 +191,7 @@ import numpy
 import omegaconf
 import open3d
 import PIL
+import pkg_resources
 import pyglet
 import pyarrow
 import rich
@@ -432,9 +434,13 @@ install_cuda_toolkit_for_torch() {
 
 install_current_python_dependencies() {
   "${PYTHON_BIN}" -m pip --version >/dev/null
-  if ! "${PYTHON_BIN}" -c 'import packaging' >/dev/null 2>&1; then
-    "${PYTHON_BIN}" -m pip install "packaging==25.0"
+  if ! "${PYTHON_BIN}" -c 'import packaging, pkg_resources' >/dev/null 2>&1; then
+    "${PYTHON_BIN}" -m pip install \
+      "packaging==25.0" \
+      "${SETUPTOOLS_REQUIREMENT}"
   fi
+  "${PYTHON_BIN}" -m pip install --upgrade \
+    "${SETUPTOOLS_REQUIREMENT}" wheel ninja
   "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" \
     -e "${REPO_ROOT}" \
     --extra-index-url https://download.pytorch.org/whl/cu128
@@ -535,7 +541,8 @@ install_python_dependencies() {
     if ! command -v ffmpeg >/dev/null 2>&1; then
       conda install -y -p "${FASTWAM_EVAL_ENV}" -c conda-forge "ffmpeg=7.1"
     fi
-    "${PYTHON_BIN}" -m pip install --upgrade pip setuptools wheel ninja
+    "${PYTHON_BIN}" -m pip install --upgrade \
+      pip "${SETUPTOOLS_REQUIREMENT}" wheel ninja
     "${PYTHON_BIN}" -m pip install \
       "${PIP_REINSTALL_ARGS[@]}" \
       torch==2.7.1+cu128 \
@@ -582,7 +589,8 @@ install_python_dependencies() {
   fi
   if [[ "${FORCE_EVAL_ENV_INSTALL}" == "1" ]] || ! curobo_python_ready; then
     install_cuda_toolkit_for_torch
-    "${PYTHON_BIN}" -m pip install --upgrade setuptools wheel ninja
+    "${PYTHON_BIN}" -m pip install --upgrade \
+      "${SETUPTOOLS_REQUIREMENT}" wheel ninja
     "${PYTHON_BIN}" -m pip install "${PIP_REINSTALL_ARGS[@]}" \
       -e "${CUROBO_ROOT}" --no-build-isolation
     if ! curobo_python_ready; then
