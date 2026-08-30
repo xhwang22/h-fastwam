@@ -8,7 +8,7 @@ export MODEL_KIND=siglip2_flow
 export EVAL_LABEL=siglip2_so400m
 export MODE="${MODE:-full}"
 export NUM_GPUS="${NUM_GPUS:-8}"
-export MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-1}"
+export MAX_TASKS_PER_GPU="${MAX_TASKS_PER_GPU:-2}"
 export RUN_DIR="${RUN_DIR:-/efs/shaunxhwang/robotwin_native_siglip2_so400m_causal_tubelet_32gpu_b48_cudnn_overlap_efa}"
 export SIGLIP2_MODEL_PATH="${SIGLIP2_MODEL_PATH:-${REPO_ROOT}/checkpoints/siglip2-so400m-patch16-384}"
 
