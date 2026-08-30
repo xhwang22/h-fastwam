@@ -7,7 +7,7 @@ Supported backends:
 * **Qwen3-VL vision** — frozen SigLIP2-initialized video ViT.
 * **Xiaomi Robotics-1 vision** — XR-1-tuned Qwen3-VL-4B vision tower.
 * **V-JEPA 2** — frozen video ViT, native spatiotemporal encoding.
-* **V-JEPA 2.1** — frozen dense-feature video ViT.
+* **V-JEPA 2.1** — frozen dense-feature image/video ViT.
 
 Both produce latents with the same shape convention as the VAE encoder:
 ``[B, output_dim, T_lat, H_lat, W_lat]`` so the downstream DiT / MoT
@@ -2118,4 +2118,208 @@ class VJEPA21Encoder(VJEPA2Encoder):
 
 
 _ENCODER_REGISTRY["vjepa2_1"] = VJEPA21Encoder
+
+
+class VJEPA21ImageSVAEEncoder(VJEPA21Encoder):
+    """V-JEPA 2.1 image features compressed by semantic-wm's S-VAE-96."""
+
+    def __init__(
+        self,
+        model_name: str = "vjepa2_1_vit_large_384",
+        freeze_backbone: bool = True,
+        spatial_downsample: int = 16,
+        temporal_downsample: int = 4,
+        standardise_output: bool = False,
+        checkpoint_source: str = "local",
+        checkpoint_path: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        adapter_checkpoint_path: Optional[str] = None,
+        image_size: int = 256,
+        view_layout: str = "robotwin_3cam",
+        frame_batch_size: int = 64,
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ):
+        if model_name != "vjepa2_1_vit_large_384":
+            raise ValueError(
+                "The published semantic-wm S-VAE-96 checkpoint requires "
+                "V-JEPA 2.1 ViT-L/16."
+            )
+        if not freeze_backbone:
+            raise ValueError("V-JEPA image S-VAE requires a frozen backbone.")
+        if standardise_output:
+            raise ValueError(
+                "Do not standardise S-VAE latents; the published adapter "
+                "already provides a KL-regularised latent space."
+            )
+        if adapter_checkpoint_path is None:
+            raise ValueError("adapter_checkpoint_path is required.")
+        if image_size <= 0 or image_size % 16 != 0:
+            raise ValueError(f"image_size must be divisible by 16, got {image_size}.")
+        if frame_batch_size <= 0:
+            raise ValueError(
+                f"frame_batch_size must be positive, got {frame_batch_size}."
+            )
+        if view_layout not in {"single", "robotwin_3cam"}:
+            raise ValueError(
+                "view_layout must be 'single' or 'robotwin_3cam', "
+                f"got {view_layout!r}."
+            )
+
+        super().__init__(
+            model_name=model_name,
+            output_dim=1024,
+            freeze_backbone=True,
+            spatial_downsample=spatial_downsample,
+            temporal_downsample=temporal_downsample,
+            standardise_output=False,
+            skip_projection=True,
+            causal_tubelet_encoding=False,
+            causal_prefix_encoding=False,
+            checkpoint_source=checkpoint_source,
+            checkpoint_path=checkpoint_path,
+            repo_path=repo_path,
+            normalise_stats_path=None,
+            torch_dtype=torch_dtype,
+        )
+
+        from .semantic_svae import load_semantic_svae_encoder
+
+        self.svae_encoder = load_semantic_svae_encoder(
+            adapter_checkpoint_path,
+            dtype=torch_dtype,
+        )
+        self.adapter_checkpoint_path = adapter_checkpoint_path
+        self.image_size = int(image_size)
+        self.view_layout = view_layout
+        self.frame_batch_size = int(frame_batch_size)
+        self.output_dim = 96
+        self.z_dim = 96
+        self._temporal_patch = 1
+        self.requires_independent_first_frame = False
+        self.projection = nn.Identity()
+
+        logger.info(
+            "VJEPA21ImageSVAEEncoder: model=%s image_size=%d views=%s "
+            "output_dim=96 temporal_downsample=%d adapter=%s",
+            model_name,
+            self.image_size,
+            self.view_layout,
+            self.temporal_downsample_factor,
+            adapter_checkpoint_path,
+        )
+
+    @staticmethod
+    def _split_robotwin_views(videos: torch.Tensor) -> list[torch.Tensor]:
+        _, _, _, height, width = videos.shape
+        if height % 3 != 0 or width % 2 != 0:
+            raise ValueError(
+                "robotwin_3cam expects a mosaic divisible into one top "
+                f"view and two bottom views, got {(height, width)}."
+            )
+        top_height = 2 * height // 3
+        half_width = width // 2
+        return [
+            videos[:, :, :, :top_height, :],
+            videos[:, :, :, top_height:, :half_width],
+            videos[:, :, :, top_height:, half_width:],
+        ]
+
+    def _encode_view(self, videos: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, num_frames, height, width = videos.shape
+        frames = videos.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * num_frames,
+            channels,
+            height,
+            width,
+        )
+        frames = F.interpolate(
+            frames,
+            size=(self.image_size, self.image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
+        frames = self._normalise_for_backbone(frames)
+
+        encoded_chunks = []
+        tokens_per_frame = (self.image_size // self._spatial_patch) ** 2
+        with torch.no_grad():
+            for chunk in frames.split(self.frame_batch_size):
+                output = self.backbone(chunk.unsqueeze(2))
+                if isinstance(output, torch.Tensor):
+                    tokens = output
+                elif isinstance(output, (tuple, list)):
+                    tokens = output[0]
+                elif hasattr(output, "last_hidden_state"):
+                    tokens = output.last_hidden_state
+                else:
+                    raise ValueError(
+                        "VJEPA21ImageSVAEEncoder: unexpected backbone output "
+                        f"type {type(output)}."
+                    )
+                if tokens.shape[1] < tokens_per_frame:
+                    raise ValueError(
+                        "V-JEPA image encoder returned fewer patch tokens than "
+                        f"expected: got {tokens.shape[1]}, expected {tokens_per_frame}."
+                    )
+                if tokens.shape[1] > tokens_per_frame:
+                    tokens = tokens[:, -tokens_per_frame:, :]
+                compressed = self.svae_encoder(tokens)
+                encoded_chunks.append(compressed)
+
+        grid = self.image_size // self._spatial_patch
+        return torch.cat(encoded_chunks, dim=0).reshape(
+            batch_size,
+            num_frames,
+            grid,
+            grid,
+            self.z_dim,
+        )
+
+    def encode(
+        self,
+        videos,
+        device="cuda",
+        tiled=False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+        return_pre_standardise=False,
+    ):
+        del tile_size, tile_stride
+        if tiled:
+            raise NotImplementedError(
+                "Tiled encoding is not supported for V-JEPA image S-VAE."
+            )
+        videos = videos.to(device=device)
+        if videos.ndim != 5 or videos.shape[1] != 3:
+            raise ValueError(
+                "VJEPA21ImageSVAEEncoder expects [B,3,T,H,W], "
+                f"got {tuple(videos.shape)}."
+            )
+
+        views = (
+            [videos]
+            if self.view_layout == "single"
+            else self._split_robotwin_views(videos)
+        )
+        compressed_views = [self._encode_view(view) for view in views]
+        latents = torch.cat(compressed_views, dim=3)
+        latents = latents.permute(0, 4, 1, 2, 3).contiguous()
+        latents = self._select_temporal_states(
+            latents,
+            original_num_frames=videos.shape[2],
+            temporal_patch_size=1,
+            temporal_downsample_factor=self.temporal_downsample_factor,
+        )
+        if return_pre_standardise:
+            return latents, None
+        return latents
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.backbone.eval()
+        self.svae_encoder.eval()
+        return self
+
+
+_ENCODER_REGISTRY["vjepa2_1_image_svae"] = VJEPA21ImageSVAEEncoder
 _ENCODER_REGISTRY["vjepa21"] = VJEPA21Encoder
