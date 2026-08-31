@@ -83,6 +83,17 @@ SHARD_DONE="${EVAL_SYNC_DIR}/done.shard${TASK_SHARD_INDEX}"
 printf '%s\n' "${CKPT}" > "${SHARD_DONE}"
 
 CKPT_TAG="${CKPT_NAME}"
+IFS='/' read -r -a _CKPT_PARTS <<< "${CKPT}"
+for (( part=0; part<${#_CKPT_PARTS[@]}; part++ )); do
+  if [[ "${_CKPT_PARTS[part]}" == "runs" ]]; then
+    if (( part + 2 >= ${#_CKPT_PARTS[@]} )); then
+      echo "ERROR: checkpoint under runs has invalid layout: ${CKPT}" >&2
+      exit 1
+    fi
+    CKPT_TAG="${_CKPT_PARTS[part + 1]}_${_CKPT_PARTS[part + 2]}"
+    break
+  fi
+done
 RUN_OUTPUT_DIR="${REPO_ROOT}/evaluate_results/robotwin/${CKPT_TAG}/${OUTPUT_TAG}"
 (
   flock -x 9

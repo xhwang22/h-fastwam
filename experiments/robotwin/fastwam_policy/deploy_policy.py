@@ -190,6 +190,7 @@ class WorldActionRobotWinPolicy:
         strict_checkpoint = (
             "HFastWAMIDM" in model_target
             or "HFastWAMFullConditionIDM" in model_target
+            or "HFastWAMLatentAction" in model_target
             or visual_encoder_type == "xr1_vision"
         )
         self.model.load_checkpoint(checkpoint_path, strict=strict_checkpoint)

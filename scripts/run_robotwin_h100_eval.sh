@@ -233,9 +233,18 @@ case "${MODEL_KIND}" in
   vae_predictor)
     TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
     ;;
+  latent_action)
+    VJEPA21_CHECKPOINT="${VJEPA21_CHECKPOINT:-${TORCH_HOME}/hub/checkpoints/vjepa2_1_vitG_384.pt}"
+    VJEPA21_REPO="${VJEPA21_REPO:-${TORCH_HOME}/hub/facebookresearch_vjepa2_main}"
+    PREPARE_ARGS+=(
+      --vjepa-checkpoint "${VJEPA21_CHECKPOINT}"
+      --vjepa-repo "${VJEPA21_REPO}"
+    )
+    TASK_CONFIG=robotwin_uncond_3cam_384_1e-4
+    ;;
   *)
     echo "[h100-eval] ERROR: unsupported MODEL_KIND=${MODEL_KIND}." >&2
-    echo "Expected xr1, idm, vjepa21_flow, dinov3_flow, siglip2_flow, or vae_predictor." >&2
+    echo "Expected xr1, idm, vjepa21_flow, dinov3_flow, siglip2_flow, vae_predictor, or latent_action." >&2
     exit 1
     ;;
 esac

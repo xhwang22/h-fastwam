@@ -68,12 +68,13 @@ def _resolve_training_stats(train_cfg, repo_root: Path) -> Path | None:
     return None
 
 
-def _check_data_contract(train_cfg) -> None:
+def _check_data_contract(train_cfg, model_kind: str) -> None:
     data = train_cfg.data.train
     _require_equal(int(data.num_frames), 33, "data.train.num_frames")
+    expected_action_video_ratio = 32 if model_kind == "latent_action" else 4
     _require_equal(
         int(data.action_video_freq_ratio),
-        4,
+        expected_action_video_ratio,
         "data.train.action_video_freq_ratio",
     )
     _require_equal(list(data.video_size), [384, 320], "data.train.video_size")
@@ -246,6 +247,45 @@ def _check_model_contract(model_kind: str, model) -> tuple[int, bool]:
             "SigLIP2 video mask",
         )
         return 1152, True
+    elif model_kind == "latent_action":
+        _require_equal(
+            target,
+            "fastwam.models.hfastwam.hfastwam_latent_action."
+            "HFastWAMLatentAction.from_pretrained_fastwam",
+            "latent-action model target",
+        )
+        _require_equal(
+            str(model.get("video_expert_type", "")),
+            "latent_action_dit",
+            "latent-action video expert",
+        )
+        _require_equal(str(visual.encoder_type), "vjepa2_1", "latent-action encoder")
+        _require_equal(
+            bool(visual.get("causal_tubelet_encoding", False)),
+            True,
+            "latent-action causal tubelet",
+        )
+        _require_equal(
+            int(model.video_dit_config.latent_dim),
+            32,
+            "latent-action dimension",
+        )
+        _require_equal(
+            int(model.video_dit_config.latent_horizon),
+            32,
+            "latent-action horizon",
+        )
+        _require_equal(
+            int(model.video_dit_config.context_dim),
+            1664,
+            "latent-action context dimension",
+        )
+        _require_equal(
+            int(model.video_dit_config.context_spatial_pool),
+            2,
+            "latent-action context pooling",
+        )
+        return 32, True
     else:
         raise ValueError(f"Unsupported model kind: {model_kind}")
 
@@ -254,6 +294,7 @@ def _check_checkpoint(
     checkpoint_path: Path,
     expected_video_dim: int,
     require_visual_encoder: bool,
+    model_kind: str,
 ) -> None:
     payload = torch.load(
         checkpoint_path,
@@ -271,7 +312,6 @@ def _check_checkpoint(
     mot = payload["mot"]
     action_input = mot.get("mixtures.action.action_encoder.weight")
     action_output = mot.get("mixtures.action.head.weight")
-    video_patch = mot.get("mixtures.video.patch_embedding.weight")
     proprio = payload["proprio_encoder"].get("weight")
     if action_input is None or tuple(action_input.shape)[1] != 14:
         raise ValueError(
@@ -288,11 +328,32 @@ def _check_checkpoint(
             f"Checkpoint proprio encoder is not 14→4096: "
             f"{None if proprio is None else tuple(proprio.shape)}"
         )
-    if video_patch is None or tuple(video_patch.shape)[1] != expected_video_dim:
-        raise ValueError(
-            f"Checkpoint video input dim is not {expected_video_dim}: "
-            f"{None if video_patch is None else tuple(video_patch.shape)}"
-        )
+    if model_kind == "latent_action":
+        latent_input = mot.get("mixtures.video.action_encoder.weight")
+        latent_output = mot.get("mixtures.video.head.weight")
+        if (
+            latent_input is None
+            or tuple(latent_input.shape)[1] != expected_video_dim
+        ):
+            raise ValueError(
+                f"Checkpoint latent-action input dim is not {expected_video_dim}: "
+                f"{None if latent_input is None else tuple(latent_input.shape)}"
+            )
+        if (
+            latent_output is None
+            or tuple(latent_output.shape)[0] != expected_video_dim
+        ):
+            raise ValueError(
+                f"Checkpoint latent-action output dim is not {expected_video_dim}: "
+                f"{None if latent_output is None else tuple(latent_output.shape)}"
+            )
+    else:
+        video_patch = mot.get("mixtures.video.patch_embedding.weight")
+        if video_patch is None or tuple(video_patch.shape)[1] != expected_video_dim:
+            raise ValueError(
+                f"Checkpoint video input dim is not {expected_video_dim}: "
+                f"{None if video_patch is None else tuple(video_patch.shape)}"
+            )
 
 
 def main() -> None:
@@ -306,6 +367,7 @@ def main() -> None:
             "dinov3_flow",
             "siglip2_flow",
             "vae_predictor",
+            "latent_action",
         ],
         required=True,
     )
@@ -340,7 +402,7 @@ def main() -> None:
             "asset-path/load_text_encoder rewrites."
         )
 
-    _check_data_contract(train_cfg)
+    _check_data_contract(train_cfg, args.model)
     model = _model_cfg(eval_cfg)
     expected_video_dim, require_visual_encoder = _check_model_contract(
         args.model,
@@ -350,6 +412,7 @@ def main() -> None:
         checkpoint_path,
         expected_video_dim=expected_video_dim,
         require_visual_encoder=require_visual_encoder,
+        model_kind=args.model,
     )
 
     training_stats = (
@@ -382,6 +445,11 @@ def main() -> None:
         print("IDM condition=[z0,pred_z1,pred_z2], inference KV cache=disabled")
     elif args.model == "vae_predictor":
         print("VAE predictor action conditioning=current clean VAE latent")
+    elif args.model == "latent_action":
+        print(
+            "latent-action inference=joint 32x32 latent-action and "
+            "32x14 raw-action flow sampling"
+        )
     else:
         print(f"{args.model} action conditioning=current clean first-frame latent")
     print("image_pipeline=480x640 -> 240x320 -> RoboTwin 384x320 canvas")

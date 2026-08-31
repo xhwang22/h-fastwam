@@ -137,6 +137,38 @@ def prepare(args: argparse.Namespace) -> None:
             raise ValueError("VAE predictor must not configure a visual encoder.")
         if str(model_cfg.get("video_expert_type", "")) != "jepa_predictor":
             raise ValueError("VAE predictor must use video_expert_type=jepa_predictor.")
+    elif args.model == "latent_action":
+        expected_target = (
+            "fastwam.models.hfastwam.hfastwam_latent_action."
+            "HFastWAMLatentAction.from_pretrained_fastwam"
+        )
+        if target != expected_target:
+            raise ValueError(
+                f"Latent-action config has unexpected target: {target}"
+            )
+        if encoder_type != "vjepa2_1":
+            raise ValueError(
+                f"Latent-action config has unexpected visual encoder: {encoder_type}"
+            )
+        if str(model_cfg.get("video_expert_type", "")) != "latent_action_dit":
+            raise ValueError(
+                "Latent-action config must use "
+                "video_expert_type=latent_action_dit."
+            )
+        vjepa_checkpoint = _resolved_file_or_dir(
+            args.vjepa_checkpoint,
+            "V-JEPA2.1 checkpoint",
+        )
+        vjepa_repo = _resolved_dir(args.vjepa_repo, "V-JEPA2.1 source")
+        vision_transformer = (
+            vjepa_repo / "app" / "vjepa_2_1" / "models" / "vision_transformer.py"
+        )
+        if not vision_transformer.is_file():
+            raise FileNotFoundError(
+                f"V-JEPA2.1 source is incomplete; missing {vision_transformer}"
+            )
+        model_cfg.visual_encoder_config.checkpoint_path = str(vjepa_checkpoint)
+        model_cfg.visual_encoder_config.repo_path = str(vjepa_repo)
     else:
         raise ValueError(f"Unsupported model kind: {args.model}")
 
@@ -164,6 +196,7 @@ def main() -> None:
             "dinov3_flow",
             "siglip2_flow",
             "vae_predictor",
+            "latent_action",
         ],
         required=True,
     )
@@ -180,7 +213,7 @@ def main() -> None:
 
     if args.model == "xr1" and not args.xr1_checkpoint:
         parser.error("--xr1-checkpoint is required for --model=xr1")
-    if args.model in {"idm", "vjepa21_flow"} and (
+    if args.model in {"idm", "vjepa21_flow", "latent_action"} and (
         not args.vjepa_checkpoint or not args.vjepa_repo
     ):
         parser.error(
