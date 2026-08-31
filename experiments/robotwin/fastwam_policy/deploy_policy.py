@@ -178,6 +178,10 @@ class WorldActionRobotWinPolicy:
         # redundant and adds a large offline asset/runtime dependency.
         language_backend = str(model_cfg_copy.get("language_backend", "legacy")).lower()
         model_cfg_copy.load_text_encoder = language_backend != "qwen3"
+        if model_cfg_copy.get("fixed_target_encoder") is False:
+            # Older deployed factories predate this no-op false flag. Keep
+            # true intact because it changes JEPA predictor construction.
+            model_cfg_copy.pop("fixed_target_encoder")
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         model_target = str(model_cfg_copy.get("_target_", ""))
