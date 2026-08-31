@@ -155,6 +155,14 @@ def prepare(args: argparse.Namespace) -> None:
                 "Latent-action config must use "
                 "video_expert_type=latent_action_dit."
             )
+        if bool(model_cfg.get("fixed_target_encoder", False)):
+            raise ValueError(
+                "Latent-action evaluation does not support "
+                "fixed_target_encoder=true."
+            )
+        # This no-op training flag was saved by a newer factory revision, but
+        # older evaluation checkouts do not accept it as a constructor kwarg.
+        model_cfg.pop("fixed_target_encoder", None)
         vjepa_checkpoint = _resolved_file_or_dir(
             args.vjepa_checkpoint,
             "V-JEPA2.1 checkpoint",

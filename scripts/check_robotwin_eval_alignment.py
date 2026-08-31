@@ -28,6 +28,8 @@ def _redacted_model(cfg) -> dict:
         "tokenizer_model_id",
     ):
         payload.pop(key, None)
+    if payload.get("fixed_target_encoder") is False:
+        payload.pop("fixed_target_encoder")
     visual = payload.get("visual_encoder_config")
     if isinstance(visual, dict):
         for key in (
