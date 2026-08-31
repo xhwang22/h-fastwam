@@ -182,6 +182,12 @@ class WorldActionRobotWinPolicy:
             # Older deployed factories predate this no-op false flag. Keep
             # true intact because it changes JEPA predictor construction.
             model_cfg_copy.pop("fixed_target_encoder")
+        configured_target = str(model_cfg_copy.get("_target_", ""))
+        if "HFastWAMLatentAction" in configured_target:
+            # DreamDojo is a training-only target generator. Its weights are
+            # deliberately excluded from latent-action checkpoints and the
+            # deployment forward generates latent actions internally.
+            model_cfg_copy.pop("dreamdojo_config", None)
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         model_target = str(model_cfg_copy.get("_target_", ""))

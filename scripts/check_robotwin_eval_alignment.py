@@ -30,6 +30,8 @@ def _redacted_model(cfg) -> dict:
         payload.pop(key, None)
     if payload.get("fixed_target_encoder") is False:
         payload.pop("fixed_target_encoder")
+    if "HFastWAMLatentAction" in str(payload.get("_target_", "")):
+        payload.pop("dreamdojo_config", None)
     visual = payload.get("visual_encoder_config")
     if isinstance(visual, dict):
         for key in (
