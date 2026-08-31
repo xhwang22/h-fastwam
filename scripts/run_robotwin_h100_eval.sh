@@ -103,6 +103,10 @@ if [[ -z "${STATS:-}" ]]; then
 fi
 
 if [[ -n "${CKPT:-}" ]]; then
+  if [[ ! -f "${CKPT}" ]]; then
+    echo "[h100-eval] ERROR: requested checkpoint not found: ${CKPT}" >&2
+    exit 1
+  fi
   CKPT="$(realpath "${CKPT}")"
 else
   CKPT="$(find "${RUN_DIR}/checkpoints/weights" -maxdepth 1 -type f -name 'step_*.pt' \
