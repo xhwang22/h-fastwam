@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 32-GPU native SigLIP2-Large 300M + Flow-DiT on AWS HyperPod.
+# 16-GPU native SigLIP2-Large 300M + Flow-DiT on AWS HyperPod.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,7 +12,7 @@ if [[ -f "${CONDA_ACTIVATE}" ]]; then
   source "${CONDA_ACTIVATE}" fastwam
 fi
 
-export FASTWAM_EXPECTED_WORLD_SIZE=32
+export FASTWAM_EXPECTED_WORLD_SIZE=16
 export FASTWAM_USE_EFA=1
 
 # shellcheck source=_aws_hyperpod_setup.sh
@@ -40,7 +40,7 @@ PY
 ) 9>"${SIGLIP2_MODEL_PATH}.download.lock"
 
 export GLOBAL_BATCH_SIZE=1536
-export GRADIENT_ACCUMULATION_STEPS=1
+export GRADIENT_ACCUMULATION_STEPS=2
 export SAVE_EVERY=2000
 export LOG_EVERY=10
 export FASTWAM_SDPA_BACKEND=cudnn
@@ -57,7 +57,7 @@ if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
   exit 2
 fi
 export LOG_ROOT="${LOG_ROOT:-/efs/shaunxhwang}"
-export RUN_NAME="${RUN_NAME:-robotwin_native_siglip2_large_300m_causal_tubelet_32gpu_b48_cudnn_overlap_efa}"
+export RUN_NAME="${RUN_NAME:-robotwin_native_siglip2_large_300m_causal_tubelet_16gpu_b48_acc2_cudnn_overlap_efa}"
 export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-encoder-ablation}"
 export WANDB_GROUP="${WANDB_GROUP:-native-siglip2-large-flow-dit}"
 export LAUNCH_LABEL=aws-native-siglip2-large-300m
