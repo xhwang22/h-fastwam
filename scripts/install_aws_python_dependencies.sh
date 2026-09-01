@@ -14,7 +14,9 @@ fi
   torchvision==0.22.1+cu128 \
   --extra-index-url https://download.pytorch.org/whl/cu128
 
-"${PYTHON_BIN}" -m pip install -e "${REPO_ROOT}"
+"${PYTHON_BIN}" -m pip install \
+  --no-build-isolation \
+  -e "${REPO_ROOT}"
 
 "${PYTHON_BIN}" -m pip install --no-cache-dir --upgrade --no-deps \
   "deepspeed==0.19.3"
