@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# 32-GPU native SigLIP2-Large 300M + Flow-DiT on AWS HyperPod.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+CONDA_ACTIVATE="/apdcephfs_csgl/share_306089109/shaunxhwang/miniconda3/bin/activate"
+if [[ -f "${CONDA_ACTIVATE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONDA_ACTIVATE}" fastwam
+fi
+
+export FASTWAM_EXPECTED_WORLD_SIZE=32
+export FASTWAM_USE_EFA=1
+
+# shellcheck source=_aws_hyperpod_setup.sh
+source "${SCRIPT_DIR}/_aws_hyperpod_setup.sh"
+fastwam_prepare_aws_hyperpod
+
+export SIGLIP2_MODEL_PATH="${SIGLIP2_MODEL_PATH:-${REPO_ROOT}/checkpoints/siglip2-large-patch16-384}"
+mkdir -p "$(dirname "${SIGLIP2_MODEL_PATH}")"
+(
+  flock -x 9
+  if [[ ! -f "${SIGLIP2_MODEL_PATH}/config.json" || ! -f "${SIGLIP2_MODEL_PATH}/model.safetensors" ]]; then
+    echo "[aws-siglip2-large] downloading google/siglip2-large-patch16-384 to ${SIGLIP2_MODEL_PATH}"
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python - "${SIGLIP2_MODEL_PATH}" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="google/siglip2-large-patch16-384",
+    revision="1b426889ea62b5a72bf9839009a1b184bfc9c178",
+    local_dir=sys.argv[1],
+    allow_patterns=["config.json", "model.safetensors"],
+)
+PY
+  fi
+) 9>"${SIGLIP2_MODEL_PATH}.download.lock"
+
+export GLOBAL_BATCH_SIZE=1536
+export GRADIENT_ACCUMULATION_STEPS=1
+export SAVE_EVERY=2000
+export LOG_EVERY=10
+export FASTWAM_SDPA_BACKEND=cudnn
+export ACCEL_CONFIG=scripts/accelerate_configs/accelerate_zero2_bf16.yaml
+export MODEL_CONFIG=hfastwam_small_native_siglip2_large
+export CAUSAL_TUBELET_ENCODING=true
+export TEMPORAL_DOWNSAMPLE=4
+export STANDARDISE_OUTPUT=true
+export VIDEO_LATENT_CACHE_ENABLED=0
+export ROBOTWIN_WEBDATASET_ROOT="${ROBOTWIN_WEBDATASET_ROOT:-/efs/shaunxhwang/robotwin2.0_webdataset}"
+if [[ ! -f "${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" ]]; then
+  echo "[aws-siglip2-large] ERROR: completed WebDataset not found: ${ROBOTWIN_WEBDATASET_ROOT}/dataset.done" >&2
+  echo "Set ROBOTWIN_WEBDATASET_ROOT to the completed indexed RoboTwin dataset." >&2
+  exit 2
+fi
+export LOG_ROOT="${LOG_ROOT:-/efs/shaunxhwang}"
+export RUN_NAME="${RUN_NAME:-robotwin_native_siglip2_large_300m_causal_tubelet_32gpu_b48_cudnn_overlap_efa}"
+export WANDB_PROJECT="${WANDB_PROJECT:-fastwam-robotwin-encoder-ablation}"
+export WANDB_GROUP="${WANDB_GROUP:-native-siglip2-large-flow-dit}"
+export LAUNCH_LABEL=aws-native-siglip2-large-300m
+export VISUAL_ENCODER_DESCRIPTION="native SigLIP2-Large/16 300M, raw 1024-d features + Wan DiT"
+
+exec bash "${SCRIPT_DIR}/run_robotwin_hfastwam_8card_small_siglip2.sh" "$@"
