@@ -243,14 +243,20 @@ def _check_model_contract(model_kind: str, model) -> tuple[int, bool]:
             True,
             "SigLIP2 causal tubelet",
         )
-        _require_equal(int(model.video_dit_config.in_dim), 1152, "SigLIP2 video in_dim")
-        _require_equal(int(model.video_dit_config.out_dim), 1152, "SigLIP2 video out_dim")
+        video_dim = int(model.video_dit_config.in_dim)
+        if video_dim not in {1024, 1152}:
+            raise ValueError(f"Unsupported SigLIP2 feature dim: {video_dim}")
+        _require_equal(
+            int(model.video_dit_config.out_dim),
+            video_dim,
+            "SigLIP2 video out_dim",
+        )
         _require_equal(
             str(model.video_dit_config.video_attention_mask_mode),
             "first_frame_causal",
             "SigLIP2 video mask",
         )
-        return 1152, True
+        return video_dim, True
     elif model_kind == "latent_action":
         _require_equal(
             target,
